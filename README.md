@@ -173,25 +173,23 @@ Claude Code は自動的に：
 - 「`計算表.bas` の `合計計算` プロシージャを高速化して」
 - 「マウスホイールでスクロールできるようにフォームに対応コードを追加して」
 
-### CLAUDE.md を置こう（推奨）
+### ガードレールは同梱済み（CLAUDE.md と専用スキル）
 
-配布フォルダに `CLAUDE.md` を作成すると、Claude Code が自動で読み込みます。
-最低限こう書いておくと事故が減ります：
+このリポジトリには、Claude Code が安全に VBA を操作するための設定が
+**最初から入っています**。クローン／解凍してそのまま使えます。
 
-```markdown
-# 作業ルール
+- **`CLAUDE.md`**（リポジトリ直下）
+  Claude Code が起動時に自動で読み込むプロジェクトルール。
+  「`.bas` を Edit / Write ツールで編集して文字化けさせない」
+  「`get → replace-procedure` の手順を守る」「`python` ではなく `py` を使う」
+  などを Claude に指示します。
 
-## .bas ファイルの編集（最重要）
-.bas ファイルは CP932 (Shift-JIS) で保存される。
-Edit / Write ツールでそのまま編集すると UTF-8 に変換されて文字化けする。
+- **`.claude/skills/shu-addin-manager/`**（同梱スキル）
+  「マクロを追加して」「フォームを直して」などのキーワードで自動的に起動し、
+  Claude に正しい作業フロー（`list → get → 修正 → replace-procedure`）を守らせます。
 
-.bas を修正するときは：
-1. Python で `encoding='cp932'` で読み書き
-2. `vba_manager.py replace-procedure` でプロシージャ単位で置換
-
-## Python コマンド
-`python` ではなく `py` を使う。
-```
+どちらも自分で用意する必要はありません。このフォルダで `claude` を起動すれば、
+そのまま有効になります。
 
 ---
 
@@ -223,10 +221,13 @@ Edit / Write ツールでそのまま編集すると UTF-8 に変換されて文
 ```
 VBAマネージャー/
 ├── README.md                       ← このファイル
+├── CLAUDE.md                       ← Claude Code 用プロジェクトルール（同梱）
 ├── LICENSE                         ← MIT
 ├── requirements.txt
 ├── 秀.xlsm                         ← サンプルアドイン（個人利用例）
-├── PDF_Classic_Editor/             ← 補助 PDF ツール（HTML/JS、おまけ）
+├── .claude/
+│   └── skills/
+│       └── shu-addin-manager/      ← Claude Code 用の同梱スキル
 └── 作業ファイル/
     ├── VBAマネージャー起動.bat
     ├── 一覧.bat
