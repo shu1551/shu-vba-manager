@@ -1,4 +1,4 @@
-"""
+r"""
 form_builder.py - UserForm作成のための共通ユーティリティ
 
 【使い方】
@@ -138,7 +138,7 @@ def add_scroll(frm, name, left, top, width, height, *, orientation=0):
 # ================================================================
 
 class FormBuilder:
-    """
+    r"""
     UserForm の作成・編集を管理するクラス。
 
     with 文で使用すると CoInitialize/CoUninitialize を自動管理する。
