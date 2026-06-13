@@ -27,6 +27,8 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 ## このツールキットでできること
 
 - ✅ **VBA モジュール (.bas) の取り出し／差し替え／プロシージャ単位の置換**
+- ✅ **開いたままのブックを直接読み書き**（セル読取・書込・書式・行列操作・検索置換・印刷設定など）
+- ✅ **グラフ／ピボット／スライサー／PowerQuery／データモデル(DAX) まで CLI で操作**
 - ✅ **UserForm を Python コードで構築**（コントロール配置〜イベントコード注入まで）
 - ✅ **VBE と `.bas` ファイルのライブ同期**
 - ✅ **登録済みマクロの GUI ランチャー**（customtkinter 製）
@@ -39,7 +41,7 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 
 | ツール | 役割 |
 |---|---|
-| **`vba_manager.py`** | 中核ツール。`.xlsm` 内の VBA モジュールを `list / get / replace-module / replace-procedure` で操作 |
+| **`vba_manager.py`** | 中核ツール。VBA の `list / get / replace-module / replace-procedure` に加え、シート読取（`read-range` / `sheet-info` / `screenshot`）・編集（`write-range` / `format-range` / `find-replace` 等）・グラフ／ピボット／PowerQuery／データモデルまで約50コマンド |
 | **`form_builder.py`** | UserForm をコードで構築。`add_btn`, `add_lbl`, `add_txt`, `add_lst` などのヘルパー付き |
 | **`live_sync_vba.py`** | VBE と `.bas` ファイルをリアルタイム同期 |
 | **`menu_launcher.py`** / **`select_macro_gui.py`** | customtkinter 製のマクロ検索／実行 GUI |
@@ -100,7 +102,7 @@ py -m pip install -r requirements.txt
 
 ## 主要ツールの使い方
 
-### `vba_manager.py` — VBA モジュール CRUD
+### `vba_manager.py` — VBA モジュール CRUD ＋ Excel 操作
 
 ```powershell
 cd "作業ファイル\project\python_scripts"
@@ -115,8 +117,35 @@ py vba_manager.py get "C:\path\to\任意.xlsm" モジュール名
 py vba_manager.py replace-module "C:\path\to\任意.xlsm" モジュール名 ファイル.bas
 
 # プロシージャ単位で置き換え（既存プロシージャをピンポイント差し替え）
-py vba_manager.py replace-procedure "C:\path\to\任意.xlsm" patched.vba
+# 非対話実行（Claude Code 連携等）では -y で確認プロンプトをスキップ
+py vba_manager.py replace-procedure -y "C:\path\to\任意.xlsm" patched.vba
 ```
+
+ファイルパスを省略すると**アクティブな（今 Excel で開いている）ブック**を自動対象にする。
+VBA だけでなく、開いたままのブックのシートを直接読み書きできる：
+
+```powershell
+# 読む（目）：セル値・シート構成・範囲のPNG化
+py vba_manager.py read-range A1:D10
+py vba_manager.py sheet-info
+py vba_manager.py screenshot A1:H30
+
+# 書く（手）：値・数式・書式・行列・検索置換・印刷設定など
+py vba_manager.py write-range C1 "=SUM(A1:A10)"
+py vba_manager.py format-range A1:D1 --bold --bg "#FFFF00"
+py vba_manager.py find-replace 旧 新 A1:Z99
+
+# 重量級：グラフ・ピボット・スライサー・PowerQuery・データモデル(DAX)
+py vba_manager.py chart create A1:B5 --type column --title "月別売上"
+py vba_manager.py pivot create 元データ!A1:C100 --rows 部門 --values 売上
+py vba_manager.py powerquery list
+py vba_manager.py datamodel list
+```
+
+全コマンド（約50個）の一覧と使い方は `vba_manager.py` 冒頭のコマンド表を参照。
+※ Excel が未起動の状態でパス指定すると自動化用の Excel が新規起動される。この Excel には
+アドインや PERSONAL.XLSB が読み込まれないため、普段使いには手動起動した Excel を使うこと
+（ツールが警告を表示する）。
 
 ### `form_builder.py` — UserForm をコードで構築
 

@@ -66,7 +66,9 @@ py vba_manager.py get <モジュール名> <Sub名>
 py vba_manager.py get <モジュール名>.<Sub名>   # ドット区切りも可
 
 # _last_proc.vba の内容でプロシージャを置換（バックアップ自動作成）
-py vba_manager.py replace-procedure
+py vba_manager.py replace-procedure -y
+#  ※ -y/--yes で確認プロンプト(y/N)をスキップ。Claude等の非対話実行では必ず -y を付ける。
+#    差分(Diff)は -y を付けても表示される。--module <名> で対象モジュールの明示も可。
 
 # モジュール全体を Remove+Import で置換
 py vba_manager.py replace-module <モジュール名> <basファイル>
@@ -85,7 +87,7 @@ py vba_manager.py export-module <モジュール名>
      `py vba_manager.py get <モジュール名> <Sub名>`
 3. `_last_proc.vba` を Read ツールで読み、修正内容を検討
 4. 修正後のコードを `_last_proc.vba` に Write
-5. `py vba_manager.py replace-procedure` で適用
+5. `py vba_manager.py replace-procedure -y` で適用（非対話実行のため -y 必須）
 6. ユーザーに動作確認を依頼
 
 ## 標準作業フロー（フォームの .bas を修正して適用）
