@@ -87,10 +87,24 @@ XL_EXTS     = ('.xlsm', '.xlam', '.xlsx', '.xls', '.xlsb')
 # ユーティリティ
 # ================================================================
 
+_created_xl = None
+_created_xl_pid = None
+
+
 def setup_encoding():
     sys.stdout.reconfigure(encoding='utf-8')
     os.environ['PYTHONIOENCODING'] = 'utf-8'
     pythoncom.CoInitialize()
+
+    # --json オプションが引数に含まれている場合、通常の print を標準エラー出力にリダイレクトする
+    if "--json" in sys.argv:
+        import builtins
+        _orig_print = builtins.print
+        def custom_print(*args, **kwargs):
+            if 'file' not in kwargs:
+                kwargs['file'] = sys.stderr
+            _orig_print(*args, **kwargs)
+        builtins.print = custom_print
 
 
 def looks_like_xl_file(s):
@@ -128,7 +142,146 @@ def parse_target_and_rest(posargs):
     return None, list(posargs)
 
 
-def get_workbook(target_file_arg=None):
+def cleanup_excel():
+    """新規起動されたExcelインスタンスがあれば終了し、COMを初期化解除する"""
+    global _created_xl, _created_xl_pid
+    import gc
+    import os
+    import signal
+    print(f"[DEBUG] cleanup_excel called. _created_xl is: {_created_xl}, PID is: {_created_xl_pid}")
+    
+    # Python側のCOM参照を解放するためにGCを強制実行
+    gc.collect()
+    
+    if _created_xl is not None:
+        try:
+            print("[DEBUG] Closing open workbooks...")
+            try:
+                # 切断エラーを回避しつつ、逆順にブックを閉じる
+                wbs = _created_xl.Workbooks
+                for i in range(wbs.Count, 0, -1):
+                    try:
+                        wb = wbs.Item(i)
+                        name = wb.Name
+                        wb.Close(SaveChanges=False)
+                        print(f"[DEBUG] Workbook closed: {name}")
+                    except Exception as ex:
+                        print(f"[DEBUG] Failed to close wb {i}: {ex}")
+            except Exception as ex:
+                print(f"[DEBUG] Failed to access Workbooks: {ex}")
+            
+            print("[DEBUG] Calling xl.Quit()...")
+            _created_xl.Quit()
+            print("[DEBUG] xl.Quit() completed.")
+        except Exception as ex:
+            print(f"[DEBUG] Error during Excel cleanup: {ex}")
+        _created_xl = None
+    
+    # 新規起動したPIDが存在する場合は強制クリーンアップ
+    if _created_xl_pid is not None:
+        try:
+            print(f"[DEBUG] Force-killing Excel process (PID: {_created_xl_pid})...")
+            os.kill(_created_xl_pid, signal.SIGTERM)
+            print("[DEBUG] Excel process force-killed successfully.")
+        except Exception as ex:
+            print(f"[DEBUG] Excel process force-kill failed or already exited: {ex}")
+        _created_xl_pid = None
+        
+    # 最後の解放
+    gc.collect()
+    try:
+        pythoncom.CoUninitialize()
+        print("[DEBUG] CoUninitialize completed.")
+    except Exception as ex:
+        print(f"[DEBUG] CoUninitialize failed: {ex}")
+
+
+def load_excel_addins_and_personal(xl):
+    """新規起動されたExcelにアドインとPERSONAL.XLSBをロードする"""
+    import os
+    import time
+
+    # 警告を非表示にする
+    try:
+        xl.DisplayAlerts = False
+    except Exception:
+        pass
+
+    loaded_any = False
+
+    # 1. アドインのロード
+    try:
+        for addin in xl.AddIns:
+            if addin.Installed:
+                try:
+                    # すでに開いていなければ開く
+                    opened = False
+                    for wb in xl.Workbooks:
+                        if wb.Name.lower() == os.path.basename(addin.FullName).lower():
+                            opened = True
+                            break
+                    if not opened:
+                        xl.Workbooks.Open(addin.FullName)
+                        print(f"[DEBUG] Loaded addin: {addin.Name}")
+                        loaded_any = True
+                except Exception as ex:
+                    # Excelがビジー状態の時のリトライ (0x800ac472)
+                    if "800ac472" in str(ex):
+                        time.sleep(0.5)
+                        try:
+                            xl.Workbooks.Open(addin.FullName)
+                            print(f"[DEBUG] Loaded addin (retry): {addin.Name}")
+                            loaded_any = True
+                        except Exception as ex2:
+                            print(f"[DEBUG] Failed to load addin {addin.Name} after retry: {ex2}")
+                    else:
+                        print(f"[DEBUG] Failed to load addin {addin.Name}: {ex}")
+    except Exception as ex:
+        print(f"[DEBUG] Failed to access AddIns: {ex}")
+
+    # 2. PERSONAL.XLSB のロード
+    try:
+        startup_path = xl.StartupPath
+        if startup_path:
+            for fname in ["PERSONAL.XLSB", "personal.xlsb", "PERSONAL.XLS", "personal.xls"]:
+                p_path = os.path.join(startup_path, fname)
+                if os.path.exists(p_path):
+                    opened = False
+                    for wb in xl.Workbooks:
+                        if wb.Name.lower() == fname.lower():
+                            opened = True
+                            break
+                    if not opened:
+                        try:
+                            xl.Workbooks.Open(p_path)
+                            print(f"[DEBUG] Loaded personal macro book: {fname}")
+                            loaded_any = True
+                        except Exception as ex:
+                            if "800ac472" in str(ex):
+                                time.sleep(0.5)
+                                try:
+                                    xl.Workbooks.Open(p_path)
+                                    print(f"[DEBUG] Loaded personal macro book (retry): {fname}")
+                                    loaded_any = True
+                                except Exception as ex2:
+                                    print(f"[DEBUG] Failed to load personal macro book {fname} after retry: {ex2}")
+                            else:
+                                print(f"[DEBUG] Failed to load personal macro book {fname}: {ex}")
+                    break
+    except Exception as ex:
+        print(f"[DEBUG] Failed to load personal macro book: {ex}")
+
+    # ロード処理が走った場合は待機
+    if loaded_any:
+        time.sleep(1.0)
+
+    try:
+        xl.DisplayAlerts = True
+    except Exception:
+        pass
+
+
+def get_workbook(target_file_arg=None, load_addins=False):
     """
     target_file_arg が None/空 → アクティブExcelブックを自動使用
     それ以外 → 既に開いているか確認、なければ新規オープン
@@ -147,6 +300,8 @@ def get_workbook(target_file_arg=None):
             raise Exception(
                 "アクティブなブックがありません。Excelでブックを開いてください。")
         print(f"対象ブック: {wb.Name}  (アクティブブック自動検出)")
+        if load_addins:
+            load_excel_addins_and_personal(xl)
         return xl, wb
 
     target_path = smart_path_resolve(target_file_arg)
@@ -162,16 +317,33 @@ def get_workbook(target_file_arg=None):
             wb = xl.Workbooks(i)
             if wb.FullName.lower() == target_path.lower():
                 print(f"対象ブック: {wb.Name}  (既に開いています)")
+                if load_addins:
+                    load_excel_addins_and_personal(xl)
                 return xl, wb
     except Exception:
         pass
 
     # 新規オープン
     xl = win32com.client.Dispatch("Excel.Application")
-    xl.Visible = True
+    global _created_xl, _created_xl_pid
+    _created_xl = xl
+    try:
+        import win32process
+        hwnd = xl.Hwnd
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        _created_xl_pid = pid
+        print(f"[DEBUG] Excel process PID detected: {_created_xl_pid}")
+    except Exception as ex:
+        _created_xl_pid = None
+        print(f"[DEBUG] Failed to detect Excel PID: {ex}")
+    xl.Visible = "--visible" in sys.argv or "-v" in sys.argv
+
+    if load_addins:
+        load_excel_addins_and_personal(xl)
+
     wb = xl.Workbooks.Open(target_path)
     print(f"対象ブック: {wb.Name}  (新規オープン)")
-    if not excel_running:
+    if not excel_running and not load_addins:
         # COM起動のExcelは起動処理が走らず、アドインや PERSONAL.XLSB が読み込まれない
         print("注意: Excelが未起動だったため自動化用に新規起動しました。")
         print("      このExcelにはアドイン(秀.xlam等)・PERSONAL.XLSB が読み込まれていません。")
@@ -315,6 +487,241 @@ def make_module_backup(wb, module_name):
 # コマンド実装
 # ================================================================
 
+def cmd_check(args):
+    """VBAコードの静的解析・診断を行う"""
+    target_file, _ = parse_target_and_rest(args.posargs)
+    xl, wb = get_workbook(target_file)
+    
+    is_json = getattr(args, 'json', False)
+
+    if not is_json:
+        print(f"\n===== VBA診断を実行中: {wb.Name} =====")
+    
+    results = {
+        "success": True,
+        "file": wb.Name,
+        "modules": [],
+        "duplicates": [],
+        "summary": {"errors": 0, "warnings": 0}
+    }
+    
+    all_procedures = {}  # proc_name -> [module_name, ...]
+    
+    for comp in wb.VBProject.VBComponents:
+        comp_name = comp.Name
+        cm = comp.CodeModule
+        count_lines = cm.CountOfLines
+        
+        type_names = {1: '標準モジュール', 2: 'クラスモジュール',
+                      3: 'フォーム', 100: 'シート/ThisWorkbook'}
+        tname = type_names.get(comp.Type, f'Type={comp.Type}')
+        
+        mod_info = {
+            "name": comp_name,
+            "type": tname,
+            "type_id": comp.Type,
+            "warnings": [],
+            "errors": [],
+            "skipped": False
+        }
+        
+        if count_lines == 0:
+            mod_info["skipped"] = True
+            results["modules"].append(mod_info)
+            continue
+            
+        code = cm.Lines(1, count_lines)
+        code = code.replace('\r\n', '\n').replace('\r', '\n')
+        lines = code.split('\n')
+        
+        # 1. Option Explicit チェック
+        has_option_explicit = False
+        for line in lines:
+            stripped = line.strip().lower()
+            if not stripped:
+                continue
+            if stripped.startswith("'") or stripped.startswith("rem "):
+                continue
+            if stripped.startswith("option explicit"):
+                has_option_explicit = True
+                break
+            if re.match(r'^(?:(?:public|private|friend)\s+)?(?:static\s+)?(?:sub|function|property)\s+', stripped) or stripped.startswith("dim ") or stripped.startswith("const "):
+                break
+        
+        if not has_option_explicit:
+            mod_info["warnings"].append("Option Explicit が記述されていません。変数宣言の強制を推奨します。")
+            
+        # 2. Sub/Function 閉じ忘れチェック
+        decl_sub = 0
+        end_sub = 0
+        decl_func = 0
+        end_func = 0
+        
+        proc_pattern = re.compile(
+            r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
+            r'(Sub|Function)\s+([^\s\(\)]+)',
+            re.IGNORECASE
+        )
+        
+        local_variables = []  # (var_name, line_idx)
+        variable_usage = {}
+        
+        # プロシージャごとの詳細診断用状態管理
+        current_proc_name = None
+        current_proc_start_idx = None
+        current_proc_has_error_handler = False
+        current_proc_kind = None  # 'sub' or 'function'
+
+        for idx, line in enumerate(lines):
+            clean_line = line.split("'")[0].strip()
+            if clean_line.lower().startswith("rem "):
+                continue
+
+            m = proc_pattern.match(clean_line)
+            if m:
+                # 別のプロシージャの中にいる状態で新しい宣言を見つけた場合（前のプロシージャがEnd Subなしで閉じた等）、
+                # 簡易クリア（閉じ忘れ警告は後続 of if decl_sub != end_sub で処理）
+                kind = m.group(1).lower()
+                name = m.group(2)
+                current_proc_name = name
+                current_proc_start_idx = idx
+                current_proc_has_error_handler = False
+                current_proc_kind = kind
+
+                if name not in all_procedures:
+                    all_procedures[name] = []
+                all_procedures[name].append(comp_name)
+
+                if kind == 'sub':
+                    decl_sub += 1
+                elif kind == 'function':
+                    decl_func += 1
+
+            # プロシージャ内における警告チェック
+            if current_proc_name:
+                # On Error の検出
+                if "on error " in clean_line.lower():
+                    current_proc_has_error_handler = True
+                # SendKeys の検出
+                if "sendkeys" in clean_line.lower():
+                    mod_info["warnings"].append(f"プロシージャ '{current_proc_name}' 内で危険な SendKeys が使用されています (行 {idx + 1})")
+
+            # 終了チェック
+            is_end_sub = re.match(r'^end\s+sub\b', clean_line, re.IGNORECASE)
+            is_end_func = re.match(r'^end\s+function\b', clean_line, re.IGNORECASE)
+
+            if is_end_sub:
+                end_sub += 1
+            elif is_end_func:
+                end_func += 1
+
+            if current_proc_name and (
+                (current_proc_kind == 'sub' and is_end_sub) or
+                (current_proc_kind == 'function' and is_end_func)
+            ):
+                if not current_proc_has_error_handler:
+                    mod_info["warnings"].append(f"プロシージャ '{current_proc_name}' にエラーハンドリング (On Error) がありません (行 {current_proc_start_idx + 1})")
+
+                current_proc_name = None
+                current_proc_start_idx = None
+                current_proc_kind = None
+
+            # Dim宣言の簡易スキャン
+            dim_match = re.match(r'^\s*Dim\s+(.+)$', clean_line, re.IGNORECASE)
+            if dim_match:
+                dim_body = dim_match.group(1)
+                parts = dim_body.split(',')
+                for p in parts:
+                    p = p.strip()
+                    var_part = re.split(r'\s+As\s+', p, flags=re.IGNORECASE)[0].strip()
+                    var_name = re.sub(r'\(.*\)', '', var_part).strip()
+                    var_name = re.sub(r'[%&\$#!@]$', '', var_name).strip()
+                    if var_name and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', var_name):
+                        local_variables.append((var_name, idx))
+                        variable_usage[var_name] = 0
+
+        if decl_sub != end_sub:
+            mod_info["errors"].append(f"Sub の閉じ忘れがあります (宣言数: {decl_sub}, End Sub数: {end_sub})")
+        if decl_func != end_func:
+            mod_info["errors"].append(f"Function の閉じ忘れがあります (宣言数: {decl_func}, End Function数: {end_func})")
+
+        # 未使用変数のカウントスキャン
+        if local_variables:
+            for idx, line in enumerate(lines):
+                clean_line = line.split("'")[0]
+                for var_name, decl_idx in local_variables:
+                    if idx == decl_idx:
+                        continue
+                    if re.search(r'\b' + re.escape(var_name) + r'\b', clean_line, re.IGNORECASE):
+                        variable_usage[var_name] += 1
+
+            for var_name, decl_idx in local_variables:
+                if variable_usage[var_name] == 0:
+                    mod_info["warnings"].append(f"未使用変数 Dim {var_name} があります (行 {decl_idx + 1})")
+
+        results["modules"].append(mod_info)
+
+        # 画面出力 (JSON指定でない場合のみ)
+        if not is_json:
+            print(f"\n📄 モジュール: {comp_name} ({tname})")
+            if not has_option_explicit:
+                print("  [WARNING] Option Explicit が記述されていません。変数宣言の強制を推奨します。")
+            if mod_info["errors"]:
+                for err in mod_info["errors"]:
+                    print(f"  [ERROR] {err}")
+            if mod_info["warnings"]:
+                for warn in mod_info["warnings"]:
+                    # Option Explicitの警告はすでに出力しているのでスキップ
+                    if "Option Explicit" in warn:
+                        continue
+                    print(f"  [WARNING] {warn}")
+            print("  モジュール診断完了")
+
+    # 重複チェックの集計
+    for proc_name, mods in all_procedures.items():
+        if len(mods) > 1:
+            results["duplicates"].append({
+                "procedure": proc_name,
+                "modules": mods
+            })
+            
+    # サマリーの集計
+    err_total = sum(len(m["errors"]) for m in results["modules"])
+    warn_total = sum(len(m["warnings"]) for m in results["modules"]) + len(results["duplicates"])
+    results["summary"]["errors"] = err_total
+    results["summary"]["warnings"] = warn_total
+
+    # JSON出力
+    if is_json:
+        import json
+        print(json.dumps(results, ensure_ascii=False), file=sys.stdout)
+        return err_total == 0
+
+    # 通常出力
+    print("\n===== ブック全体の重複診断 =====")
+    if results["duplicates"]:
+        for dup in results["duplicates"]:
+            print(f"  [WARNING] 重複プロシージャ名 '{dup['procedure']}' が複数のモジュールに存在します:")
+            for m in dup["modules"]:
+                print(f"    - {m}")
+    else:
+        print("  プロシージャ名の重複はありません。")
+
+    print(f"\n===== 診断サマリー =====")
+    print(f"  エラー数  : {err_total}")
+    print(f"  警告数    : {warn_total}")
+    
+    if err_total > 0:
+        print("  [RESULT] 致命的な構文エラーがあります。修正してください。")
+        return False
+    elif warn_total > 0:
+        print("  [RESULT] 警告項目がありますが、実行は可能です。品質向上のため修正を推奨します。")
+        return True
+    else:
+        print("  [RESULT] すべてのチェックを通過しました。良好な状態です。")
+        return True
+
+
 def cmd_diag(args):
     """動作確認"""
     print("Syntax OK")
@@ -343,27 +750,157 @@ def cmd_list_open(args):
 
 def cmd_list(args):
     """マクロ(プロシージャ)一覧"""
+    load_addins = getattr(args, 'personal', False) or getattr(args, 'addin', False) or getattr(args, 'all', False)
     target_file, _ = parse_target_and_rest(args.posargs)
-    xl, wb = get_workbook(target_file)
+    xl, default_wb = get_workbook(target_file, load_addins=load_addins)
+
+    # 全プロジェクトをリスト化 (ビジーエラー対策としてリトライ)
+    import time
+    all_projects = []
+    for attempt in range(5):
+        try:
+            all_projects = []
+            for p in xl.VBE.VBProjects:
+                all_projects.append(p)
+            break
+        except Exception as ex:
+            if "800ac472" in str(ex) and attempt < 4:
+                time.sleep(0.5)
+                continue
+            print(f"エラー: VBAプロジェクトモデルへのアクセスが拒否されました: {ex}", file=sys.stderr)
+            return False
+
+    # 対象のプロジェクトを選択
+    target_projects = []
+    if getattr(args, 'all', False):
+        target_projects = all_projects
+    elif getattr(args, 'personal', False):
+        found = None
+        for p in all_projects:
+            try:
+                fname = os.path.basename(p.Filename).lower()
+                if fname in ("personal.xlsb", "personal.xls"):
+                    found = p
+                    break
+            except Exception:
+                continue
+        if not found:
+            print("エラー: 個人用マクロブック (PERSONAL.XLSB) がロードされていません。", file=sys.stderr)
+            return False
+        target_projects.append(found)
+    elif getattr(args, 'addin', False):
+        found_addins = []
+        for p in all_projects:
+            try:
+                fname = os.path.basename(p.Filename).lower()
+                if fname.endswith(('.xlam', '.xla')):
+                    found_addins.append(p)
+            except Exception:
+                continue
+        if not found_addins:
+            print("エラー: アドインブック (.xlam / .xla) がロードされていません。", file=sys.stderr)
+            return False
+        target_addin = found_addins[0]
+        for p in found_addins:
+            try:
+                if "秀" in os.path.basename(p.Filename):
+                    target_addin = p
+                    break
+            except Exception:
+                continue
+        target_projects.append(target_addin)
+    else:
+        found = None
+        try:
+            for p in all_projects:
+                try:
+                    if p.Filename.lower() == default_wb.FullName.lower():
+                        found = p
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if not found:
+            try:
+                found = default_wb.VBProject
+            except Exception as ex:
+                print(f"エラー: VBProjectの取得に失敗しました: {ex}", file=sys.stderr)
+                return False
+        target_projects.append(found)
 
     pattern = re.compile(
         r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
         r'(?:Sub|Function)\s+([^\s\(\)]+)',
         re.IGNORECASE | re.MULTILINE
     )
-    macros = []
-    for comp in wb.VBProject.VBComponents:
-        # --standard オプション指定時は標準モジュール(Type==1)のみを対象とする
-        if getattr(args, 'standard', False) and comp.Type != 1:
-            continue
-        cm = comp.CodeModule
-        if cm.CountOfLines == 0:
-            continue
-        for m in pattern.finditer(cm.Lines(1, cm.CountOfLines)):
-            name = m.group(1)
-            if name not in macros:
-                macros.append(name)
 
+    def get_project_display_name(p):
+        try:
+            if p.Filename:
+                return os.path.basename(p.Filename)
+        except Exception:
+            pass
+        return p.Name
+
+    is_all = getattr(args, 'all', False)
+    if is_all:
+        all_results = {}
+        for proj in target_projects:
+            macros = []
+            proj_name = get_project_display_name(proj)
+            try:
+                for comp in proj.VBComponents:
+                    if getattr(args, 'standard', False) and comp.Type != 1:
+                        continue
+                    cm = comp.CodeModule
+                    if cm.CountOfLines == 0:
+                        continue
+                    for m in pattern.finditer(cm.Lines(1, cm.CountOfLines)):
+                        name = m.group(1)
+                        if name not in macros:
+                            macros.append(name)
+            except Exception as ex:
+                print(f"[DEBUG] Failed to access VBComponents of {proj_name}: {ex}", file=sys.stderr)
+                continue
+            all_results[proj_name] = macros
+
+        if getattr(args, 'json', False):
+            import json
+            print(json.dumps({"success": True, "file": "all", "macros": all_results}, ensure_ascii=False), file=sys.stdout)
+            return True
+
+        for p_name, macros in all_results.items():
+            print(f"\n--- {p_name} ---")
+            print(f"マクロ数: {len(macros)}")
+            for name in macros:
+                print(f"MACRO:{name}")
+        return True
+
+    proj = target_projects[0]
+    proj_name = get_project_display_name(proj)
+    macros = []
+    try:
+        for comp in proj.VBComponents:
+            if getattr(args, 'standard', False) and comp.Type != 1:
+                continue
+            cm = comp.CodeModule
+            if cm.CountOfLines == 0:
+                continue
+            for m in pattern.finditer(cm.Lines(1, cm.CountOfLines)):
+                name = m.group(1)
+                if name not in macros:
+                    macros.append(name)
+    except Exception as ex:
+        print(f"エラー: VBComponentsへのアクセスに失敗しました: {ex}", file=sys.stderr)
+        return False
+
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"success": True, "file": proj_name, "macros": macros}, ensure_ascii=False), file=sys.stdout)
+        return True
+
+    print(f"対象ブック: {proj_name}")
     print(f"マクロ数: {len(macros)}")
     for name in macros:
         print(f"MACRO:{name}")
@@ -372,14 +909,141 @@ def cmd_list(args):
 
 def cmd_list_modules(args):
     """モジュール一覧"""
+    load_addins = getattr(args, 'personal', False) or getattr(args, 'addin', False) or getattr(args, 'all', False)
     target_file, _ = parse_target_and_rest(args.posargs)
-    xl, wb = get_workbook(target_file)
+    xl, default_wb = get_workbook(target_file, load_addins=load_addins)
+
+    # 全プロジェクトをリスト化 (ビジーエラー対策としてリトライ)
+    import time
+    all_projects = []
+    for attempt in range(5):
+        try:
+            all_projects = []
+            for p in xl.VBE.VBProjects:
+                all_projects.append(p)
+            break
+        except Exception as ex:
+            if "800ac472" in str(ex) and attempt < 4:
+                time.sleep(0.5)
+                continue
+            print(f"エラー: VBAプロジェクトモデルへのアクセスが拒否されました: {ex}", file=sys.stderr)
+            return False
+
+    # 対象のプロジェクトを選択
+    target_projects = []
+    if getattr(args, 'all', False):
+        target_projects = all_projects
+    elif getattr(args, 'personal', False):
+        found = None
+        for p in all_projects:
+            try:
+                fname = os.path.basename(p.Filename).lower()
+                if fname in ("personal.xlsb", "personal.xls"):
+                    found = p
+                    break
+            except Exception:
+                continue
+        if not found:
+            print("エラー: 個人用マクロブック (PERSONAL.XLSB) がロードされていません。", file=sys.stderr)
+            return False
+        target_projects.append(found)
+    elif getattr(args, 'addin', False):
+        found_addins = []
+        for p in all_projects:
+            try:
+                fname = os.path.basename(p.Filename).lower()
+                if fname.endswith(('.xlam', '.xla')):
+                    found_addins.append(p)
+            except Exception:
+                continue
+        if not found_addins:
+            print("エラー: アドインブック (.xlam / .xla) がロードされていません。", file=sys.stderr)
+            return False
+        target_addin = found_addins[0]
+        for p in found_addins:
+            try:
+                if "秀" in os.path.basename(p.Filename):
+                    target_addin = p
+                    break
+            except Exception:
+                continue
+        target_projects.append(target_addin)
+    else:
+        found = None
+        try:
+            for p in all_projects:
+                try:
+                    if p.Filename.lower() == default_wb.FullName.lower():
+                        found = p
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if not found:
+            try:
+                found = default_wb.VBProject
+            except Exception as ex:
+                print(f"エラー: VBProjectの取得に失敗しました: {ex}", file=sys.stderr)
+                return False
+        target_projects.append(found)
 
     type_names = {1: '標準モジュール', 2: 'クラスモジュール',
                   3: 'フォーム', 100: 'シート/ThisWorkbook'}
-    for comp in wb.VBProject.VBComponents:
-        tname = type_names.get(comp.Type, f'Type={comp.Type}')
-        print(f"MODULE:{comp.Name}  ({tname})")
+
+    def get_project_display_name(p):
+        try:
+            if p.Filename:
+                return os.path.basename(p.Filename)
+        except Exception:
+            pass
+        return p.Name
+
+    is_all = getattr(args, 'all', False)
+    if is_all:
+        all_results = {}
+        for proj in target_projects:
+            modules = []
+            proj_name = get_project_display_name(proj)
+            try:
+                for comp in proj.VBComponents:
+                    tname = type_names.get(comp.Type, f'Type={comp.Type}')
+                    modules.append({"name": comp.Name, "type": tname, "type_id": comp.Type})
+            except Exception as ex:
+                print(f"[DEBUG] Failed to access VBComponents of {proj_name}: {ex}", file=sys.stderr)
+                continue
+            all_results[proj_name] = modules
+
+        if getattr(args, 'json', False):
+            import json
+            print(json.dumps({"success": True, "file": "all", "modules": all_results}, ensure_ascii=False), file=sys.stdout)
+            return True
+
+        for p_name, modules in all_results.items():
+            print(f"\n--- {p_name} ---")
+            for m in modules:
+                print(f"MODULE:{m['name']}  ({m['type']})")
+        return True
+
+    proj = target_projects[0]
+    proj_name = get_project_display_name(proj)
+    modules = []
+    try:
+        for comp in proj.VBComponents:
+            tname = type_names.get(comp.Type, f'Type={comp.Type}')
+            modules.append({"name": comp.Name, "type": tname, "type_id": comp.Type})
+    except Exception as ex:
+        print(f"エラー: VBComponentsへのアクセスに失敗しました: {ex}", file=sys.stderr)
+        return False
+
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"success": True, "file": proj_name, "modules": modules}, ensure_ascii=False), file=sys.stdout)
+        return True
+
+    print(f"対象ブック: {proj_name}")
+    for m in modules:
+        print(f"MODULE:{m['name']}  ({m['type']})")
     return True
 
 
@@ -1023,6 +1687,11 @@ def cmd_list_shortcuts(args):
                 'shortcut': shortcut_str
             })
 
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"success": True, "file": wb.Name, "shortcuts": shortcuts}, ensure_ascii=False), file=sys.stdout)
+        return True
+
     if not shortcuts:
         print("ショートカットキーが設定されているマクロはありません。")
         return True
@@ -1033,6 +1702,83 @@ def cmd_list_shortcuts(args):
         print(f"[{item['module']}] {item['macro']} -> {item['shortcut']}")
     print("-" * 60)
     return True
+
+
+def cmd_run_macro(args):
+    """Excelマクロを実行する"""
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: run-macro [excel_file] <macro_name>", file=sys.stderr)
+        return False
+
+    macro_name = rest[0]
+
+    # 実行前にアドインや個人用マクロをロードする
+    xl, wb = get_workbook(target_file, load_addins=True)
+
+    # 警告を非表示にする
+    try:
+        xl.DisplayAlerts = False
+    except Exception:
+        pass
+
+    full_macro_path = macro_name
+
+    # マクロ名に "!" が含まれていない場合、どのブックにあるか検索する
+    if "!" not in macro_name:
+        found_wb = None
+        # VBE.VBProjectsからマクロを検索
+        try:
+            pattern = re.compile(
+                r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
+                r'(?:Sub|Function)\s+' + re.escape(macro_name) + r'\b',
+                re.IGNORECASE
+            )
+            for p in xl.VBE.VBProjects:
+                for comp in p.VBComponents:
+                    cm = comp.CodeModule
+                    if cm.CountOfLines > 0:
+                        code = cm.Lines(1, cm.CountOfLines)
+                        if pattern.search(code):
+                            try:
+                                if p.Filename:
+                                    found_wb = os.path.basename(p.Filename)
+                                    break
+                            except Exception:
+                                pass
+                            found_wb = p.Name
+                            break
+                if found_wb:
+                    break
+        except Exception as ex:
+            print(f"[DEBUG] Failed to search macro location: {ex}", file=sys.stderr)
+
+        if found_wb:
+            full_macro_path = f"{found_wb}!{macro_name}"
+            print(f"[DEBUG] Macro found in: {found_wb}", file=sys.stderr)
+        else:
+            print(f"[WARNING] Macro '{macro_name}' not found in open projects. Trying direct run.", file=sys.stderr)
+
+    print(f"マクロ実行中: {full_macro_path}", file=sys.stderr)
+
+    try:
+        # マクロ実行
+        result = xl.Application.Run(full_macro_path)
+
+        if getattr(args, 'json', False):
+            import json
+            print(json.dumps({"success": True, "macro": full_macro_path, "result": str(result)}, ensure_ascii=False), file=sys.stdout)
+        else:
+            print(f"マクロ実行成功。戻り値: {result}")
+        return True
+    except Exception as e:
+        err_msg = str(e)
+        if getattr(args, 'json', False):
+            import json
+            print(json.dumps({"success": False, "macro": full_macro_path, "error": err_msg}, ensure_ascii=False), file=sys.stdout)
+        else:
+            print(f"エラー: マクロの実行に失敗しました: {err_msg}", file=sys.stderr)
+        return False
 
 
 # ================================================================
@@ -3901,10 +4647,18 @@ def main():
     p = sub.add_parser("list")
     p.add_argument("posargs", nargs="*")
     p.add_argument("--standard", action="store_true", help="標準モジュールのみを抽出")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+    p.add_argument("--personal", action="store_true", help="個人用マクロブック (PERSONAL.XLSB) を対象にする")
+    p.add_argument("--addin", action="store_true", help="アドインブック (秀.xlam 等) を対象にする")
+    p.add_argument("--all", action="store_true", help="開いているすべてのブック・アドインを対象にする")
 
     # list-modules [excel_file]
     p = sub.add_parser("list-modules")
     p.add_argument("posargs", nargs="*")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+    p.add_argument("--personal", action="store_true", help="個人用マクロブック (PERSONAL.XLSB) を対象にする")
+    p.add_argument("--addin", action="store_true", help="アドインブック (秀.xlam 等) を対象にする")
+    p.add_argument("--all", action="store_true", help="開いているすべてのブック・アドインを対象にする")
 
     # get [excel_file] <macro_name>
     p = sub.add_parser("get")
@@ -3924,6 +4678,12 @@ def main():
     # list-shortcuts [excel_file]
     p = sub.add_parser("list-shortcuts")
     p.add_argument("posargs", nargs="*")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+
+    # run-macro [excel_file] <macro_name> [args...]
+    p = sub.add_parser("run-macro", help="Excel内の指定されたマクロを実行します")
+    p.add_argument("posargs", nargs="+")
+    p.add_argument("--json", action="store_true", help="実行結果をJSON形式で出力")
 
     # replace-module [excel_file] <module_name> <bas_file>
     p = sub.add_parser("replace-module")
@@ -4181,9 +4941,15 @@ def main():
     p.add_argument("--color", choices=['mono', 'color'], help="カラーモード（mono:モノクロ, color:カラー）")
     p.add_argument("--orientation", choices=['portrait', 'landscape'], help="用紙の向き（portrait:縦, landscape:横）")
 
-    args = parser.parse_args()
+    # check [excel_file]
+    p = sub.add_parser("check", help="全モジュールの構文チェックと診断を実行します")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+
+    args, unknown = parser.parse_known_args()
 
     cmds = {
+        "check":             cmd_check,
         "diag":              cmd_diag,
         "list-open":         cmd_list_open,
         "list":              cmd_list,
@@ -4194,6 +4960,7 @@ def main():
         "export-module":     cmd_export_module,
         "reorder-macro":     cmd_reorder_macro,
         "list-shortcuts":    cmd_list_shortcuts,
+        "run-macro":         cmd_run_macro,
         "read-range":        cmd_read_range,
         "read-selection":    cmd_read_selection,
         "sheet-info":        cmd_sheet_info,
@@ -4235,13 +5002,17 @@ def main():
     }
 
     if args.command in cmds:
+        ok = False
         try:
-            ok = cmds[args.command](args)
-        except SystemExit:
-            raise                      # reorder-macro 等は自前の終了コードを使う
-        except Exception as e:
-            print(f"エラー: {e}")
-            sys.exit(1)
+            try:
+                ok = cmds[args.command](args)
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"エラー: {e}")
+                sys.exit(1)
+        finally:
+            cleanup_excel()
         # 明示的に False を返したコマンドは失敗(1)、それ以外は成功(0)
         sys.exit(0 if ok is not False else 1)
     else:

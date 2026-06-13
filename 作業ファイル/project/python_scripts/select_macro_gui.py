@@ -33,7 +33,7 @@ class VBAManagerGUI(ctk.CTk):
         # ---- サイドバー ----
         self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(5, weight=1)
+        self.sidebar_frame.grid_rowconfigure(6, weight=1)
 
         ctk.CTkLabel(self.sidebar_frame, text="VBA Manager",
                      font=ctk.CTkFont(size=20, weight="bold")
@@ -57,7 +57,14 @@ class VBAManagerGUI(ctk.CTk):
         self.proc_label = ctk.CTkLabel(
             self.sidebar_frame, text="コード: (未取得)",
             text_color="gray", font=ctk.CTkFont(size=11), wraplength=170)
-        self.proc_label.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="w")
+        self.proc_label.grid(row=4, column=0, padx=20, pady=(0, 10), sticky="w")
+
+        # 使い方マニュアルボタンを追加
+        self.manual_button = ctk.CTkButton(
+            self.sidebar_frame, text="📖 使い方マニュアル",
+            font=ctk.CTkFont(size=12),
+            command=self.btn_open_manual)
+        self.manual_button.grid(row=5, column=0, padx=20, pady=(10, 20), sticky="ew")
 
         self.after(100, self.load_excel_files)
         self.after(500, self.refresh_proc_label)
@@ -84,6 +91,7 @@ class VBAManagerGUI(ctk.CTk):
             ("🔬 詳細解析",            self.btn_analyze),
             ("☑  構文チェック",        self.btn_syntax_check),
             ("🩺 診断",               self.btn_diag),
+            ("🛠️ フォーム作成",       self.btn_create_form),
         ]
 
         row, col = 0, 0
@@ -363,6 +371,45 @@ class VBAManagerGUI(ctk.CTk):
 
     def btn_diag(self):
         self.run_backend_command(["diag"])
+
+    def btn_create_form(self):
+        """フォーム作成ダイアログを開く"""
+        self.open_create_form_dialog()
+
+    def btn_open_manual(self):
+        """使い方マニュアルを開く"""
+        manual_path = os.path.abspath(
+            os.path.join(SCRIPTS_DIR, "..", "..", "..", "使い方マニュアル.txt"))
+        if os.path.exists(manual_path):
+            self.open_in_editor(manual_path)
+        else:
+            self.append_log("[エラー] 使い方マニュアル.txt が見つかりません。")
+
+    def open_create_form_dialog(self):
+        forms_info = [
+            ("カレンダーフォーム (F_Calendar)", "create_f_calendar.py"),
+            ("ノード編集フォーム", "create_node_edit_form.py"),
+            ("サイズ入力フォーム (F_ResizeSelect)", "create_resize_form.py"),
+            ("ワークシート一覧フォーム (ワークシート一覧)", "rebuild_ws_form.py"),
+        ]
+
+        target_file = self.get_target_file_path()
+
+        def on_select(selected_item):
+            script_name = None
+            for display_name, s_name in forms_info:
+                if display_name == selected_item:
+                    script_name = s_name
+                    break
+            if script_name:
+                script_path = os.path.join(SCRIPTS_DIR, script_name)
+                self.run_script(script_path, [target_file],
+                                 callback=lambda: self.append_log(f"✓ {selected_item} の作成が完了しました。"))
+
+        display_names = [info[0] for info in forms_info]
+        self._make_select_dialog(
+            "作成するフォームを選択",
+            display_names, on_select)
 
     # ================================================================
     # ダイアログ
