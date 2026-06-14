@@ -347,25 +347,17 @@ def main():
     # --- Excel に適用 ---
     print("\n【Excel に適用】")
     pythoncom.CoInitialize()
-    # 起動中の Excel を掴む（開いて閉じる方式は禁止＝アクティブな開いてるブックに作業）
+    # 起動中の Excel のアクティブブックに作業（特定ブックに限定しない＝汎用）
     try:
         xl = win32com.client.GetActiveObject("Excel.Application")
     except Exception:
-        print("  ! Excel が起動していません。秀を開いてから実行してください。")
+        print("  ! Excel が起動していません。対象ブックを開いてから実行してください。")
         return
 
     try:
-        # 開いているブックから shu001/shu003 を持つ本体を掴む（パス・ブック名に非依存）
-        wb = None
-        for w in xl.Workbooks:
-            try:
-                if any(c.Name in ("shu001", "shu003") for c in w.VBProject.VBComponents):
-                    wb = w
-                    break
-            except Exception:
-                continue
+        wb = xl.ActiveWorkbook
         if wb is None:
-            print("  ! shu001/shu003 を持つブックが開かれていません。秀を開いてから実行してください。")
+            print("  ! アクティブなブックがありません。対象ブックを開いてから実行してください。")
             return
         print(f"  対象ブック: {wb.Name}")
 
