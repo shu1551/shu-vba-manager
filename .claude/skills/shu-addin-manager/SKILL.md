@@ -1,219 +1,68 @@
 ---
 name: shu-addin-manager
 description: |
-  秀.xlsm（Excel VBAアドインソフト）のマクロ追加・修正・管理を行うスキル。
-  秀.xlsm はアドインとして登録し、どのExcelファイルからでもマクロをメニュー表示・実行できる
-  ユニークなアドインフレームワーク。shu001モジュールにマクロを追加するだけでメニューに自動反映される。
+  秀.xlsm 固有の情報を扱うスキル。秀.xlsm は Excel VBA アドインソフトで、標準モジュール(本体は shu003)に
+  Sub を書くだけでアクティブマクロフォームのメニューに自動表示・実行できるフレームワーク。
+  このスキルが持つのは秀.xlsm固有の事実（ファイルパス・モジュール地図 shu003/004/005・フォーム一覧・
+  アドインの仕組み）だけ。
 
-  このスキルは以下のときに必ず使うこと：
-  - ユーザーが「秀」「アドイン」「shu001」「shu003」に言及したとき
-  - 「マクロを追加して」「マクロを修正して」「VBAマクロ」などExcel VBAアドイン関連の作業
-  - vba_manager.py や form_builder.py を使う作業
-  - 秀.xlsm のプロシージャやモジュールの操作
-  - Excel VBA のショートカットキー設定やAttribute行の操作
+  以下のとき使う（秀.xlsm を名指ししたときだけ）：
+  - 「秀」「秀.xlsm」「アドイン」「shu001 / shu003 / shu005」に言及したとき
+  - 秀.xlsm のモジュール構成・フォーム・パスを知りたいとき
+
+  ※ vba_manager.py / form_builder.py の使い方・コマンド・標準作業フロー・.bas の扱いは
+    汎用スキル **excel-vba-manager** にある。秀.xlsm への操作も、ツールの手順はそちらに従う
+    （Excel で秀.xlsm を開いてアクティブにして操作する＝対象はアクティブブック）。
 ---
 
-# 秀.xlsm アドインマネージャー
+# 秀.xlsm（固有情報）
 
-## 概要
+## これは何か
 
-秀.xlsm は Excel VBA アドインソフト。shu001 モジュールにマクロ（Sub）を書くだけで、
+秀.xlsm は Excel VBA アドインソフト。標準モジュール（現在の本体は shu003）にマクロ（Sub）を書くだけで、
 アクティブマクロフォームのメニューに自動表示され、選択して実行できる。
 専門知識なしでオリジナルのアドインソフトが作成できるフレームワーク。
 
+> ⚠ ツールの使い方（list / get / replace-procedure、目/手コマンド、ピボット・パワークエリ等、
+> .bas の CP932 取り扱い、UserForm 作成）は **excel-vba-manager スキル**を見ること。
+> ここに置くのは秀.xlsm 固有の「地図」だけ。秀.xlsm を操作するときも、Excel で秀.xlsm を開いて
+> アクティブにし、excel-vba-manager の手順で操作する（対象はアクティブブック）。
+
 ## 重要パス
 
-このスキルはリポジトリのルートで `claude` を起動して使う前提。
-パスはすべてリポジトリルートからの相対。
-
 ```
-秀.xlsm:            秀.xlsm（リポジトリルート直下）
-SCRIPTS:            作業ファイル\project\python_scripts\
-vba_manager.py:     SCRIPTS\vba_manager.py（メイン管理ツール）
-form_builder.py:    SCRIPTS\form_builder.py（UserForm作成モジュール）
-_last_proc.vba:     SCRIPTS\_last_proc.vba（get の出力先、UTF-8）
-backups:            作業ファイル\backups\（自動バックアップ格納場所）
+秀.xlsm:            C:\Users\shu\Desktop\アプリ\秀 20260113\秀.xlsm
+shu003.bas:         SCRIPTS\shu003.bas（標準モジュール本体・正規ソース／約1719行）
+shu004.bas:         SCRIPTS\shu004.bas（クリーン化・祝日更新）
+shu005.bas:         SCRIPTS\shu005.bas（アドイン管理：有効/無効/登録/一覧）
+（shu001/shu002 は現在空。.bas は SCRIPTS に存在するが中身なし）
 ```
-
-標準モジュールの正規ソース（shu001.bas / shu003.bas 等）はリポジトリには含まれない。
-必要なときは `export-module` で 秀.xlsm 本体から取り出す。
+> SCRIPTS（python_scripts）の場所と vba_manager.py 等の実行方法は excel-vba-manager スキル参照。
 
 ## 秀.xlsm の構成
 
-- **標準モジュール**: shu001, shu003, Module1
-- **主要フォーム**: アクティブマクロフォーム ほか
-- 構成はアドインの育て方によって変わる。`list-modules` で実際の状態を確認すること。
+- **標準モジュール**: shu003（約1,719行・作業マクロ本体／約99サブ）, shu005（266行・アドイン管理／7サブ）,
+  shu004（255行・クリーン化と祝日更新／5サブ）。shu001・shu002 は現在空
+- **主要フォーム**: アクティブマクロフォーム, テキストフォーム, ボタンフォーム, 一覧,
+  絞込検索フォーム, 日付フォーム, プリンタ, セル一覧, ワークシート一覧,
+  倍率回転フォーム, ファイル名一覧, パーソナルマクロフォーム, マクロフォーム,
+  位置情報, F_Calendar, UserForm1, 記憶
+- **シート**: Sheet2(記憶), ThisWorkbook
 
-## vba_manager.py コマンド一覧
+## 秀.xlsm 固有の注意
 
-すべてのコマンドは SCRIPTS ディレクトリから実行する。Excelで秀.xlsmを開いた状態で使う。
-**コマンドは `py` を使うこと（`python` ではない）。**
+### マクロを追加するだけでメニューに出る
+標準モジュール（shu003）に Sub を追加すると、アクティブマクロフォームのメニューに自動で並ぶ。
+二重帳簿（リボン定義等）は不要。表示順は replace-module 時のモジュール並びに影響される
+（excel-vba-manager の「replace-module の副作用」参照）。
 
-```bash
-cd 作業ファイル\project\python_scripts
+### マウスホイール対応（現状：未実装）
+> 秀.xlsm に ListBox のマウスホイール対応は **実装されていない**（2026-05 時点で全モジュール走査して確認）。
+> 以前「shu001 の `ホイール有効化`/`ホイール無効化` を呼ぶ」と記載していたが、その Sub は現存しない
+> （shu001 は空）。各フォームにもホイール処理の Sub・API宣言（`SetWindowsHookEx` 等）は無く、
+> マクロフォーム／パーソナルマクロフォームに「ListBox1 のホイールスクロールを有効化」という
+> コメントだけが残っている。
 
-# マクロ一覧表示
-py vba_manager.py list
-
-# モジュール一覧表示
-py vba_manager.py list-modules
-
-# プロシージャのコード取得 → _last_proc.vba に保存
-py vba_manager.py get <Sub名>
-
-# モジュール指定してプロシージャ取得（同名プロシージャが複数ある場合に使う）
-py vba_manager.py get <モジュール名> <Sub名>
-py vba_manager.py get <モジュール名>.<Sub名>   # ドット区切りも可
-
-# _last_proc.vba の内容でプロシージャを置換（バックアップ自動作成）
-py vba_manager.py replace-procedure -y
-#  ※ -y/--yes で確認プロンプト(y/N)をスキップ。Claude等の非対話実行では必ず -y を付ける。
-#    差分(Diff)は -y を付けても表示される。--module <名> で対象モジュールの明示も可。
-
-# モジュール全体を Remove+Import で置換
-py vba_manager.py replace-module <モジュール名> <basファイル>
-
-# モジュールを .bas にエクスポート
-py vba_manager.py export-module <モジュール名>
-```
-
-## 標準作業フロー（マクロ修正）
-
-この手順を必ず守ること。勝手にコードを変更しない。
-
-1. `py vba_manager.py list` でマクロ一覧を確認
-2. `py vba_manager.py get <Sub名>` で対象コードを取得
-   - 同名プロシージャが複数フォームにある場合は **モジュール指定** を使う：
-     `py vba_manager.py get <モジュール名> <Sub名>`
-3. `_last_proc.vba` を Read ツールで読み、修正内容を検討
-4. 修正後のコードを `_last_proc.vba` に Write
-5. `py vba_manager.py replace-procedure -y` で適用（非対話実行のため -y 必須）
-6. ユーザーに動作確認を依頼
-
-## 標準作業フロー（フォームの .bas を修正して適用）
-
-フォームや複数プロシージャをまとめて修正する場合（.bas ファイルを直接編集）：
-
-1. `py vba_manager.py export-module <モジュール名>` で最新の .bas をエクスポート
-2. Python スクリプトで CP932 のまま編集する（Edit/Write ツール禁止）：
-   ```python
-   # 編集スクリプトの雛形
-   path = r"作業ファイル\project\python_scripts\対象フォーム.bas"
-   with open(path, 'r', encoding='cp932') as f:
-       lines = f.readlines()
-   # 行番号ベースで修正（多行文字列マッチは使わない）
-   # lines[N] = 新しい行内容
-   with open(path, 'w', encoding='cp932') as f:
-       f.writelines(lines)
-   ```
-   **行番号は inspect スクリプトで事前確認する：**
-   ```python
-   with open(path, 'r', encoding='cp932') as f:
-       lines = f.readlines()
-   for i, line in enumerate(lines, 1):
-       if "対象キーワード" in line:
-           print(f"L{i}: {repr(line)}")
-   ```
-3. `py vba_manager.py replace-module <モジュール名> <basファイル>` で適用
-
-## 標準作業フロー（標準モジュール全体の適用）
-
-.bas ファイルを編集してモジュール全体を置換する場合：
-
-1. `py vba_manager.py export-module <モジュール名>` でエクスポート
-2. .bas ファイルを Python で CP932 のまま編集
-3. `py vba_manager.py replace-module <モジュール名> <basファイル>` で適用
-
-## UserForm の作成・修正
-
-form_builder.py を使う。
-
-```python
-from form_builder import FormBuilder, add_btn, add_lbl, add_txt, add_lst, add_combo
-
-with FormBuilder.connect() as fb:  # アクティブブック接続
-    frm = fb.get_or_create("FormName", caption="タイトル", width=300, height=200)
-    f = fb.clear_controls(frm)
-    add_btn(f, "BtnOK", "OK", 80, 160, 60, 20)
-    add_lbl(f, "Label1", "テキスト", 10, 10, 100, 18)
-    add_txt(f, "TextBox1", 10, 30, 200, 22)
-    add_lst(f, "ListBox1", 10, 60, 200, 90)
-    fb.inject_vba(frm, "_form_code.vba")  # VBAコードを注入
-    fb.save()
-```
-
-デフォルトフォントは全コントロール 12pt。
-
-## 絶対に守るべきルール
-
-### 勝手な変更の禁止
-- 指示されていない機能を追加しない
-- 指示されていないコードを変更しない
-- 影響範囲を確認せずに変更しない
-
-### エンコーディング（最重要 - 違反厳禁）
-- .bas ファイルは **CP932**（Shift-JIS）で保存
-- win32com 経由の文字列は Unicode
-- _last_proc.vba は UTF-8
-
-**⚠ .bas ファイルに Edit ツール・Write ツールを絶対に使うな ⚠**
-Claude の Edit / Write ツールは UTF-8 で書き込むため、CP932 の .bas ファイルが破壊される。
-VBA にインポートするとモジュール名・プロシージャ名・日本語文字列が全て文字化けする。
-
-.bas ファイルを修正するときは必ず以下のいずれかを使うこと：
-1. **Python で CP932 のまま読み書き**:
-   ```python
-   with open(path, 'r', encoding='cp932') as f:
-       content = f.read()
-   # 修正処理
-   with open(path, 'w', encoding='cp932') as f:
-       f.write(content)
-   ```
-2. **_last_proc.vba 経由で replace-procedure**（プロシージャ単位の修正）
-
-### モジュール適用方式
-- AddFromString は Attribute 行を正しく処理しないことがある
-- **必ず Remove + Import 方式（replace-module）を使うこと**
-- ショートカットキーは Attribute VB_ProcData.VB_Invoke_Func で定義される
-
-### replace-module の副作用
-- Remove+Import でモジュールが VBComponents の末尾に移動する
-- アクティブマクロフォーム等でマクロの表示順が変わる場合がある
-- 影響を受けたモジュール（shu003等）も replace-module して順番を揃える
-
-### InsertLines の改行問題
-- Python の \n では正しく複数行に分割されないことがある
-- .bas ファイル直接編集方式を使うこと
-
-## マウスホイール対応
-
-ListBox を持つフォームではホイールスクロールを有効化する。
-shu001 に以下の Public Sub が定義済み：
-
-```vba
-' フォームの UserForm_Initialize で呼ぶ
-Public Sub ホイール有効化(対象リスト As Object)
-
-' フォームの UserForm_Terminate で呼ぶ
-Public Sub ホイール無効化()
-```
-
-フォーム側の実装例：
-```vba
-Private Sub UserForm_Initialize()
-    ホイール有効化 ListBox1
-End Sub
-
-Private Sub UserForm_Terminate()
-    ホイール無効化
-End Sub
-```
-
-## 変更前の確認チェックリスト
-
-コードを変更する前に必ず以下を確認：
-
-1. 変更対象のフォーム/モジュールが他の機能から参照されていないか
-2. AutoFilter の起点列（B1始まりかA1始まりか）
-3. 既存のコントロール名と用途（別機能で使われていないか）
-4. 変更がユーザーの指示の範囲内か
+ホイール対応が必要になったら、Win32 フック（`SetWindowsHookEx` + `WH_MOUSE_LL`）で新規に実装する。
+実装したら本節を実際の Sub 名・呼び出し手順に更新すること。
+存在しない `ホイール有効化`/`ホイール無効化` を呼ぶコードは書かないこと。

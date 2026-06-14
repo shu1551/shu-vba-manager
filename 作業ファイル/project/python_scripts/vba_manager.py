@@ -568,6 +568,123 @@ def make_module_backup(wb, module_name):
 # コマンド実装
 # ================================================================
 
+def _find_duplicate_procedures(norm_text):
+    """.bas 内の Sub/Function 名の重複を機械的に検出（重複プロシージャ挿入の検知）。
+
+    Property Get/Let/Set は同名が正常なので対象外（Sub/Function のみ）。
+    戻り値: {名前: [行番号, ...], ...}（重複のあるものだけ）
+    """
+    sub_pattern = re.compile(
+        r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
+        r'(?P<kind>Sub|Function)\s+(?P<name>[^\s\(]+)',
+        re.IGNORECASE
+    )
+    seen = {}
+    for idx, line in enumerate(norm_text.split('\n'), 1):
+        m = sub_pattern.match(line)
+        if m:
+            seen.setdefault(m.group('name'), []).append(idx)
+    return {name: lns for name, lns in seen.items() if len(lns) > 1}
+
+
+def _find_consecutive_dup_lines(norm_text):
+    """連続して同一の非空コード行を検出（重複挿入の臭い。例: On Error Resume Next ×2）。
+
+    空行・コメント行は対象外。空行を挟むとリセット（空行連続は正常）。
+    戻り値: [(行番号, 行内容), ...]
+    """
+    hits = []
+    prev = None
+    for idx, raw in enumerate(norm_text.split('\n'), 1):
+        s = raw.strip()
+        if s and not s.startswith("'") and s == prev:
+            hits.append((idx, s))
+        prev = s if s else None
+    return hits
+
+
+def cmd_check_bas(args):
+    """.bas を取り込む前の単体検査（COM不要）。
+
+    バイパス経路（vba_manager を通さず手書きスクリプトで .bas を作る）でも、取り込み前に
+    この1コマンドで「文字コード事故 / 改行二重化 / プロシージャ重複 / 連続重複行」を機械的に
+    検査できる。COM接続が落ちていても動くのが要点（安全確認を不安全な手順と同じ手数にする）。
+    --fix を付けると改行二重化だけ CP932 のまま自動修正する
+    （重複は判断が要るので自動修正しない＝Pythonは機械的検査まで）。
+    """
+    if not args.posargs:
+        print("使い方: py vba_manager.py check-bas <file.bas> [--fix]")
+        return False
+    path = args.posargs[0]
+    if not os.path.isfile(path):
+        print(f"エラー: ファイルが見つかりません: {path}")
+        return False
+
+    name = os.path.basename(path)
+    print(f"===== .bas 取り込み前検査: {name} =====")
+    problems = 0
+    warnings = 0
+
+    # 1. 文字コード事故（UTF-8化 / BOM）
+    if not validate_bas_encoding(path):
+        problems += 1
+    else:
+        print("  [OK] 文字コード: CP932 として安全")
+
+    # 2. 改行二重化（\r\r\n）
+    try:
+        fixed_bytes, raw_bytes, was_doubled = normalize_bas_newlines(path)
+    except Exception as e:
+        print(f"エラー: 改行検査に失敗 ({e})")
+        return False
+    if was_doubled:
+        before = len(re.split(r'\r\n|\r|\n', raw_bytes.decode('cp932')))
+        after = len(re.split(r'\r\n|\r|\n', fixed_bytes.decode('cp932')))
+        if getattr(args, 'fix', False):
+            with open(path, 'wb') as f:
+                f.write(fixed_bytes)
+            print(f"  [FIXED] 改行二重化を修正しました: {before}行 → {after}行")
+        else:
+            print(f"  [NG] 改行二重化を検知: {before}行 → {after}行（--fix で修正可）")
+            problems += 1
+    else:
+        print("  [OK] 改行: 正規 CRLF（二重化なし）")
+
+    # 3/4 の検査は現在のファイル内容（--fix 後を反映）に対して行う
+    with open(path, 'rb') as f:
+        norm_text = re.sub(r'\r\n|\r', '\n', f.read().decode('cp932'))
+
+    # 3. プロシージャ名の重複（重複挿入の検知・自動修正しない）
+    dups = _find_duplicate_procedures(norm_text)
+    if dups:
+        print("  [NG] Sub/Function 名の重複を検知（重複挿入の疑い・自動修正しません）:")
+        for nm, lns in dups.items():
+            print(f"        {nm}  (行 {', '.join(map(str, lns))})")
+        problems += 1
+    else:
+        print("  [OK] プロシージャ名: 重複なし")
+
+    # 4. 連続する同一コード行（On Error Resume Next ×2 等の臭い）
+    cdl = _find_consecutive_dup_lines(norm_text)
+    if cdl:
+        print("  [WARN] 連続する同一コード行（重複挿入の臭い・要確認）:")
+        for ln, s in cdl[:20]:
+            disp = s if len(s) <= 60 else s[:60] + '…'
+            print(f"        行{ln}: {disp}")
+        if len(cdl) > 20:
+            print(f"        … 他 {len(cdl) - 20} 件")
+        warnings += 1
+    else:
+        print("  [OK] 連続重複行: なし")
+
+    print(f"----- 結果: 問題 {problems} / 警告 {warnings} -----")
+    if problems:
+        print("  ⚠ 問題があります。修正してから replace-module / replace-procedure で取り込んでください。")
+        return False
+    print("  取り込み可（手書きでも、取り込みは replace-module / replace-procedure 経由を推奨）。")
+    return True
+
+
 def cmd_check(args):
     """VBAコードの静的解析・診断を行う"""
     target_file, _ = parse_target_and_rest(args.posargs)
@@ -5048,10 +5165,16 @@ def main():
     p.add_argument("posargs", nargs="*")
     p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
 
+    # check-bas <file.bas> [--fix]  (COM不要・取り込み前の単体検査)
+    p = sub.add_parser("check-bas", help="取り込み前に .bas を単体検査（文字コード/改行二重化/重複）。COM不要")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--fix", action="store_true", help="改行二重化を CP932 のまま自動修正する")
+
     args, unknown = parser.parse_known_args()
 
     cmds = {
         "check":             cmd_check,
+        "check-bas":         cmd_check_bas,
         "diag":              cmd_diag,
         "list-open":         cmd_list_open,
         "list":              cmd_list,
