@@ -12,7 +12,6 @@ import pythoncom
 sys.stdout.reconfigure(encoding='utf-8')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-XLSM_PATH = r'c:\Users\shu\Desktop\秀 20260113\秀.xlsm'
 
 
 def read_bas_cp932(fname):
@@ -348,24 +347,34 @@ def main():
     # --- Excel に適用 ---
     print("\n【Excel に適用】")
     pythoncom.CoInitialize()
-    xl = win32com.client.Dispatch("Excel.Application")
-    xl.Visible = True
+    # 起動中の Excel を掴む（開いて閉じる方式は禁止＝アクティブな開いてるブックに作業）
+    try:
+        xl = win32com.client.GetActiveObject("Excel.Application")
+    except Exception:
+        print("  ! Excel が起動していません。秀を開いてから実行してください。")
+        return
 
     try:
-        # 既に開いている場合はそれを使用、なければ開く
-        try:
-            wb = xl.Workbooks(os.path.basename(XLSM_PATH))
-            print("  既に開いているブックを使用")
-        except Exception:
-            wb = xl.Workbooks.Open(XLSM_PATH)
-            print(f"  ブックを開きました: {os.path.basename(XLSM_PATH)}")
+        # 開いているブックから shu001/shu003 を持つ本体を掴む（パス・ブック名に非依存）
+        wb = None
+        for w in xl.Workbooks:
+            try:
+                if any(c.Name in ("shu001", "shu003") for c in w.VBProject.VBComponents):
+                    wb = w
+                    break
+            except Exception:
+                continue
+        if wb is None:
+            print("  ! shu001/shu003 を持つブックが開かれていません。秀を開いてから実行してください。")
+            return
+        print(f"  対象ブック: {wb.Name}")
 
         ok1 = apply_module(wb, 'shu001', 'shu001_optimized.bas')
         ok3 = apply_module(wb, 'shu003', 'shu003_optimized.bas')
 
         if ok1 and ok3:
             wb.Save()
-            print("  ✓ 秀.xlsm 保存完了")
+            print(f"  ✓ {wb.Name} 保存完了")
         else:
             print("  ! エラーがあるため保存しませんでした")
 
