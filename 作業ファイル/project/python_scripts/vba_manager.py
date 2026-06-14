@@ -281,6 +281,39 @@ def load_excel_addins_and_personal(xl):
         pass
 
 
+def _running_excel_workbooks():
+    """Running Object Table を走査し、起動中の全 Excel の全ブックを返す。
+
+    GetActiveObject は ROT 先頭の1インスタンスしか返さず、非表示ゾンビ Excel
+    (ブック0個)を掴むことがある。ROT を直接舐めれば、実際にブックを開いている
+    インスタンスだけ拾える(ゾンビはブックを持たないので現れない)。
+    失敗時は [] を返し、呼び出し側は GetActiveObject にフォールバックする。
+    """
+    wbs = []
+    try:
+        rot = pythoncom.GetRunningObjectTable()
+        ctx = pythoncom.CreateBindCtx(0)
+        monikers = list(rot)
+    except Exception:
+        return wbs
+    for mon in monikers:
+        try:
+            disp = mon.GetDisplayName(ctx, None)
+        except Exception:
+            continue
+        # Excel のブックはフルパス(...\xxx.xlsm 等)で ROT 登録される
+        if not disp or not re.search(r'\.xl\w{1,4}$', disp, re.IGNORECASE):
+            continue
+        try:
+            obj = rot.GetObject(mon)
+            wb = win32com.client.Dispatch(obj.QueryInterface(pythoncom.IID_IDispatch))
+            _ = wb.FullName  # ブックか確認(違えば例外)
+            wbs.append(wb)
+        except Exception:
+            continue
+    return wbs
+
+
 def get_workbook(target_file_arg=None, load_addins=False):
     """
     target_file_arg が None/空 → アクティブExcelブックを自動使用
@@ -290,15 +323,33 @@ def get_workbook(target_file_arg=None, load_addins=False):
     pythoncom.CoInitialize()
 
     if not target_file_arg:
-        try:
-            xl = win32com.client.GetActiveObject("Excel.Application")
-        except Exception:
-            raise Exception(
-                "Excelが起動していません。Excelを開いてから実行してください。")
-        wb = xl.ActiveWorkbook
+        # ROT 全インスタンス横断で、実ブックを持つ Excel を選ぶ(ゾンビ自動回避)
+        wb = None
+        for cand in _running_excel_workbooks():
+            try:
+                app = cand.Application
+                if app.Visible and app.ActiveWorkbook is not None:
+                    wb = app.ActiveWorkbook   # 可視インスタンスのアクティブブックを最優先
+                    break
+                if wb is None:
+                    wb = cand                  # 暫定: 実ブックを持つ最初のもの
+            except Exception:
+                continue
+        if wb is None:
+            # ROT に出ない稀ケース(未保存ブック等)は GetActiveObject で再挑戦
+            try:
+                wb = win32com.client.GetActiveObject("Excel.Application").ActiveWorkbook
+            except Exception:
+                wb = None
         if wb is None:
             raise Exception(
-                "アクティブなブックがありません。Excelでブックを開いてください。")
+                "起動中の Excel に開いているブックが見つかりません。\n"
+                "  ・Excel で対象ブックを開いてから再実行してください。\n"
+                "  ・非表示のゾンビ EXCEL.EXE が残っている場合があります。"
+                "タスクマネージャーで余分な EXCEL.EXE を終了し、対象ブックを開いて再実行してください。\n"
+                "  ※ COM 接続できないからといって .bas を手書きスクリプトで処理しないこと"
+                "(改行二重化の原因)。")
+        xl = wb.Application
         print(f"対象ブック: {wb.Name}  (アクティブブック自動検出)")
         if load_addins:
             load_excel_addins_and_personal(xl)
@@ -308,20 +359,25 @@ def get_workbook(target_file_arg=None, load_addins=False):
     if not target_path:
         raise Exception(f"ファイルが見つかりません: {target_file_arg}")
 
-    # 既に開いているか確認
+    # 既に開いているか確認(全 Excel インスタンス横断)
     excel_running = False
-    try:
-        xl = win32com.client.GetActiveObject("Excel.Application")
+    for wb in _running_excel_workbooks():
         excel_running = True
-        for i in range(1, xl.Workbooks.Count + 1):
-            wb = xl.Workbooks(i)
+        try:
             if wb.FullName.lower() == target_path.lower():
+                xl = wb.Application
                 print(f"対象ブック: {wb.Name}  (既に開いています)")
                 if load_addins:
                     load_excel_addins_and_personal(xl)
                 return xl, wb
-    except Exception:
-        pass
+        except Exception:
+            continue
+    if not excel_running:
+        try:
+            win32com.client.GetActiveObject("Excel.Application")
+            excel_running = True
+        except Exception:
+            excel_running = False
 
     # 新規オープン
     xl = win32com.client.Dispatch("Excel.Application")
