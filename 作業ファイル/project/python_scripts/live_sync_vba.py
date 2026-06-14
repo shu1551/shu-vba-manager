@@ -85,8 +85,6 @@ End Sub
                 
                 # 3. メモリ上のテキストをVBAにそのまま書き戻す（これが文字化けしない最強の方法）
                 cm.DeleteLines(1, cm.CountOfLines)
-                # 改行を正規CRLFに揃える（改行二重化ガード）
-                new_code = re.sub(r'\r+\n?', '\n', new_code).replace('\n', '\r\n')
                 cm.AddFromString(new_code)
                 print(f"Updated {mod_name} (Removed descriptions, added macro if needed)")
                 

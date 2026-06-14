@@ -19,7 +19,6 @@ form_builder.py - UserForm作成のための共通ユーティリティ
 """
 
 import os
-import re
 import pythoncom
 import win32com.client
 
@@ -304,8 +303,6 @@ class FormBuilder:
         cm = frm_comp.CodeModule
         if cm.CountOfLines > 0:
             cm.DeleteLines(1, cm.CountOfLines)
-        # 改行を正規CRLFに揃える（改行二重化ガード／AddFromString直前の防御統一）
-        code = re.sub(r'\r+\n?', '\n', code).replace('\n', '\r\n')
         cm.AddFromString(code)
         print(f"VBAコード注入完了 ({os.path.basename(vba_file)})")
 
