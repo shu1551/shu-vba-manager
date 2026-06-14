@@ -591,13 +591,16 @@ def _find_consecutive_dup_lines(norm_text):
     """連続して同一の非空コード行を検出（重複挿入の臭い。例: On Error Resume Next ×2）。
 
     空行・コメント行は対象外。空行を挟むとリセット（空行連続は正常）。
+    入れ子で正常に連続しうるブロック終端等（End If / End With / Next / Loop / Else / Wend）は
+    重複扱いしない（実モジュールでの誤検知を避ける）。
     戻り値: [(行番号, 行内容), ...]
     """
+    struct = re.compile(r'^(end\b|else\b|elseif\b|next\b|loop\b|wend\b)', re.IGNORECASE)
     hits = []
     prev = None
     for idx, raw in enumerate(norm_text.split('\n'), 1):
         s = raw.strip()
-        if s and not s.startswith("'") and s == prev:
+        if s and not s.startswith("'") and s == prev and not struct.match(s):
             hits.append((idx, s))
         prev = s if s else None
     return hits
