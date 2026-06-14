@@ -1,13 +1,24 @@
-# 秀.xlsm VBAマネージャー — プロジェクトルール
+# Excel VBA マネージャー — プロジェクトルール
 
-このリポジトリは Excel VBA アドイン「秀.xlsm」を Claude Code で
-会話しながら操作するためのツールキット。Claude はこの指示に必ず従うこと。
+このリポジトリは Excel の VBA マクロ・シート・テーブル・ピボット・パワークエリ等を
+Claude Code で会話しながら操作するための **汎用ツールキット**。
+**対象は常に「今アクティブに開いている Excel ブック（ActiveWorkbook）」** で、特定のブックに依存しない。
+Excel VBA アドイン「秀.xlsm」は、その代表的な利用例として同梱しているにすぎない。
+Claude はこの指示に必ず従うこと。
+
+## 対象の原則（最重要・まずこれを当てる）
+
+- `vba_manager.py` / `form_builder.py` は **アクティブな開いているブック** に対して動く。
+  引数なし＝アクティブブック、第1引数にパスを渡せばそのファイルを対象にする。
+- 特定ブック名・パス・モジュール名（`shu001`/`shu003` 等）に**限定／依存させない**。
+- 既存コードに `XLSM_PATH` や `shu001` 等の固有名詞があっても「対象」と鵜呑みにしない。
+  **固有名詞より「対象はアクティブブック」を先に当てる**。秀.xlsm を亡霊のように呼び戻さない。
 
 ## 作業の前提
 
 - スクリプトは `作業ファイル/project/python_scripts/` から実行する
 - Python は `py` コマンドを使う（`python` ではない）
-- Excel で 秀.xlsm を開いた状態で操作する
+- 操作したいブックを Excel で開いてアクティブにしておく（秀.xlsm はその一例）
 - 事前に Excel のトラストセンターで
   「VBA プロジェクト オブジェクト モデルへのアクセスを信頼する」を有効にしておく
 
@@ -38,8 +49,17 @@ VBA モジュールが破壊される。
 2. `py vba_manager.py get <Sub名>` で対象コードを取得（_last_proc.vba に出力）
 3. `_last_proc.vba` を Read ツールで読み、修正内容を検討
 4. 修正後のコードを `_last_proc.vba` に Write
-5. `py vba_manager.py replace-procedure` で適用
+5. `py vba_manager.py replace-procedure -y` で適用（非対話実行では -y 必須）
 6. ユーザーに動作確認を依頼
+
+## 取り込み前の検査（check-bas）
+
+手書きで `.bas` を作った場合など、取り込む前に機械的な事故を1コマンドで検査できる（COM不要）：
+
+```bash
+py vba_manager.py check-bas <file.bas>         # 文字コード/改行二重化/重複を検査
+py vba_manager.py check-bas <file.bas> --fix   # 改行二重化(\r\r\n)だけ自動修正
+```
 
 ## 守ること
 
@@ -47,4 +67,6 @@ VBA モジュールが破壊される。
 - 指示されていないコードを変更しない
 - 影響範囲を確認せずに変更しない
 
-詳しい手順は `.claude/skills/shu-addin-manager/SKILL.md` を参照。
+詳しい手順は `.claude/skills/excel-vba-manager/SKILL.md`（汎用ツールの全コマンド・標準フロー）を参照。
+秀.xlsm 固有の情報（モジュール構成・フォーム一覧・アドインの仕組み）は
+`.claude/skills/shu-addin-manager/SKILL.md` を参照。
