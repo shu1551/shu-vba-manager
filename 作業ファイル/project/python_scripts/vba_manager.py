@@ -420,6 +420,31 @@ def validate_bas_encoding(path):
     return True
 
 
+def normalize_bas_newlines(path):
+    """インポート前に .bas の改行を正規 CRLF に揃える（改行二重化アーティファクトの水際修正）。
+
+    「export → 編集 → テキストモードで書き戻し」の経路では、\\r\\n の各 \\n の前に
+    余分な \\r が足されて \\r\\r\\n になることがある。これを VBA の Import に通すと
+    1行おきに空行が挟まり、モジュールの行数が倍に膨れる（過去に繰り返した二重化事故の正体）。
+    validate_bas_encoding が「文字コード事故」を弾くのと対になる「改行事故」の水際チェック。
+
+    返り値 (fixed_bytes, raw_bytes, was_fixed):
+        was_fixed=False なら元と完全一致＝無加工。True なら二重化等を検知・修正済み。
+
+    クリーンな CRLF ファイルには冪等（バイト列が変わらないので was_fixed=False）。
+    空行 (\\r\\n\\r\\n) は各 \\r\\n が個別にマッチするため保持される。
+    """
+    with open(path, 'rb') as f:
+        raw = f.read()
+    text = raw.decode('cp932')
+    # \r を1個以上含む改行（\r\n / \r\r\n / \r\r\r\n / lone \r）を一旦 \n に畳む
+    norm = re.sub(r'\r+\n?', '\n', text)
+    # lone \n（Unix改行）も含め、すべて正規 CRLF へ揃える
+    norm = norm.replace('\n', '\r\n')
+    fixed = norm.encode('cp932')
+    return fixed, raw, (fixed != raw)
+
+
 def validate_vba_code(code, force=False):
     """VBAコードの簡易バリデーション（構文・エンコード）"""
     # 1. CP932エンコード検証
@@ -1401,6 +1426,23 @@ def cmd_replace_module(args):
     if not validate_bas_encoding(resolved):
         return False
 
+    # 改行二重化（\r\r\n 化）の水際チェック＆修正。
+    # 過去の二重化事故は、外部で作られた .bas が既に倍増した状態で replace-module に
+    # 渡され、それを無検査で Import したのが原因だった。ここで修正してから取り込む。
+    import_path = resolved
+    tmp_norm = None
+    fixed_bytes, raw_bytes, was_fixed = normalize_bas_newlines(resolved)
+    if was_fixed:
+        # VBA は \r\r\n を「行＋空行」と解釈して行数が倍に見える。実症状に合わせて
+        # \r\n / \r / \n のいずれでも行が区切られる前提で数える。
+        before_lines = len(re.split(r'\r\n|\r|\n', raw_bytes.decode('cp932')))
+        after_lines = len(re.split(r'\r\n|\r|\n', fixed_bytes.decode('cp932')))
+        print(f"⚠ 改行の二重化を検知しました。インポート前に修正します: {before_lines}行 → {after_lines}行")
+        tmp_norm = os.path.join(SCRIPT_DIR, f"_norm_{os.path.basename(resolved)}")
+        with open(tmp_norm, 'wb') as f:
+            f.write(fixed_bytes)
+        import_path = tmp_norm
+
     xl, wb = get_workbook(target_file)
     make_backup(wb.FullName, f"module_{module_name}")
     # モジュール単位のバックアップ
@@ -1417,15 +1459,19 @@ def cmd_replace_module(args):
                 wb.VBProject.VBComponents.Remove(comp)
                 time.sleep(1.5)
                 pythoncom.PumpWaitingMessages()
-                wb.VBProject.VBComponents.Import(resolved)
+                wb.VBProject.VBComponents.Import(import_path)
                 time.sleep(1.5)
                 pythoncom.PumpWaitingMessages()
                 wb.Save()
             finally:
                 xl.DisplayAlerts = True
+                if tmp_norm and os.path.exists(tmp_norm):
+                    os.remove(tmp_norm)
             print(f"置換完了: モジュール '{module_name}' → 保存しました")
             return True
 
+    if tmp_norm and os.path.exists(tmp_norm):
+        os.remove(tmp_norm)
     print(f"エラー: モジュール '{module_name}' が見つかりません")
     return False
 
