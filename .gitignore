@@ -48,3 +48,8 @@ _wheel_dump/
 !作業ファイル/project/python_scripts/bas_editor.py
 !作業ファイル/project/python_scripts/format_bas.py
 !作業ファイル/project/python_scripts/optimize_vba_modules.py
+
+# =============================================================================
+# ローカルのワンショットスクリプト退避先（非公開・公開対象外）
+# =============================================================================
+作業ファイル/project/python_scripts/_archive/
