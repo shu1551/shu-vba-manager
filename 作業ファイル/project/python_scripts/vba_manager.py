@@ -74,7 +74,9 @@ import argparse
 import time
 import unicodedata
 import pythoncom
+import pywintypes
 import win32com.client
+import win32com.client.dynamic
 
 # ---- パス定数 ----
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -281,6 +283,21 @@ def load_excel_addins_and_personal(xl):
         pass
 
 
+def _get_active_excel():
+    """起動中の Excel.Application に late-binding で接続する(gencache 非経由)。
+
+    win32com.client.GetActiveObject は gen_py キャッシュを通るため、キャッシュ破損
+    (例: module '...' has no attribute 'CLSIDToClassMap')で例外になり、Excel が実際は
+    開いているのに「起動していない」と誤判定する。pythoncom.GetActiveObject で生の
+    インスタンスを掴んで dynamic.Dispatch で包めばキャッシュに一切依存しない。
+    Excel 未起動時は例外を送出する(呼び出し側で捕捉する)。
+    """
+    clsid = pywintypes.IID("Excel.Application")
+    unk = pythoncom.GetActiveObject(clsid)
+    disp = unk.QueryInterface(pythoncom.IID_IDispatch)
+    return win32com.client.dynamic.Dispatch(disp)
+
+
 def _running_excel_workbooks():
     """Running Object Table を走査し、起動中の全 Excel の全ブックを返す。
 
@@ -306,7 +323,7 @@ def _running_excel_workbooks():
             continue
         try:
             obj = rot.GetObject(mon)
-            wb = win32com.client.Dispatch(obj.QueryInterface(pythoncom.IID_IDispatch))
+            wb = win32com.client.dynamic.Dispatch(obj.QueryInterface(pythoncom.IID_IDispatch))
             _ = wb.FullName  # ブックか確認(違えば例外)
             wbs.append(wb)
         except Exception:
@@ -338,7 +355,7 @@ def get_workbook(target_file_arg=None, load_addins=False):
         if wb is None:
             # ROT に出ない稀ケース(未保存ブック等)は GetActiveObject で再挑戦
             try:
-                wb = win32com.client.GetActiveObject("Excel.Application").ActiveWorkbook
+                wb = _get_active_excel().ActiveWorkbook
             except Exception:
                 wb = None
         if wb is None:
@@ -374,13 +391,13 @@ def get_workbook(target_file_arg=None, load_addins=False):
             continue
     if not excel_running:
         try:
-            win32com.client.GetActiveObject("Excel.Application")
+            _get_active_excel()
             excel_running = True
         except Exception:
             excel_running = False
 
     # 新規オープン
-    xl = win32com.client.Dispatch("Excel.Application")
+    xl = win32com.client.dynamic.Dispatch("Excel.Application")
     global _created_xl, _created_xl_pid
     _created_xl = xl
     try:
@@ -927,7 +944,7 @@ def cmd_diag(args):
     """動作確認"""
     print("Syntax OK")
     try:
-        xl = win32com.client.GetActiveObject("Excel.Application")
+        xl = _get_active_excel()
         wb = xl.ActiveWorkbook
         if wb:
             print(f"アクティブブック: {wb.Name}")
@@ -940,7 +957,7 @@ def cmd_diag(args):
 def cmd_list_open(args):
     """現在開いているExcelファイルを一覧表示"""
     try:
-        xl = win32com.client.GetObject(None, 'Excel.Application')
+        xl = _get_active_excel()
     except Exception:
         print('Excelは起動していません')
         return
