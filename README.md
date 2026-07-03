@@ -26,10 +26,14 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 
 ## このツールキットでできること
 
-- ✅ **VBA モジュール (.bas) の取り出し／差し替え／プロシージャ単位の置換**
-- ✅ **開いたままのブックを直接読み書き**（セル読取・書込・書式・行列操作・検索置換・印刷設定など）
+- ✅ **VBA モジュール (.bas) の取り出し／差し替え／プロシージャ単位の置換・追加・削除**
+- ✅ **全マクロ横断のコード検索（grep）と一括置換（code-replace・diffプレビュー付き）**
+- ✅ **バックアップからの復元（restore）**、**コマンド列の一括実行（batch・接続1回）**
+- ✅ **開いたままのブックを直接読み書き**（セル読取・書込・書式・行列操作・検索置換・PDF出力など）
 - ✅ **グラフ／ピボット／スライサー／PowerQuery／データモデル(DAX) まで CLI で操作**
-- ✅ **UserForm を Python コードで構築**（コントロール配置〜イベントコード注入まで）
+- ✅ **UserForm を「宣言」で構築**（行構造を書くだけで整列済みフォームが完成・イベント雛形も自動生成）
+- ✅ **フォームの検査（lint）・実表示スクリーンショット・既存フォームの宣言コード逆変換**
+- ✅ **導入セルフ診断（setup-check）**——環境が揃っているか1コマンドで○×確認
 - ✅ **VBE と `.bas` ファイルのライブ同期**
 - ✅ **登録済みマクロの GUI ランチャー**（customtkinter 製）
 - ✅ **任意の `.xlsm` を対象にできる**（自分のブックでも、配布ブックでも）
@@ -41,8 +45,12 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 
 | ツール | 役割 |
 |---|---|
-| **`vba_manager.py`** | 中核ツール。VBA の `list / get / replace-module / replace-procedure` に加え、シート読取（`read-range` / `sheet-info` / `screenshot`）・編集（`write-range` / `format-range` / `find-replace` 等）・グラフ／ピボット／PowerQuery／データモデルまで約50コマンド |
-| **`form_builder.py`** | UserForm をコードで構築。`add_btn`, `add_lbl`, `add_txt`, `add_lst` などのヘルパー付き |
+| **`vba_manager.py`** | 中核ツール。VBA の `list / get / replace-module / replace-procedure / add-procedure / delete-procedure` に、コード検索 `grep`・一括置換 `code-replace`・復元 `restore`・一括実行 `batch`・導入診断 `setup-check`、シート読取（`read-range` / `sheet-info` / `screenshot`）・編集（`write-range` / `format-range` / `find-replace` / `export-pdf` 等）・グラフ／ピボット／PowerQuery／データモデルまで **58コマンド** |
+| **`form_layout.py`** | UserForm を**宣言で構築**するレイアウトエンジン。行構造を書くだけでラベル整列・ボタンバー・タブ順・イベント雛形まで自動。Excel 不要の配置プレビューも（`py form_layout.py preview 宣言.py`） |
+| **`form_inspect.py`** | フォームの点検。コントロール配置＋コードを1接続で取得、実表示PNG撮影（`--png` / `--png-all`）、機械検査（`--lint`）、既存フォームの宣言コード逆変換（`--to-layout`） |
+| **`form_tool.py`** | フォームの幾何操作 CLI。`scale / set / move / align / size-match / distribute / tab-order / rename-control / delete-control / copy-form` |
+| **`form_builder.py`** | UserForm 構築の低レベル部品。`add_btn`, `add_lbl` などのヘルパーと `Grid` 配置（カレンダー等の自由配置向け） |
+| **`test_tools.py`** | 自動テスト（pytest・22件）。レイアウト計算・エンコーディングガード・lint 等の COM 不要部分を検証 |
 | **`live_sync_vba.py`** | VBE と `.bas` ファイルをリアルタイム同期 |
 | **`menu_launcher.py`** / **`select_macro_gui.py`** | customtkinter 製のマクロ検索／実行 GUI |
 | **`bas_editor.py`** | `.bas` ファイル編集ヘルパー（プロシージャ単位の `replace_sub`, `read_bas`） |
@@ -93,7 +101,19 @@ py -m pip install -r requirements.txt
 
 ここで詰まる人が多いので必ず確認してください。
 
-### ④ Claude Code のインストール（推奨）
+### ④ 導入セルフ診断（ここまでの確認）
+
+設定が揃ったかどうかは、1コマンドで確認できます：
+
+```powershell
+cd "作業ファイル\project\python_scripts"
+py vba_manager.py setup-check
+```
+
+Python / pywin32 / Excel / 上記③の信頼設定などを ○× で表示し、NG には対処法が出ます。
+分からないところは、この出力をそのまま AI に貼って聞いてください。
+
+### ⑤ Claude Code のインストール（推奨）
 
 <https://claude.com/claude-code> の手順に従ってインストール。
 インストール後、配布フォルダで `claude` コマンドを起動するとここを作業ディレクトリとして AI と対話できます。
@@ -140,27 +160,47 @@ py vba_manager.py chart create A1:B5 --type column --title "月別売上"
 py vba_manager.py pivot create 元データ!A1:C100 --rows 部門 --values 売上
 py vba_manager.py powerquery list
 py vba_manager.py datamodel list
+
+# 横断系：検索・一括置換・復元・一括実行（2026-07 追加）
+py vba_manager.py grep "ActiveSheet"              # 全マクロからコード検索（モジュール/行番号つき）
+py vba_manager.py code-replace "旧" "新" -y       # 一括置換（diffプレビュー・バックアップ・Attribute温存）
+py vba_manager.py list-backups                    # 自動バックアップの一覧（5世代）
+py vba_manager.py restore <バックアップ.bas>       # 置換前の状態に復元（undo）
+py vba_manager.py batch cmds.txt                  # コマンド列を接続1回で一括実行（実測: 6コマンド約1秒）
+py vba_manager.py export-pdf 出力.pdf --sheet 集計  # PDF出力
 ```
 
-全コマンド（約50個）の一覧と使い方は `vba_manager.py` 冒頭のコマンド表を参照。
+全コマンド（58個）の一覧と使い方は `vba_manager.py` 冒頭のコマンド表を参照。
 ※ Excel が未起動の状態でパス指定すると自動化用の Excel が新規起動される。この Excel には
 アドインや PERSONAL.XLSB が読み込まれないため、普段使いには手動起動した Excel を使うこと
 （ツールが警告を表示する）。
 
-### `form_builder.py` — UserForm をコードで構築
+### `form_layout.py` — UserForm を「宣言」で構築（2026-07 追加・推奨）
+
+座標の手計算は不要になりました。行構造を書くだけで、ラベル整列・ボタンバー右寄せ・
+Enter/Esc 割り当て・タブ順・イベントコード雛形まで自動です：
 
 ```python
-from form_builder import FormBuilder, add_btn, add_lbl, add_txt, add_lst
+from form_layout import build_form, row, lbl, txt, combo, button_bar, ok, cancel, spacer
 
-with FormBuilder.connect(wb_keyword='ターゲットブック名') as fb:
-    fb.create_form('SampleForm', width=300, height=200)
-    add_lbl(fb, 'lblTitle', 'タイトル', x=10, y=10)
-    add_txt(fb, 'txtInput', x=10, y=40, width=200)
-    add_btn(fb, 'btnOK', 'OK', x=10, y=80)
+build_form("F_Input", "顧客登録", rows=[
+    row(lbl("顧客名"), txt("txtName", required=True)),   # required でラベルに＊＋入力チェック雛形
+    row(lbl("区分"), combo("cmbKind", items=["法人", "個人"])),
+    spacer(),
+    button_bar(ok("btnSave", "登録"), cancel("btnClose", "閉じる")),
+], vba_stub=True, png=True)   # png=True で構築後に実表示スクリーンショット
 ```
 
-これで `SampleForm` という名前の UserForm がターゲットブックに作成されます。
-さらにイベントコード（`btnOK_Click` など）も Python から注入可能。
+- `py form_layout.py preview 宣言.py` — **Excel を起動せずに**配置図PNGで設計確認
+- `py form_inspect.py <フォーム> --lint` — 重なり・不揃い・タブ順・孤児ハンドラの機械検査
+- `py form_inspect.py <フォーム> --to-layout` — **既存フォームを宣言コードに逆変換**（改修が宣言編集になる）
+- `py form_tool.py move/align/size-match/tab-order …` — 微調整もコマンドで
+- タブ付きフォーム（MultiPage）・枠（Frame）・範囲選択欄・スピン付き数値なども対応
+
+### `form_builder.py` — 低レベル部品（自由配置向け）
+
+カレンダーの7×6ボタン格子のような自由配置は、従来どおり `add_btn` 等で直接置けます。
+`Grid` / `vstack` / `hstack` の座標計算ヘルパー付き。イベントコードの注入（`inject_vba`）もこちら。
 
 ### `live_sync_vba.py` — ライブ同期
 

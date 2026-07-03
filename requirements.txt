@@ -1,2 +1,5 @@
 pywin32
 customtkinter
+
+# 開発用（任意・自動テストを回す場合のみ）
+# pytest

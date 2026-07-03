@@ -110,13 +110,16 @@ def setup_encoding():
 
 
 def looks_like_xl_file(s):
-    """文字列がExcelファイルパスっぽいか判定"""
+    """文字列がExcelファイルパスっぽいか判定。
+
+    Excel拡張子で終わるものだけを対象ブックと見なす。
+    以前は「パス区切りを含む」「ファイルとして存在する」でも True にしていたが、
+    それだと `replace-procedure fix.vba` の fix.vba が対象ブック扱いになり、
+    無関係ファイルのオープンや古い _last_proc.vba への静かなフォールバックを招く。
+    """
     if not s:
         return False
-    lower = s.lower()
-    return (any(lower.endswith(e) for e in XL_EXTS)
-            or os.sep in s or '/' in s
-            or os.path.exists(s))
+    return s.lower().endswith(XL_EXTS)
 
 
 def smart_path_resolve(filename):
@@ -150,8 +153,11 @@ def cleanup_excel():
     import gc
     import os
     import signal
-    print(f"[DEBUG] cleanup_excel called. _created_xl is: {_created_xl}, PID is: {_created_xl_pid}")
-    
+    # 自動起動したインスタンスが無ければ何もしない回なので、DEBUG も出さない
+    # （全コマンドの末尾に毎回2行のノイズが出ていた）
+    if _created_xl is not None or _created_xl_pid is not None:
+        print(f"[DEBUG] cleanup_excel called. _created_xl is: {_created_xl}, PID is: {_created_xl_pid}")
+
     # Python側のCOM参照を解放するためにGCを強制実行
     gc.collect()
     
@@ -165,6 +171,15 @@ def cleanup_excel():
                     try:
                         wb = wbs.Item(i)
                         name = wb.Name
+                        try:
+                            if not wb.Saved:
+                                # 自動起動経路では閉じる＝未保存変更の破棄。無言だと
+                                # 「書いたつもりが消えていた」になるため明示する
+                                print(f"⚠ 未保存の変更を破棄して閉じます: {name}")
+                                print("  （保存したい場合は同じ batch 内で save を実行するか、"
+                                      "Excel を先に起動してから作業してください）")
+                        except Exception:
+                            pass
                         wb.Close(SaveChanges=False)
                         print(f"[DEBUG] Workbook closed: {name}")
                     except Exception as ex:
@@ -193,7 +208,6 @@ def cleanup_excel():
     gc.collect()
     try:
         pythoncom.CoUninitialize()
-        print("[DEBUG] CoUninitialize completed.")
     except Exception as ex:
         print(f"[DEBUG] CoUninitialize failed: {ex}")
 
@@ -331,7 +345,33 @@ def _running_excel_workbooks():
     return wbs
 
 
+# get_workbook の接続キャッシュ。通常の1コマンド1プロセスでは1回しか呼ばれないので
+# 実質無関係だが、batch モードでは全行が同じCOM接続を使い回せる（1コマンド毎の
+# COM再接続＝ROT走査が一番重い、という実測への構造的な解）。
+_wb_cache = {}
+
+
 def get_workbook(target_file_arg=None, load_addins=False):
+    """get_workbook（接続キャッシュつきの入口）。戻り値: (xl, wb)"""
+    key = "__active__"
+    if target_file_arg:
+        resolved = smart_path_resolve(target_file_arg)
+        key = resolved.lower() if resolved else target_file_arg.lower()
+    if key in _wb_cache:
+        xl, wb = _wb_cache[key]
+        try:
+            _ = wb.Name          # 生存確認（閉じられていたら再接続）
+            if load_addins:
+                load_excel_addins_and_personal(xl)
+            return xl, wb
+        except Exception:
+            del _wb_cache[key]
+    xl, wb = _get_workbook_uncached(target_file_arg, load_addins)
+    _wb_cache[key] = (xl, wb)
+    return xl, wb
+
+
+def _get_workbook_uncached(target_file_arg=None, load_addins=False):
     """
     target_file_arg が None/空 → アクティブExcelブックを自動使用
     それ以外 → 既に開いているか確認、なければ新規オープン
@@ -391,8 +431,19 @@ def get_workbook(target_file_arg=None, load_addins=False):
             continue
     if not excel_running:
         try:
-            _get_active_excel()
+            xl_fallback = _get_active_excel()
             excel_running = True
+            # ROT 走査が失敗していても実際は開いているケースの二重オープン防止:
+            # GetActiveObject で掴んだインスタンスの Workbooks も確認する
+            try:
+                for wb in xl_fallback.Workbooks:
+                    if wb.FullName.lower() == target_path.lower():
+                        print(f"対象ブック: {wb.Name}  (既に開いています)")
+                        if load_addins:
+                            load_excel_addins_and_personal(xl_fallback)
+                        return xl_fallback, wb
+            except Exception:
+                pass
         except Exception:
             excel_running = False
 
@@ -425,7 +476,12 @@ def get_workbook(target_file_arg=None, load_addins=False):
 
 
 def make_backup(wb_fullname, label):
-    """バックアップを作成（タイムスタンプ付き・同系列は直近5世代まで保持）"""
+    """バックアップを作成（タイムスタンプ付き・同系列は直近5世代まで保持）。
+
+    成功時はバックアップパス、失敗時は None を返す。
+    破壊的操作（replace-procedure / replace-module）の呼び出し元は
+    None のとき停止する（--force で続行可）。
+    """
     os.makedirs(BACKUP_DIR, exist_ok=True)
     ext = os.path.splitext(wb_fullname)[1] or '.xlsm'
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -436,7 +492,7 @@ def make_backup(wb_fullname, label):
         print(f"バックアップ作成: backups/{os.path.basename(backup_path)}")
     except Exception as e:
         print(f"警告: バックアップ失敗 ({e})")
-        return
+        return None
     # 同じ系列（同ブック・同ラベル）の古い世代を間引いて5世代までにする
     try:
         olds = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith(prefix))
@@ -444,16 +500,42 @@ def make_backup(wb_fullname, label):
             os.remove(os.path.join(BACKUP_DIR, f))
     except Exception:
         pass
+    return backup_path
+
+
+def _remove_export_artifacts(bas_path):
+    """一時 Export の後始末。
+
+    フォーム（UserForm）を Export すると同名の .frx が必ず併産されるが、
+    従来は .bas しか消しておらず _tmp_*.frx が溜まり続けていた（構造的な掃除漏れ）。
+    ペアで削除する。
+    """
+    for p in (bas_path, os.path.splitext(bas_path)[0] + '.frx'):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
 
 
 def read_code_file(path):
-    """コードファイルを UTF-8 / CP932 で読み込む"""
+    """コードファイルを UTF-8 / CP932 で読み込む（改行は \\n に正規化）。
+
+    改行二重化(\\r\\r\\n)の水際検知＝多層防御の①層。テキストモード読みでは
+    \\r\\r\\n が \\n\\n（空行）に化けて検知不能になるため、バイトで検知してから復号する。
+    外部エディタ等で二重化済みのファイルもここで畳まれ、素通しでモジュールに入らない。
+    """
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if b'\r\r' in raw:
+        print(f"⚠ {os.path.basename(path)} に改行の二重化(\\r\\r\\n)を検知しました。正規化して読み込みます。")
     for enc in ['utf-8-sig', 'utf-8', 'cp932']:
         try:
-            with open(path, 'r', encoding=enc) as f:
-                return f.read()
+            text = raw.decode(enc)
         except Exception:
             continue
+        # \r\n / \r\r\n / lone \r をすべて \n に畳む（従来のテキストモード読みと互換）
+        return re.sub(r'\r+\n?', '\n', text)
     raise Exception(f"ファイルを読み込めません: {path}")
 
 
@@ -575,10 +657,10 @@ def make_module_backup(wb, module_name):
             try:
                 comp.Export(backup_path)
                 print(f"モジュールバックアップ作成: backups/{backup_filename}")
-                return True
+                return backup_path
             except Exception as e:
                 print(f"警告: モジュールバックアップ失敗 ({e})")
-    return False
+    return None
 
 
 # ================================================================
@@ -624,7 +706,7 @@ def _find_consecutive_dup_lines(norm_text):
 
 
 def cmd_check_bas(args):
-    """.bas を取り込む前の単体検査（COM不要）。
+    """.bas を取り込む前の単体検査（COM不要）。複数ファイル可。
 
     バイパス経路（vba_manager を通さず手書きスクリプトで .bas を作る）でも、取り込み前に
     この1コマンドで「文字コード事故 / 改行二重化 / プロシージャ重複 / 連続重複行」を機械的に
@@ -633,9 +715,26 @@ def cmd_check_bas(args):
     （重複は判断が要るので自動修正しない＝Pythonは機械的検査まで）。
     """
     if not args.posargs:
-        print("使い方: py vba_manager.py check-bas <file.bas> [--fix]")
+        print("使い方: py vba_manager.py check-bas <file.bas> [file2.bas ...] [--fix] [--json]")
         return False
-    path = args.posargs[0]
+    results = []
+    ok_all = True
+    for p in args.posargs:
+        ok = _check_bas_one(p, fix=getattr(args, 'fix', False))
+        results.append({"file": p, "ok": bool(ok)})
+        if not ok:
+            ok_all = False
+    if len(args.posargs) > 1:
+        print(f"===== 一括検査: {len(args.posargs)}本 → {'すべて取り込み可' if ok_all else '⚠ NGあり'} =====")
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"success": ok_all, "files": results}, ensure_ascii=False),
+              file=sys.stdout)
+    return ok_all
+
+
+def _check_bas_one(path, fix=False):
+    """check-bas の1ファイルぶんの検査本体（True=取り込み可）"""
     if not os.path.isfile(path):
         print(f"エラー: ファイルが見つかりません: {path}")
         return False
@@ -660,7 +759,7 @@ def cmd_check_bas(args):
     if was_doubled:
         before = len(re.split(r'\r\n|\r|\n', raw_bytes.decode('cp932')))
         after = len(re.split(r'\r\n|\r|\n', fixed_bytes.decode('cp932')))
-        if getattr(args, 'fix', False):
+        if fix:
             with open(path, 'wb') as f:
                 f.write(fixed_bytes)
             print(f"  [FIXED] 改行二重化を修正しました: {before}行 → {after}行")
@@ -956,13 +1055,27 @@ def cmd_diag(args):
 
 def cmd_list_open(args):
     """現在開いているExcelファイルを一覧表示"""
+    as_json = getattr(args, 'json', False)
     try:
         xl = _get_active_excel()
     except Exception:
+        if as_json:
+            import json
+            print(json.dumps({"success": True, "excel_running": False, "workbooks": []},
+                             ensure_ascii=False), file=sys.stdout)
+            return True
         print('Excelは起動していません')
         return
+    books = []
     for wb in xl.Workbooks:
-        print(wb.FullName)
+        books.append({"name": wb.Name, "fullname": wb.FullName})
+        if not as_json:
+            print(wb.FullName)
+    if as_json:
+        import json
+        print(json.dumps({"success": True, "excel_running": True, "workbooks": books},
+                         ensure_ascii=False), file=sys.stdout)
+    return True
 
 
 
@@ -1097,31 +1210,63 @@ def cmd_list(args):
 
     proj = target_projects[0]
     proj_name = get_project_display_name(proj)
-    macros = []
+    mod_filter = getattr(args, 'module_opt', None)
+    detail = getattr(args, 'detail', False)
+    macros = []            # 従来互換の名前リスト
+    details = []           # --detail / --json 用
     try:
         for comp in proj.VBComponents:
             if getattr(args, 'standard', False) and comp.Type != 1:
                 continue
+            if mod_filter and comp.Name.lower() != mod_filter.lower():
+                continue
             cm = comp.CodeModule
             if cm.CountOfLines == 0:
                 continue
-            for m in pattern.finditer(cm.Lines(1, cm.CountOfLines)):
+            code = cm.Lines(1, cm.CountOfLines)
+            lines = code.split('\r\n')
+            for m in pattern.finditer(code):
                 name = m.group(1)
-                if name not in macros:
-                    macros.append(name)
+                if name in macros:
+                    continue
+                macros.append(name)
+                if not (detail or getattr(args, 'json', False)):
+                    continue
+                info = {'module': comp.Name, 'name': name}
+                try:
+                    info['lines'] = cm.ProcCountLines(name, 0)
+                    start = cm.ProcStartLine(name, 0)
+                    body_start = cm.ProcBodyLine(name, 0)
+                    # 宣言の次行が先頭コメントならそれを1行だけ添える（機械的抽出）
+                    if body_start < len(lines):
+                        first = lines[body_start].strip()   # body_start は1始まり＝宣言行、次行は index body_start
+                        if first.startswith("'"):
+                            info['comment'] = first.lstrip("'").strip()
+                except Exception:
+                    pass
+                details.append(info)
     except Exception as ex:
         print(f"エラー: VBComponentsへのアクセスに失敗しました: {ex}", file=sys.stderr)
         return False
 
     if getattr(args, 'json', False):
         import json
-        print(json.dumps({"success": True, "file": proj_name, "macros": macros}, ensure_ascii=False), file=sys.stdout)
+        payload = {"success": True, "file": proj_name, "macros": macros}
+        if details:
+            payload["details"] = details
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stdout)
         return True
 
     print(f"対象ブック: {proj_name}")
     print(f"マクロ数: {len(macros)}")
-    for name in macros:
-        print(f"MACRO:{name}")
+    if detail:
+        for d in details:
+            extra = f", {d['lines']}行" if 'lines' in d else ""
+            cmt = f"  '{d['comment']}" if 'comment' in d else ""
+            print(f"MACRO:[{d['module']}] {d['name']}{extra}{cmt}")
+    else:
+        for name in macros:
+            print(f"MACRO:{name}")
     return True
 
 
@@ -1265,52 +1410,53 @@ def cmd_list_modules(args):
     return True
 
 
-def cmd_get(args):
-    """プロシージャのコードを取得・表示・ファイル保存
+def _all_procedure_names(wb):
+    """ブック内の全プロシージャ名を列挙（did-you-mean 用の機械的リスト）"""
+    pat = re.compile(
+        r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
+        r'(?:Sub|Function)\s+([^\s\(\)]+)',
+        re.IGNORECASE | re.MULTILINE)
+    names = []
+    try:
+        for comp in wb.VBProject.VBComponents:
+            cm = comp.CodeModule
+            if cm.CountOfLines == 0:
+                continue
+            for m in pat.finditer(cm.Lines(1, cm.CountOfLines)):
+                if m.group(1) not in names:
+                    names.append(m.group(1))
+    except Exception:
+        pass
+    return names
 
-    書式:
-      get <macro_name>                       全モジュールから検索
-      get <module_name> <macro_name>         モジュール指定（スペース区切り）
-      get <module_name>.<macro_name>         モジュール指定（ドット区切り）
+
+def _suggest_similar(name, candidates, label="もしかして"):
+    """タイポ候補の提示（difflib による機械的な近似のみ・判断はしない）"""
+    import difflib
+    close = difflib.get_close_matches(name, candidates, n=3, cutoff=0.6)
+    if close:
+        print(f"  {label}: {' / '.join(close)}")
+    print("  py vba_manager.py list で一覧を確認できます。")
+
+
+def _extract_proc(wb, module_name, macro_name):
+    """1プロシージャのコードを取り出す。
+
+    戻り値: (comp_name, clean_code) / 見つからなければ (None, None)。
+    同名複数（module_name 未指定時）は例外 ValueError(候補リスト) を投げる。
     """
-    target_file, rest = parse_target_and_rest(args.posargs)
-    if not rest:
-        print("使い方: get [excel_file] <macro_name>  または  get [excel_file] <module_name> <macro_name>")
-        return False
-
-    # モジュール指定の解析
-    module_name = None
-    if len(rest) >= 2 and not looks_like_xl_file(rest[1]):
-        # 書式: get <module_name> <macro_name>
-        module_name = rest[0]
-        macro_name  = rest[1]
-    elif len(rest) == 1 and '.' in rest[0] and not looks_like_xl_file(rest[0]):
-        # 書式: get <module_name>.<macro_name>
-        module_name, macro_name = rest[0].split('.', 1)
-    else:
-        macro_name = rest[0]
-
-    if module_name:
-        print(f"モジュール指定: {module_name}")
-
-    xl, wb = get_workbook(target_file)
-
     # モジュール未指定時：同名プロシージャが複数モジュールにある場合はエラー
     # （違うフォームの同名イベントを黙って掴む事故を防ぐ。replace-procedure と同じ流儀）
     if not module_name:
-        matched_modules = []
+        matched = []
         for comp in wb.VBProject.VBComponents:
             try:
                 comp.CodeModule.ProcStartLine(macro_name, 0)
-                matched_modules.append(comp.Name)
+                matched.append(comp.Name)
             except Exception:
                 pass
-        if len(matched_modules) > 1:
-            print(f"エラー: '{macro_name}' が複数のモジュールに存在します:")
-            for mn in matched_modules:
-                print(f"  - {mn}")
-            print(f"  モジュールを指定してください。例: py vba_manager.py get {matched_modules[0]} {macro_name}")
-            return False
+        if len(matched) > 1:
+            raise ValueError(matched)
 
     for comp in wb.VBProject.VBComponents:
         if module_name and comp.Name.lower() != module_name.lower():
@@ -1339,22 +1485,91 @@ def cmd_get(args):
                 lines.pop()
             else:
                 break
-        clean = '\n'.join(lines) + '\n'
+        return comp.Name, '\n'.join(lines) + '\n'
+    return None, None
 
-        # _last_proc.vba に UTF-8 で保存
-        with open(LAST_PROC_FILE, 'w', encoding='utf-8') as f:
-            f.write(clean)
 
-        print(f"モジュール  : {comp.Name}")
-        print(f"プロシージャ: {macro_name}")
-        print(f"保存先      : {LAST_PROC_FILE}")
-        print("=" * 60)
-        print(clean)
-        print("=" * 60)
+def cmd_get(args):
+    """プロシージャのコードを取得・表示・ファイル保存
+
+    書式:
+      get <macro_name>                       全モジュールから検索
+      get <module_name> <macro_name>         モジュール指定（スペース区切り）
+      get <module_name>.<macro_name>         モジュール指定（ドット区切り）
+      get <名1> <名2> <名3> ...              3個以上は複数取得（各要素にドット記法可）
+                                             ※出力は連結。書き戻しは従来どおり1本ずつ
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: get [excel_file] <macro_name>  または  get [excel_file] <module_name> <macro_name>")
+        return False
+
+    # 取得リクエストの解析
+    requests = []                     # [(module_name or None, macro_name), ...]
+    if len(rest) >= 3:
+        # 複数取得モード（1回のCOM接続でまとめ読み）。各要素は 名前 or モジュール.名前
+        for token in rest:
+            if '.' in token:
+                mn, pn = token.split('.', 1)
+                requests.append((mn, pn))
+            else:
+                requests.append((None, token))
+    elif len(rest) == 2 and '.' in rest[0] and '.' in rest[1] and not looks_like_xl_file(rest[1]):
+        # 両方ドット記法なら複数取得（get A.x B.y を「モジュールA.x のマクロ B.y」と
+        # 誤解釈しないため）
+        for token in rest:
+            mn, pn = token.split('.', 1)
+            requests.append((mn, pn))
+    elif len(rest) == 2 and not looks_like_xl_file(rest[1]):
+        requests.append((rest[0], rest[1]))          # get <module> <macro>
+        print(f"モジュール指定: {rest[0]}")
+    elif len(rest) == 1 and '.' in rest[0] and not looks_like_xl_file(rest[0]):
+        mn, pn = rest[0].split('.', 1)
+        requests.append((mn, pn))                    # get <module>.<macro>
+        print(f"モジュール指定: {mn}")
+    else:
+        requests.append((None, rest[0]))
+
+    xl, wb = get_workbook(target_file)
+
+    results = []
+    for module_name, macro_name in requests:
+        try:
+            comp_name, clean = _extract_proc(wb, module_name, macro_name)
+        except ValueError as e:
+            print(f"エラー: '{macro_name}' が複数のモジュールに存在します:")
+            for mn in e.args[0]:
+                print(f"  - {mn}")
+            print(f"  モジュールを指定してください。例: py vba_manager.py get {e.args[0][0]} {macro_name}")
+            return False
+        if comp_name is None:
+            print(f"エラー: プロシージャ '{macro_name}' が見つかりません")
+            _suggest_similar(macro_name, _all_procedure_names(wb))
+            return False
+        results.append({'module': comp_name, 'name': macro_name, 'code': clean})
+
+    out_path = getattr(args, 'out_opt', None)
+    save_path = os.path.abspath(out_path) if out_path else LAST_PROC_FILE
+    joined = '\n'.join(r['code'] for r in results)
+    with open(save_path, 'w', encoding='utf-8') as f:
+        f.write(joined)
+
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"success": True, "file": wb.Name, "saved": save_path,
+                          "procs": results}, ensure_ascii=False), file=sys.stdout)
         return True
 
-    print(f"エラー: プロシージャ '{macro_name}' が見つかりません")
-    return False
+    for r in results:
+        print(f"モジュール  : {r['module']}")
+        print(f"プロシージャ: {r['name']}")
+        print(f"保存先      : {save_path}")
+        print("=" * 60)
+        print(r['code'])
+        print("=" * 60)
+    if len(results) > 1:
+        print(f"（{len(results)}本を連結して保存しました。replace-procedure での書き戻しは1本ずつ）")
+    return True
 
 
 def cmd_replace_procedure(args):
@@ -1421,7 +1636,10 @@ def cmd_replace_procedure(args):
             print(f"  例: py vba_manager.py replace-procedure --module {matched_modules[0]}")
             return False
 
-    make_backup(wb.FullName, macro_name)
+    if make_backup(wb.FullName, macro_name) is None and not getattr(args, 'force', False):
+        print("エラー: バックアップが取れないため中止しました（--force で強行可）。")
+        print("  ※ 未保存の新規ブックはバックアップできません。一度保存してから実行してください。")
+        return False
 
     # 対象プロシージャの確認と差分表示
     target_comp = None
@@ -1441,6 +1659,8 @@ def cmd_replace_procedure(args):
 
     if not target_comp:
         print(f"エラー: プロシージャ '{macro_name}' が見つかりません")
+        _suggest_similar(macro_name, _all_procedure_names(wb))
+        print("  新規追加なら add-procedure を使ってください。")
         return False
 
     # 変更前コードの取得と差分表示
@@ -1475,7 +1695,10 @@ def cmd_replace_procedure(args):
             print(line)
         print("----------------------\n")
     else:
-        print("変更はありません。")
+        # 変更ゼロなら置換しない（Attribute経路だと無変更でも Remove+Import が走り、
+        # 無用なリスクを負うだけのため）
+        print("変更はありません。置換をスキップしました。")
+        return True
 
     # 確認プロンプト
     if not getattr(args, 'yes', False):
@@ -1484,8 +1707,8 @@ def cmd_replace_procedure(args):
             print("キャンセルされました。")
             return False
 
-    # モジュール単位のバックアップ
-    make_module_backup(wb, target_comp.Name)
+    # モジュール単位のバックアップ（Attribute経路の Import 失敗時の復旧素材を兼ねる）
+    module_backup = make_module_backup(wb, target_comp.Name)
 
     print(f"プロシージャ '{macro_name}' を置換中...")
 
@@ -1509,8 +1732,10 @@ def cmd_replace_procedure(args):
             r'(?:Sub|Function)\s+' + re.escape(macro_name) + r'\s*[\(\s]',
             re.IGNORECASE
         )
+        # 末尾コメント（End Sub 'xxx）を許容しないと次のプロシージャの End Sub まで
+        # スキャンが伸び、置換範囲が次のプロシージャを丸ごと巻き込む（消失事故）
         end_pattern = re.compile(
-            r'^\s*End\s+(?:Sub|Function)\s*$', re.IGNORECASE
+            r"^\s*End\s+(?:Sub|Function)\s*(?:'.*)?$", re.IGNORECASE
         )
 
         sub_line_idx = None
@@ -1521,7 +1746,11 @@ def cmd_replace_procedure(args):
             if sub_line_idx is None and proc_pattern.match(line):
                 sub_line_idx = idx
                 # Sub宣言の直後の Attribute行を収集
+                # （宣言が行継続 " _" で複数行の場合は継続行を読み飛ばしてから収集。
+                #   読み飛ばさないと Attribute を見逃し、ショートカット定義が失われる）
                 check = idx + 1
+                while check < len(bas_lines) and re.search(r'\s_\s*$', bas_lines[check - 1]):
+                    check += 1
                 while check < len(bas_lines) and bas_lines[check].strip().startswith('Attribute '):
                     attr_block.append(bas_lines[check])
                     check += 1
@@ -1530,13 +1759,13 @@ def cmd_replace_procedure(args):
                 break
 
         if sub_line_idx is None or proc_end_idx is None:
-            os.remove(tmp_bas)
+            _remove_export_artifacts(tmp_bas)
             continue
 
         if not attr_block:
             # Attribute行なし → 従来の InsertLines 方式（高速・モジュール順維持）
             # InsertLines は末尾改行を余分な空行として挿入するため取り除く
-            os.remove(tmp_bas)
+            _remove_export_artifacts(tmp_bas)
             cm.DeleteLines(eff_start, eff_count)
             cm.InsertLines(eff_start, new_code.rstrip('\n'))
             wb.Save()
@@ -1561,7 +1790,7 @@ def cmd_replace_procedure(args):
                 decl_idx = ni
                 break
         if decl_idx is None:
-            os.remove(tmp_bas)
+            _remove_export_artifacts(tmp_bas)
             print("エラー: 置換コードに Sub/Function 宣言が見つかりません")
             return False
         if decl_idx > 0:
@@ -1579,26 +1808,180 @@ def cmd_replace_procedure(args):
 
         # Remove + Import（例外時も DisplayAlerts を戻し、一時ファイルを残さない）
         xl.DisplayAlerts = False
+        removed = False
         try:
             wb.Save()
             time.sleep(0.5)
             pythoncom.PumpWaitingMessages()
             wb.VBProject.VBComponents.Remove(comp)
+            removed = True
             time.sleep(1.5)
             pythoncom.PumpWaitingMessages()
             wb.VBProject.VBComponents.Import(tmp_bas)
             time.sleep(1.5)
             pythoncom.PumpWaitingMessages()
             wb.Save()
+        except Exception as ex:
+            print(f"エラー: 置換中に失敗しました: {ex}")
+            if removed:
+                # Remove 成功後の Import 失敗＝開いているブックからモジュール消失。
+                # 直前のモジュールバックアップ（置換前の内容）から自動復旧を試みる。
+                print(f"⚠ モジュール '{module_name}' は Remove 済みです。バックアップから復旧を試みます...")
+                try:
+                    if module_backup and os.path.exists(module_backup):
+                        wb.VBProject.VBComponents.Import(module_backup)
+                        print(f"復旧成功: {module_backup} を再インポートしました（置換前の内容に戻っています）")
+                    else:
+                        raise RuntimeError("モジュールバックアップがありません")
+                except Exception as ex2:
+                    print(f"復旧失敗: {ex2}")
+                    print("  ⚠ このままブックを保存するとモジュールがファイルからも消えます。")
+                    print("  対処: ブックを『保存せずに閉じて』開き直せば置換前の状態に戻ります。")
+                    if module_backup:
+                        print(f"  または backups のバックアップを手動で Import: {module_backup}")
+            return False
         finally:
             xl.DisplayAlerts = True
             if os.path.exists(tmp_bas):
-                os.remove(tmp_bas)
+                _remove_export_artifacts(tmp_bas)
         print(f"置換完了: [{module_name}] '{macro_name}' → 保存しました (Attribute保持)")
         return True
 
     print(f"エラー: プロシージャ '{macro_name}' が見つかりません")
     return False
+
+
+def cmd_add_procedure(args):
+    """新規プロシージャをモジュール末尾に追加: add-procedure [excel_file] <モジュール名>
+
+    コードは _last_proc.vba（または --code-file）から。replace-procedure が
+    既存置換専用なのに対し、こちらは「新しい Sub を1本足す」軽量経路
+    （InsertLines のみ・Remove+Import 不要）。
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: add-procedure [excel_file] <モジュール名> [--code-file f] [-y]")
+        print("  追加するコードは _last_proc.vba（または --code-file）に置く")
+        return False
+    module_name = rest[0]
+    if _reject_extra_args(rest, 1, '使い方: add-procedure [excel_file] <モジュール名>'):
+        return False
+
+    code_file = getattr(args, 'code_file_opt', None) or LAST_PROC_FILE
+    resolved = smart_path_resolve(code_file)
+    if not resolved or not os.path.exists(resolved):
+        print(f"エラー: コードファイルが見つかりません: {code_file}")
+        return False
+    new_code = read_code_file(resolved)
+    if not validate_vba_code(new_code, force=getattr(args, 'force', False)):
+        return False
+    m = re.search(r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
+                  r'(?:Sub|Function)\s+([^\s\(]+)', new_code,
+                  re.MULTILINE | re.IGNORECASE)
+    if not m:
+        print("エラー: コードに Sub/Function 宣言が見つかりません")
+        return False
+    proc_name = m.group(1)
+
+    xl, wb = get_workbook(target_file)
+    comp = None
+    for c in wb.VBProject.VBComponents:
+        if c.Name.lower() == module_name.lower():
+            comp = c
+            break
+    if comp is None:
+        print(f"エラー: モジュール '{module_name}' が見つかりません（list-modules で確認）")
+        return False
+    cm = comp.CodeModule
+    # 同名の重複挿入を防止（ブック全体はマクロ実行時の曖昧さになるだけだが、
+    # 同一モジュール内はコンパイルエラーになるため必ず止める）
+    try:
+        cm.ProcStartLine(proc_name, 0)
+        exists = True
+    except Exception:
+        exists = False
+    if exists:
+        print(f"エラー: '{proc_name}' は [{comp.Name}] に既に存在します。修正なら replace-procedure を使ってください。")
+        return False
+
+    print(f"--- 追加するプロシージャ: [{comp.Name}] {proc_name} ---")
+    print(new_code.rstrip('\n'))
+    print("-" * 40)
+    if not getattr(args, 'yes', False):
+        ans = input(f"モジュール '{comp.Name}' の末尾に追加しますか？ (y/N): ")
+        if ans.strip().lower() not in ('y', 'yes'):
+            print("キャンセルされました。")
+            return False
+    if make_backup(wb.FullName, f"add_{proc_name}") is None and not getattr(args, 'force', False):
+        print("エラー: バックアップが取れないため中止しました（--force で強行可）。")
+        return False
+
+    body = new_code.rstrip('\n')
+    if cm.CountOfLines > 0:
+        body = '\n' + body     # 既存コードとの区切りの空行
+    cm.InsertLines(cm.CountOfLines + 1, body)
+    wb.Save()
+    print(f"追加完了: [{comp.Name}] '{proc_name}' → 保存しました")
+    return True
+
+
+def cmd_delete_procedure(args):
+    """プロシージャを削除: delete-procedure [excel_file] <Sub名>
+
+    同名が複数モジュールにある場合は --module で明示（get/replace と同じ流儀）。
+    削除対象のコードを表示してから確認（-y でスキップ）。
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: delete-procedure [excel_file] <Sub名> [--module 名] [-y]")
+        return False
+    macro_name = rest[0]
+    if _reject_extra_args(rest, 1, '使い方: delete-procedure [excel_file] <Sub名> [--module 名]'):
+        return False
+    module_opt = getattr(args, 'module_opt', None)
+
+    xl, wb = get_workbook(target_file)
+
+    # 対象特定（同名複数はエラーで候補列挙＝対象取り違え防止）
+    matches = []
+    for comp in wb.VBProject.VBComponents:
+        if module_opt and comp.Name.lower() != module_opt.lower():
+            continue
+        try:
+            start = comp.CodeModule.ProcStartLine(macro_name, 0)
+            count = comp.CodeModule.ProcCountLines(macro_name, 0)
+            matches.append((comp, start, count))
+        except Exception:
+            continue
+    if not matches:
+        print(f"エラー: プロシージャ '{macro_name}' が見つかりません")
+        _suggest_similar(macro_name, _all_procedure_names(wb))
+        return False
+    if len(matches) > 1:
+        print(f"エラー: '{macro_name}' は複数のモジュールにあります。--module で指定してください:")
+        for comp, _, _ in matches:
+            print(f"  {comp.Name}")
+        return False
+
+    comp, start, count = matches[0]
+    cm = comp.CodeModule
+    print(f"--- 削除するプロシージャ: [{comp.Name}] {macro_name} ({count}行) ---")
+    print(cm.Lines(start, count).rstrip())
+    print("-" * 40)
+    if not getattr(args, 'yes', False):
+        ans = input(f"[{comp.Name}] から '{macro_name}' を削除しますか？ (y/N): ")
+        if ans.strip().lower() not in ('y', 'yes'):
+            print("キャンセルされました。")
+            return False
+    if make_backup(wb.FullName, f"delete_{macro_name}") is None and not getattr(args, 'force', False):
+        print("エラー: バックアップが取れないため中止しました（--force で強行可）。")
+        return False
+    make_module_backup(wb, comp.Name)
+
+    cm.DeleteLines(start, count)
+    wb.Save()
+    print(f"削除完了: [{comp.Name}] '{macro_name}' → 保存しました")
+    return True
 
 
 def cmd_replace_module(args):
@@ -1619,6 +2002,15 @@ def cmd_replace_module(args):
     if not validate_bas_encoding(resolved):
         return False
 
+    # フォーム（.frm）はレイアウトを .frx に持ち、Import は .frm と同名の .frx を
+    # 同じ場所に要求する。.frx 無しで Import するとレイアウトが空のフォームになるため止める。
+    is_form_file = resolved.lower().endswith('.frm')
+    src_frx = os.path.splitext(resolved)[0] + '.frx'
+    if is_form_file and not os.path.exists(src_frx):
+        print(f"エラー: フォームの相方 {os.path.basename(src_frx)} が見つかりません。")
+        print("  .frm と .frx は同じフォルダにペアで置いてください（.frx が無いとレイアウトが失われます）。")
+        return False
+
     # 改行二重化（\r\r\n 化）の水際チェック＆修正。
     # 過去の二重化事故は、外部で作られた .bas が既に倍増した状態で replace-module に
     # 渡され、それを無検査で Import したのが原因だった。ここで修正してから取り込む。
@@ -1634,37 +2026,86 @@ def cmd_replace_module(args):
         tmp_norm = os.path.join(SCRIPT_DIR, f"_norm_{os.path.basename(resolved)}")
         with open(tmp_norm, 'wb') as f:
             f.write(fixed_bytes)
+        if is_form_file:
+            # 正規化後の .frm から Import する場合も .frx を随伴させる
+            # （コピーしないとレイアウト無しで取り込まれる穴だった）
+            shutil.copy2(src_frx, os.path.splitext(tmp_norm)[0] + '.frx')
         import_path = tmp_norm
 
+    # .bas の VB_Name と指定モジュール名の照合（別モジュール取り違えの防止）。
+    # VB_Name が無い .bas は Import 時に Module1 等の別名で入り「Xを消してYが増える」
+    # 事故になるため、ここで止める。
+    with open(import_path, 'rb') as f:
+        bas_head = f.read().decode('cp932', errors='replace')
+    m_name = re.search(r'^Attribute\s+VB_Name\s*=\s*"([^"]*)"', bas_head,
+                       re.MULTILINE | re.IGNORECASE)
+    if not m_name:
+        print(f"エラー: {os.path.basename(resolved)} に Attribute VB_Name 行がありません。")
+        print("  このまま Import すると別名モジュールとして取り込まれます。")
+        print("  export-module で出力した .bas をベースに編集してください。")
+        if tmp_norm and os.path.exists(tmp_norm):
+            _remove_export_artifacts(tmp_norm)
+        return False
+    if m_name.group(1).lower() != module_name.lower():
+        print(f"エラー: .bas の VB_Name '{m_name.group(1)}' が指定モジュール名 '{module_name}' と一致しません。")
+        print("  別モジュールの .bas を取り込もうとしている可能性があります（対象取り違え防止のため停止）。")
+        if tmp_norm and os.path.exists(tmp_norm):
+            _remove_export_artifacts(tmp_norm)
+        return False
+
     xl, wb = get_workbook(target_file)
-    make_backup(wb.FullName, f"module_{module_name}")
-    # モジュール単位のバックアップ
-    make_module_backup(wb, module_name)
+    if make_backup(wb.FullName, f"module_{module_name}") is None and not getattr(args, 'force', False):
+        print("エラー: バックアップが取れないため中止しました（--force で強行可）。")
+        print("  ※ 未保存の新規ブックはバックアップできません。一度保存してから実行してください。")
+        return False
+    # モジュール単位のバックアップ（Import 失敗時の復旧素材を兼ねる）
+    module_backup = make_module_backup(wb, module_name)
     print(f"モジュール '{module_name}' を Remove+Import で置換中...")
 
     for comp in wb.VBProject.VBComponents:
         if comp.Name.lower() == module_name.lower():
             xl.DisplayAlerts = False
+            removed = False
             try:
                 wb.Save()
                 time.sleep(0.5)
                 pythoncom.PumpWaitingMessages()
                 wb.VBProject.VBComponents.Remove(comp)
+                removed = True
                 time.sleep(1.5)
                 pythoncom.PumpWaitingMessages()
                 wb.VBProject.VBComponents.Import(import_path)
                 time.sleep(1.5)
                 pythoncom.PumpWaitingMessages()
                 wb.Save()
+            except Exception as ex:
+                print(f"エラー: 置換中に失敗しました: {ex}")
+                if removed:
+                    # Remove だけ成功して Import に失敗＝開いているブックからモジュール消失。
+                    # 直前のモジュールバックアップから自動復旧を試みる。
+                    print(f"⚠ モジュール '{module_name}' は Remove 済みです。バックアップから復旧を試みます...")
+                    try:
+                        if module_backup and os.path.exists(module_backup):
+                            wb.VBProject.VBComponents.Import(module_backup)
+                            print(f"復旧成功: {module_backup} を再インポートしました（置換前の内容に戻っています）")
+                        else:
+                            raise RuntimeError("モジュールバックアップがありません")
+                    except Exception as ex2:
+                        print(f"復旧失敗: {ex2}")
+                        print("  ⚠ このままブックを保存するとモジュールがファイルからも消えます。")
+                        print("  対処: ブックを『保存せずに閉じて』開き直せば置換前の状態に戻ります。")
+                        if module_backup:
+                            print(f"  または backups のバックアップを手動で Import: {module_backup}")
+                return False
             finally:
                 xl.DisplayAlerts = True
                 if tmp_norm and os.path.exists(tmp_norm):
-                    os.remove(tmp_norm)
+                    _remove_export_artifacts(tmp_norm)
             print(f"置換完了: モジュール '{module_name}' → 保存しました")
             return True
 
     if tmp_norm and os.path.exists(tmp_norm):
-        os.remove(tmp_norm)
+        _remove_export_artifacts(tmp_norm)
     print(f"エラー: モジュール '{module_name}' が見つかりません")
     return False
 
@@ -1682,7 +2123,8 @@ def _parse_module_blocks(bas_text):
         r'(?P<kind>Sub|Function)\s+(?P<name>[^\s\(]+)',
         re.IGNORECASE
     )
-    end_pattern = re.compile(r'^\s*End\s+(?:Sub|Function)\s*$', re.IGNORECASE)
+    # 末尾コメント（End Sub 'xxx）を許容（cmd_replace_procedure の end_pattern と同じ理由）
+    end_pattern = re.compile(r"^\s*End\s+(?:Sub|Function)\s*(?:'.*)?$", re.IGNORECASE)
 
     lines = bas_text.split('\r\n')
     n = len(lines)
@@ -1747,12 +2189,12 @@ def cmd_reorder_macro(args):
     """
     rest = list(args.posargs)
     if len(rest) < 2:
-        print("使い方: reorder-macro <macro_name> <up|down>")
+        print("使い方: reorder-macro <macro_name> <up|down|top|bottom|位置番号>")
         sys.exit(1)
     macro_name = rest[0]
     direction  = rest[1].lower()
-    if direction not in ('up', 'down'):
-        print("方向は up または down を指定してください")
+    if direction not in ('up', 'down', 'top', 'bottom') and not direction.isdigit():
+        print("方向は up|down|top|bottom または移動先の位置番号(1始まり)を指定してください")
         sys.exit(1)
 
     xl, wb = get_workbook(None)  # ActiveWorkbook 自動検出
@@ -1790,7 +2232,7 @@ def cmd_reorder_macro(args):
             target_idx = i
             break
     if target_idx is None:
-        os.remove(tmp_bas)
+        _remove_export_artifacts(tmp_bas)
         print(f"エラー: モジュール {module_name} に Sub '{macro_name}' が見つかりません")
         sys.exit(2)
 
@@ -1801,7 +2243,7 @@ def cmd_reorder_macro(args):
     ]
 
     if target_idx not in visible_indices:
-        os.remove(tmp_bas)
+        _remove_export_artifacts(tmp_bas)
         print(f"エラー: '{macro_name}' は一覧表示対象ではありません")
         sys.exit(2)
 
@@ -1809,19 +2251,37 @@ def cmd_reorder_macro(args):
 
     if direction == 'up':
         if vis_pos == 0:
-            os.remove(tmp_bas)
+            _remove_export_artifacts(tmp_bas)
             print(f"BOUNDARY: [{module_name}] 内で既に最初です")
             sys.exit(3)
         swap_block_idx = visible_indices[vis_pos - 1]
-    else:
+        # ブロック単位で入れ替え（Attribute 行は各ブロック内に含まれているので一緒に動く）
+        blocks[target_idx], blocks[swap_block_idx] = blocks[swap_block_idx], blocks[target_idx]
+    elif direction == 'down':
         if vis_pos == len(visible_indices) - 1:
-            os.remove(tmp_bas)
+            _remove_export_artifacts(tmp_bas)
             print(f"BOUNDARY: [{module_name}] 内で既に最後です")
             sys.exit(3)
         swap_block_idx = visible_indices[vis_pos + 1]
-
-    # ブロック単位で入れ替え（Attribute 行は各ブロック内に含まれているので一緒に動く）
-    blocks[target_idx], blocks[swap_block_idx] = blocks[swap_block_idx], blocks[target_idx]
+        blocks[target_idx], blocks[swap_block_idx] = blocks[swap_block_idx], blocks[target_idx]
+    else:
+        # top / bottom / 位置番号: 一発で目的位置へ（up/down を N回＝重量処理N回、の代わり）
+        if direction == 'top':
+            new_pos = 0
+        elif direction == 'bottom':
+            new_pos = len(visible_indices) - 1
+        else:
+            new_pos = max(0, min(int(direction) - 1, len(visible_indices) - 1))
+        if new_pos == vis_pos:
+            _remove_export_artifacts(tmp_bas)
+            print(f"BOUNDARY: [{module_name}] 既にその位置です")
+            sys.exit(3)
+        # 可視ブロックの並びだけを組み替え、非表示ブロックの位置は維持する
+        vis_blocks = [blocks[i] for i in visible_indices]
+        blk = vis_blocks.pop(vis_pos)
+        vis_blocks.insert(new_pos, blk)
+        for i, b in zip(visible_indices, vis_blocks):
+            blocks[i] = b
 
     new_text = _write_module(header, blocks, trailing)
     with open(tmp_bas, 'wb') as f:
@@ -1846,7 +2306,7 @@ def cmd_reorder_macro(args):
     finally:
         xl.DisplayAlerts = True
         if os.path.exists(tmp_bas):
-            os.remove(tmp_bas)
+            _remove_export_artifacts(tmp_bas)
 
     print(f"完了: [{module_name}] '{macro_name}' を {direction}に移動")
     sys.exit(0)
@@ -1865,13 +2325,154 @@ def cmd_export_module(args):
 
     for comp in wb.VBProject.VBComponents:
         if comp.Name.lower() == module_name.lower():
-            out_path = os.path.join(SCRIPT_DIR, f"{module_name}.bas")
+            # 表記ゆれ（大小文字）でファイル名が実モジュール名とズレないよう comp.Name を使う
+            out_path = os.path.join(SCRIPT_DIR, f"{comp.Name}.bas")
+            if os.path.exists(out_path):
+                print(f"（既存の {os.path.basename(out_path)} を上書きします）")
             comp.Export(out_path)
             print(f"エクスポート完了: {out_path}")
             return True
 
     print(f"エラー: モジュール '{module_name}' が見つかりません")
+    print("  存在するモジュール: " + ', '.join(c.Name for c in wb.VBProject.VBComponents))
     return False
+
+
+def cmd_export_all(args):
+    """全モジュールを一括エクスポート: export-all [excel_file] [--dir 出力先] [--check]
+
+    1回のCOM接続で全 VBComponents を書き出す（1コマンドずつ回すと数分かかる
+    ことが実測済みの作業を1コマンド化）。--check で書き出した .bas/.frm に
+    check-bas 相当の機械検査（文字コード/改行二重化/重複）をその場でかける。
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    out_dir = getattr(args, 'dir_opt', None) or SCRIPT_DIR
+    out_dir = os.path.abspath(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    ext_map = {1: '.bas', 2: '.cls', 3: '.frm', 100: '.cls'}
+
+    xl, wb = get_workbook(target_file)
+    exported = []
+    skipped = 0
+    for comp in wb.VBProject.VBComponents:
+        ctype = int(comp.Type)
+        if ctype not in ext_map:
+            skipped += 1
+            continue
+        if ctype == 100 and comp.CodeModule.CountOfLines == 0:
+            skipped += 1               # 空の ThisWorkbook / Sheet モジュールは省く
+            continue
+        out_path = os.path.join(out_dir, comp.Name + ext_map[ctype])
+        comp.Export(out_path)
+        exported.append(out_path)
+        print(f"  {os.path.basename(out_path)}")
+    print(f"エクスポート完了: {len(exported)}本 → {out_dir}"
+          + (f"（空モジュール等 {skipped}本はスキップ）" if skipped else ""))
+
+    if getattr(args, 'check', False):
+        print("----- 取り込み前検査 (check-bas 相当) -----")
+        ng = 0
+        for p in exported:
+            if not p.lower().endswith(('.bas', '.frm', '.cls')):
+                continue
+            ok = validate_bas_encoding(p)
+            _, _, doubled = normalize_bas_newlines(p)
+            with open(p, 'rb') as f:
+                norm_text = re.sub(r'\r\n|\r', '\n', f.read().decode('cp932', errors='replace'))
+            dups = _find_duplicate_procedures(norm_text)
+            if ok and not doubled and not dups:
+                print(f"  [OK] {os.path.basename(p)}")
+            else:
+                ng += 1
+                marks = []
+                if not ok:
+                    marks.append("文字コード")
+                if doubled:
+                    marks.append("改行二重化")
+                if dups:
+                    marks.append(f"重複({', '.join(dups)})")
+                print(f"  [NG] {os.path.basename(p)}: {' / '.join(marks)}")
+        print(f"----- 検査結果: NG {ng} / {len(exported)}本 -----")
+        return ng == 0
+    return True
+
+
+def cmd_list_backups(args):
+    """バックアップの一覧: list-backups [キーワード]（COM不要）
+
+    backups フォルダの内容を新しい順に表示。restore の対象選びに使う。
+    """
+    kw = args.posargs[0] if args.posargs else None
+    if not os.path.isdir(BACKUP_DIR):
+        print(f"バックアップフォルダがありません: {BACKUP_DIR}")
+        return False
+    entries = []
+    for name in os.listdir(BACKUP_DIR):
+        path = os.path.join(BACKUP_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        if kw and kw.lower() not in name.lower():
+            continue
+        entries.append((os.path.getmtime(path), name, os.path.getsize(path)))
+    entries.sort(reverse=True)
+    if not entries:
+        print("該当するバックアップはありません。" + (f"（キーワード: {kw}）" if kw else ""))
+        return True
+    limit = getattr(args, 'max_hits', None) or 30
+    print(f"--- バックアップ一覧（新しい順・{min(limit, len(entries))}/{len(entries)}件） ---")
+    for mtime, name, size in entries[:limit]:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+        low = name.lower()
+        if low.endswith(('.bas', '.frm', '.cls')):
+            kind = "モジュール"
+        elif low.endswith(('.xlsm', '.xlsx', '.xlsb', '.xls', '.xlam')):
+            kind = "ブック"
+        else:
+            kind = "その他"
+        print(f"  {stamp}  [{kind}] {name}  ({size:,} bytes)")
+    if len(entries) > limit:
+        print(f"  …他 {len(entries) - limit}件（--max で上限変更可）")
+    print(f"場所: {BACKUP_DIR}")
+    print("戻すには: py vba_manager.py restore <ファイル名>   （モジュール .bas/.frm のみ）")
+    return True
+
+
+def cmd_restore(args):
+    """モジュールバックアップを開いているブックに書き戻す: restore <バックアップ.bas>
+
+    対象モジュール名はファイル内の Attribute VB_Name から機械的に取得し、
+    replace-module と同じ経路（照合・ガード・自動復旧つき）で適用する。
+    どの世代に戻すかの判断はユーザー/AI側（list-backups で選ぶ）。
+    ブック丸ごと（.xlsm）のバックアップはこのコマンドでは扱わない
+    （開いているブックへの上書きになるため。必要ならExcelを閉じて手動コピー）。
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: restore [excel_file] <バックアップファイル名>   （list-backups で確認）")
+        return False
+    name = rest[0]
+    if name.lower().endswith(('.xlsm', '.xlsx', '.xlsb', '.xls')):
+        print("エラー: ブック丸ごとのバックアップは restore では扱いません。")
+        print("  （開いているブックそのものの上書きになるため。Excelを閉じて手動でコピーしてください）")
+        return False
+    path = name if os.path.isabs(name) else os.path.join(BACKUP_DIR, name)
+    if not os.path.exists(path):
+        print(f"エラー: バックアップが見つかりません: {path}")
+        print("  list-backups で名前を確認してください。")
+        return False
+    with open(path, 'rb') as f:
+        head = f.read().decode('cp932', errors='replace')
+    m = re.search(r'^Attribute\s+VB_Name\s*=\s*"([^"]*)"', head, re.MULTILINE | re.IGNORECASE)
+    if not m:
+        print(f"エラー: {os.path.basename(path)} に VB_Name がありません（モジュールバックアップではない可能性）")
+        return False
+    module_name = m.group(1)
+    print(f"復元: モジュール '{module_name}' ← backups/{os.path.basename(path)}")
+    import argparse as _ap
+    ns = _ap.Namespace(posargs=([target_file] if target_file else []) + [module_name, path],
+                       force=getattr(args, 'force', False))
+    return cmd_replace_module(ns)
 
 
 def cmd_list_shortcuts(args):
@@ -1891,12 +2492,9 @@ def cmd_list_shortcuts(args):
             with open(tmp_file, 'rb') as f:
                 content = f.read().decode('cp932', errors='replace')
         except Exception:
-            if os.path.exists(tmp_file):
-                os.remove(tmp_file)
             continue
         finally:
-            if os.path.exists(tmp_file):
-                os.remove(tmp_file)
+            _remove_export_artifacts(tmp_file)
 
         # Attribute マクロ名.VB_ProcData.VB_Invoke_Func = "キー\n14"
         pattern = re.compile(
@@ -1940,6 +2538,272 @@ def cmd_list_shortcuts(args):
     for item in shortcuts:
         print(f"[{item['module']}] {item['macro']} -> {item['shortcut']}")
     print("-" * 60)
+    return True
+
+
+def cmd_setup_check(args):
+    """導入セルフ診断: setup-check
+
+    「会話するだけでマクロが直る」環境に必要なものが揃っているかを○×で表示する。
+    初心者が最初に打つ1コマンド。Excel を起動していなくても動く
+    （VBOM 信頼設定のチェックだけは Excel 起動中に実施）。
+    """
+    results = []          # (ok: bool|None, 項目, 詳細, 対処)
+
+    # 1. Python 本体
+    v = sys.version_info
+    bits = 64 if sys.maxsize > 2 ** 32 else 32
+    results.append((True, "Python",
+                    f"{v.major}.{v.minor}.{v.micro} ({bits}bit)", None))
+
+    # 2. pywin32
+    try:
+        import win32com  # noqa: F401  （先頭 import 済みだが診断として明示確認）
+        try:
+            from importlib.metadata import version as _ver
+            pv = _ver("pywin32")
+        except Exception:
+            pv = "(バージョン不明)"
+        results.append((True, "pywin32", f"インストール済み {pv}", None))
+    except ImportError:
+        results.append((False, "pywin32", "見つかりません",
+                        "py -m pip install pywin32 を実行してください（AI に「入れて」でも可）"))
+
+    # 3. Excel のインストール（レジストリ確認・起動はしない）
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Excel.Application\CurVer") as k:
+            curver = winreg.QueryValueEx(k, None)[0]     # 例: Excel.Application.16
+        results.append((True, "Excel", f"インストール済み ({curver})", None))
+        excel_installed = True
+    except Exception:
+        results.append((False, "Excel", "インストールが確認できません",
+                        "Excel (デスクトップ版) が必要です"))
+        excel_installed = False
+
+    # 4. Excel の起動状態と VBOM（VBAプロジェクトへのアクセス信頼）
+    xl = None
+    if excel_installed:
+        try:
+            xl = _get_active_excel()
+        except Exception:
+            xl = None
+    if xl is None:
+        results.append((None, "Excel起動", "起動していません",
+                        "VBOM 設定の診断には、Excel でブックを開いてから再実行してください"))
+    else:
+        try:
+            wb_names = [w.Name for w in xl.Workbooks]
+        except Exception:
+            wb_names = []
+        results.append((True, "Excel起動",
+                        f"起動中（開いているブック: {', '.join(wb_names) or 'なし'}）", None))
+        # VBOM: VBE にアクセスできるか（ブロックされていると例外になる）
+        try:
+            _ = xl.VBE.VBProjects.Count
+            results.append((True, "VBOM信頼設定", "有効（VBAプロジェクトにアクセス可能）", None))
+        except Exception:
+            results.append((False, "VBOM信頼設定", "無効（VBAプロジェクトにアクセスできません）",
+                            "Excel の [ファイル > オプション > トラストセンター > トラストセンターの設定 > "
+                            "マクロの設定] で「VBA プロジェクト オブジェクト モデルへのアクセスを信頼する」に"
+                            "チェックを入れてください"))
+
+    # 5. gen_py キャッシュの健全性（破損すると「Excelは起動していません」と誤報する既知問題）
+    if xl is not None:
+        try:
+            win32com.client.GetActiveObject("Excel.Application")
+            results.append((True, "COMキャッシュ(gen_py)", "正常", None))
+        except Exception:
+            results.append((False, "COMキャッシュ(gen_py)", "破損の疑い（キャッシュ経由の接続に失敗）",
+                            r"%LOCALAPPDATA%\Temp\gen_py フォルダを削除すると自動再生成されます"))
+
+    # 6. ツール一式の存在
+    missing = [f for f in ("form_builder.py", "form_inspect.py",
+                           "form_layout.py", "form_tool.py")
+               if not os.path.exists(os.path.join(SCRIPT_DIR, f))]
+    if missing:
+        results.append((None, "ツール一式", f"見つからないファイル: {', '.join(missing)}",
+                        "フォーム機能を使う場合は同じフォルダに配置してください（マクロ管理だけなら不要）"))
+    else:
+        results.append((True, "ツール一式", "vba_manager + フォーム4ツールが揃っています", None))
+
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"success": all(r[0] is not False for r in results),
+                          "checks": [{"ok": r[0], "item": r[1], "detail": r[2],
+                                      "fix": r[3]} for r in results]},
+                         ensure_ascii=False), file=sys.stdout)
+        return all(r[0] is not False for r in results)
+
+    print("===== 導入セルフ診断 (setup-check) =====")
+    ng = 0
+    for ok, item, detail, fix in results:
+        mark = "OK" if ok else ("--" if ok is None else "NG")
+        if ok is False:
+            ng += 1
+        print(f"  [{mark}] {item}: {detail}")
+        if fix and ok is not True:
+            print(f"       → {fix}")
+    print("-" * 44)
+    if ng == 0:
+        print("  問題なし。`py vba_manager.py list` から始められます。")
+    else:
+        print(f"  NG {ng}件。上の対処を実行してから再実行してください。")
+        print("  分からないところは、導入しようとしている AI にこの出力を貼って聞いてください。")
+    return ng == 0
+
+
+def cmd_grep(args):
+    """全モジュール横断のVBAコード検索: grep [excel_file] <検索文字列>
+
+    「どのマクロが ActiveSheet を使っているか」等を1回のCOM接続で調べる。
+    出力: [モジュール] プロシージャ名:行番号: 該当行
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: grep [excel_file] <検索文字列> [--regex] [-i] [--module 名] [--max N] [--json]")
+        return False
+    needle = rest[0]
+    if _reject_extra_args(rest, 1, '検索文字列は1つ。スペースを含むならクォートで囲む'):
+        return False
+    flags = re.IGNORECASE if getattr(args, 'ignore_case', False) else 0
+    if getattr(args, 'regex', False):
+        try:
+            pat = re.compile(needle, flags)
+        except re.error as e:
+            print(f"エラー: 正規表現が不正です: {e}")
+            return False
+    else:
+        pat = re.compile(re.escape(needle), flags)
+    mod_filter = getattr(args, 'module_opt', None)
+    max_hits = getattr(args, 'max_hits', None) or 200
+
+    xl, wb = get_workbook(target_file)
+    hits = []
+    total = 0
+    for comp in wb.VBProject.VBComponents:
+        if mod_filter and comp.Name.lower() != mod_filter.lower():
+            continue
+        cm = comp.CodeModule
+        n = cm.CountOfLines
+        if n == 0:
+            continue
+        code = cm.Lines(1, n)
+        for i, line in enumerate(code.split('\r\n'), 1):
+            if pat.search(line):
+                total += 1
+                if len(hits) < max_hits:
+                    try:
+                        proc = cm.ProcOfLine(i, 0) or ''
+                        # dynamic Dispatch は out引数付きメソッドをタプルで返すことがある
+                        if isinstance(proc, tuple):
+                            proc = proc[0] or ''
+                    except Exception:
+                        proc = ''
+                    hits.append({'module': comp.Name, 'proc': proc,
+                                 'line': i, 'text': line.rstrip()})
+
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"success": True, "file": wb.Name, "pattern": needle,
+                          "total": total, "hits": hits}, ensure_ascii=False), file=sys.stdout)
+        return True
+    if total == 0:
+        print(f"'{needle}' は見つかりませんでした。")
+        return True
+    for h in hits:
+        proc_part = f" {h['proc']}" if h['proc'] else ""
+        print(f"[{h['module']}]{proc_part}:{h['line']}: {h['text'].strip()}")
+    if total > len(hits):
+        print(f"…他 {total - len(hits)}件（--max で上限変更可）")
+    print(f"--- {total}件 ヒット ---")
+    return True
+
+
+def cmd_code_replace(args):
+    """全マクロ横断の一括置換: code-replace <検索> <置換>
+
+    grep の対。差分プレビュー → 確認 → バックアップ → 変更行だけ ReplaceLine。
+    行単位の置換のみ（複数行にまたがるパターンは対象外）。
+    ReplaceLine 方式なので Attribute 行（ショートカット定義）は壊れない。
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if len(rest) < 2:
+        print("使い方: code-replace [excel_file] <検索> <置換> [--regex] [--module 名] [-y]")
+        return False
+    needle, repl = rest[0], rest[1]
+    if _reject_extra_args(rest, 2, 'スペースを含む場合はクォートで囲んでください'):
+        return False
+    use_regex = getattr(args, 'regex', False)
+    if use_regex:
+        try:
+            pat = re.compile(needle)
+        except re.error as e:
+            print(f"エラー: 正規表現が不正です: {e}")
+            return False
+    else:
+        pat = re.compile(re.escape(needle))
+        repl_escaped = repl.replace('\\', '\\\\')   # 置換文字列の \ を文字通りに
+    mod_filter = getattr(args, 'module_opt', None)
+
+    xl, wb = get_workbook(target_file)
+
+    # 変更計画の作成（この段階では何も書き換えない）
+    plans = []       # (comp, [(行番号, 旧行, 新行), ...])
+    total_lines = 0
+    for comp in wb.VBProject.VBComponents:
+        if mod_filter and comp.Name.lower() != mod_filter.lower():
+            continue
+        cm = comp.CodeModule
+        n = cm.CountOfLines
+        if n == 0:
+            continue
+        changes = []
+        for i, line in enumerate(cm.Lines(1, n).split('\r\n'), 1):
+            if not pat.search(line):
+                continue
+            new_line = pat.sub(repl if use_regex else repl_escaped, line)
+            if new_line != line:
+                changes.append((i, line, new_line))
+        if changes:
+            plans.append((comp, changes))
+            total_lines += len(changes)
+
+    if not plans:
+        print(f"'{needle}' にマッチする行はありません（置換なし）")
+        return True
+
+    # 差分プレビュー
+    print(f"--- 置換プレビュー: {len(plans)}モジュール / {total_lines}行 ---")
+    for comp, changes in plans:
+        print(f"[{comp.Name}] {len(changes)}行:")
+        for i, old, new in changes[:20]:
+            print(f"  {i}: - {old.strip()}")
+            print(f"  {i}: + {new.strip()}")
+        if len(changes) > 20:
+            print(f"  … 他 {len(changes) - 20}行")
+    print("-" * 40)
+
+    if not getattr(args, 'yes', False):
+        ans = input(f"{total_lines}行を置換しますか？ (y/N): ")
+        if ans.strip().lower() not in ('y', 'yes'):
+            print("キャンセルされました。")
+            return False
+
+    if make_backup(wb.FullName, "code_replace") is None and not getattr(args, 'force', False):
+        print("エラー: バックアップが取れないため中止しました（--force で強行可）。")
+        return False
+    for comp, _ in plans:
+        make_module_backup(wb, comp.Name)
+
+    # 変更行だけを書き換える
+    for comp, changes in plans:
+        cm = comp.CodeModule
+        for i, _, new_line in changes:
+            cm.ReplaceLine(i, new_line)
+        print(f"置換: [{comp.Name}] {len(changes)}行")
+    wb.Save()
+    print(f"完了: {len(plans)}モジュール / {total_lines}行 を置換して保存しました")
     return True
 
 
@@ -2018,6 +2882,13 @@ def cmd_run_macro(args):
         else:
             print(f"エラー: マクロの実行に失敗しました: {err_msg}", file=sys.stderr)
         return False
+    finally:
+        # 戻さないとユーザーの Excel セッションに DisplayAlerts=False が残り、
+        # 以後の手動操作で保存確認などの警告が出なくなる
+        try:
+            xl.DisplayAlerts = True
+        except Exception:
+            pass
 
 
 # ================================================================
@@ -2036,14 +2907,29 @@ def _col_letter(n):
     return s
 
 
-def _resolve_range(xl, wb, spec):
+def _resolve_range(xl, wb, spec, sheet_name=None):
     """
     範囲指定を (ws, rng) に解決する。
       'A1:D20'         → アクティブシートの範囲
       'Sheet1!A1:D20'  → シート指定の範囲
       'Sheet1'         → そのシートの UsedRange
       None / ''        → アクティブシートの UsedRange
+    sheet_name（--sheet オプション）が来たら spec はアドレスのみとして扱う。
+    「シート!範囲」一本槍だと、'!' を含むシート名（Excelでは合法）や
+    記号入り日本語シート名のクォートで詰むための分離指定の口。
     """
+    if sheet_name:
+        ws = None
+        for sh in wb.Sheets:
+            if sh.Name == sheet_name:
+                ws = sh
+                break
+        if ws is None:
+            raise Exception(f"シート '{sheet_name}' が見つかりません")
+        if not spec:
+            return ws, ws.UsedRange
+        return ws, ws.Range(spec)
+
     if not spec:
         ws = wb.ActiveSheet
         return ws, ws.UsedRange
@@ -2065,6 +2951,39 @@ def _resolve_range(xl, wb, spec):
     return ws, ws.Range(spec)
 
 
+def _whole_sheet_spec(wb, spec, sheet_name=None):
+    """spec がシート全域(UsedRange)に解決される形ならシート名を返す（破壊系コマンドのガード用）。
+
+    「シート名だけ」「末尾!」「空」の spec は _resolve_range で UsedRange 全域になる。
+    読み取り系では便利だが、clear/fill/sort/write 等の破壊系では
+    範囲指定ミス1つで全域破壊になるため、明示指定(--whole-sheet)なしでは拒否する。
+    """
+    if sheet_name:
+        return sheet_name if not spec else None
+    if not spec:
+        return wb.ActiveSheet.Name
+    if '!' in spec:
+        sheet_part, addr = spec.split('!', 1)
+        return sheet_part if not addr else None
+    for sh in wb.Sheets:
+        if sh.Name == spec:
+            return spec
+    return None
+
+
+def _reject_extra_args(rest, used, usage):
+    """位置引数の食い残しをエラーにする。
+
+    黙って捨てると `clear-range Sheet1 A1:B2` のように「第2引数のつもりの範囲」が
+    無視され、シート全域が対象になる事故（過去に実害）につながる。
+    """
+    if len(rest) > used:
+        print(f"エラー: 余分な引数があります: {' '.join(str(a) for a in rest[used:])}")
+        print(f"  {usage}")
+        return True
+    return False
+
+
 def _cell_str(v):
     """セル値を表示用文字列に"""
     if v is None:
@@ -2083,16 +3002,24 @@ def _disp_width(s):
 
 
 def _disp_truncate(s, width):
-    """表示幅 width に収まるよう切り詰める"""
+    """表示幅 width に収まるよう切り詰める。
+
+    切れたことが分かるよう末尾に '…' を付ける（黙って切ると、欠けた値を
+    全文と誤読して write で書き戻す事故の芽になる）。全文が要るときは
+    read-range --width で広げるか --tsv で書き出す。
+    """
+    if _disp_width(s) <= width:
+        return s
+    lim = max(width - 2, 1)     # '…' は全角幅2として確保
     out = []
     w = 0
     for ch in s:
         cw = 2 if unicodedata.east_asian_width(ch) in ('F', 'W', 'A') else 1
-        if w + cw > width:
+        if w + cw > lim:
             break
         out.append(ch)
         w += cw
-    return ''.join(out)
+    return ''.join(out) + '…'
 
 
 def _disp_pad(s, width, right=False):
@@ -2103,11 +3030,22 @@ def _disp_pad(s, width, right=False):
     return (' ' * pad + s) if right else (s + ' ' * pad)
 
 
-def _values_to_grid(rng, use_formula=False):
+def _range_values_2d(rng, use_formula=False):
+    """Range の値を 2次元リストへ正規化（--tsv / --json 用）"""
+    raw = rng.Formula if use_formula else rng.Value
+    if raw is None:
+        return [['']]
+    if not isinstance(raw, tuple):
+        return [[raw]]
+    return [list(r) if isinstance(r, tuple) else [r] for r in raw]
+
+
+def _values_to_grid(rng, use_formula=False, max_col_width=40):
     """Range の値を、列文字＋行番号つきのテキスト格子にする
 
     use_formula=True のときは計算結果ではなく数式(.Formula)を表示する。
     数式のないセルは定数値がそのまま入る（write-range の .Value と同じ規約）。
+    max_col_width を超える列は '…' 付きで切り詰める（--width で変更可）。
     """
     raw = rng.Formula if use_formula else rng.Value
     if raw is None:
@@ -2138,7 +3076,7 @@ def _values_to_grid(rng, use_formula=False):
         w = _disp_width(headers[j])
         for i in range(len(str_rows)):
             w = max(w, _disp_width(str_rows[i][j]))
-        col_w.append(min(w, 40))
+        col_w.append(min(w, max_col_width))
 
     def fmt_row(cells, label):
         parts = [_disp_pad(label, rownum_w, right=True)]
@@ -2154,17 +3092,58 @@ def _values_to_grid(rng, use_formula=False):
 
 
 def cmd_read_range(args):
-    """シートのセル値をテキスト格子で読み取る（目・テキスト版）"""
+    """シートのセル値をテキスト格子で読み取る（目・テキスト版）。
+
+    複数範囲可（1回のCOM接続でまとめ読み）。--tsv で _last_values.tsv に
+    書き出せば「読む→TSVを編集→write-range で書き戻す」の往復が
+    get→_last_proc.vba→replace-procedure と同じ型になる。
+    """
     target_file, rest = parse_target_and_rest(args.posargs)
-    spec = rest[0] if rest else None
+    specs = rest if rest else [None]
     use_formula = getattr(args, 'formula', False)
+    try:
+        width = int(getattr(args, 'width', None) or 40)
+    except (TypeError, ValueError):
+        print("エラー: --width は数値で指定してください")
+        return False
+    tsv_out = getattr(args, 'tsv_out', None)
+    if tsv_out is not None and len(specs) > 1:
+        print("エラー: --tsv は範囲1つのときだけ使えます")
+        return False
+
     xl, wb = get_workbook(target_file)
-    ws, rng = _resolve_range(xl, wb, spec)
-    mode = "（数式表示）" if use_formula else ""
-    print(f"シート: {ws.Name}   範囲: {rng.Address}{mode}")
-    print("=" * 60)
-    print(_values_to_grid(rng, use_formula))
-    print("=" * 60)
+    sheet_opt = getattr(args, 'sheet_opt', None)
+    blocks = [(_resolve_range(xl, wb, spec, sheet_opt)) for spec in specs]
+
+    if getattr(args, 'json', False):
+        import json
+        out = []
+        for ws, rng in blocks:
+            rows = _range_values_2d(rng, use_formula)
+            out.append({"sheet": ws.Name, "address": rng.Address,
+                        "ref": f"{ws.Name}!{rng.Address}",
+                        "rows": [[_cell_str(v) for v in r] for r in rows]})
+        print(json.dumps({"success": True, "file": wb.Name, "ranges": out},
+                         ensure_ascii=False), file=sys.stdout)
+        return True
+
+    for ws, rng in blocks:
+        mode = "（数式表示）" if use_formula else ""
+        # 末尾の [シート名!番地] はそのまま次コマンドの range 引数に貼れる形
+        print(f"シート: {ws.Name}   範囲: {rng.Address}{mode}   [{ws.Name}!{rng.Address}]")
+        print("=" * 60)
+        print(_values_to_grid(rng, use_formula, max_col_width=width))
+        print("=" * 60)
+
+    if tsv_out is not None:
+        path = _LAST_VALUES_FILE if tsv_out == '_DEFAULT_' else os.path.abspath(tsv_out)
+        ws, rng = blocks[0]
+        rows = _range_values_2d(rng, use_formula)
+        lines = ['\t'.join(_cell_str(v) for v in r) for r in rows]
+        with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+            f.write('\n'.join(lines) + '\n')
+        print(f"TSV書き出し: {path}  ({len(rows)}行 x {max(len(r) for r in rows)}列)")
+        print(f"  編集後の書き戻し: py vba_manager.py write-range \"{ws.Name}!{_col_letter(rng.Column)}{rng.Row}\"")
     return True
 
 
@@ -2197,8 +3176,17 @@ def cmd_read_selection(args):
 
 
 def cmd_sheet_info(args):
-    """ブックのシート構成・使用範囲を表示（見取り図）"""
+    """ブックのシート構成・使用範囲を表示（見取り図）。
+
+    --preview N で各シート使用範囲の先頭N行も格子表示（初見ブックの俯瞰が
+    1コマンド1接続で済む。従来は sheet-info + シート毎の read-range で N+1 接続）。
+    """
     target_file, _ = parse_target_and_rest(args.posargs)
+    try:
+        preview = int(getattr(args, 'preview', None) or 0)
+    except (TypeError, ValueError):
+        print("エラー: --preview は数値で指定してください")
+        return False
     xl, wb = get_workbook(target_file)
     active = wb.ActiveSheet.Name
     print(f"ブック: {wb.Name}")
@@ -2210,9 +3198,18 @@ def cmd_sheet_info(args):
             ur = sh.UsedRange
             dims = f"{ur.Rows.Count}行 x {ur.Columns.Count}列  ({ur.Address})"
         except Exception:
+            ur = None
             dims = "(空)"
         vis = '' if sh.Visible == -1 else '  [非表示]'
         print(f"{mark} {sh.Name}: {dims}{vis}")
+        if preview > 0 and ur is not None:
+            try:
+                nrows = min(preview, ur.Rows.Count)
+                head = ur.Worksheet.Range(ur.Cells(1, 1), ur.Cells(nrows, ur.Columns.Count))
+                grid = _values_to_grid(head)
+                print('    ' + grid.replace('\n', '\n    '))
+            except Exception as e:
+                print(f"    (先頭行を読めませんでした: {e})")
     print("-" * 60)
     return True
 
@@ -2260,8 +3257,10 @@ def cmd_screenshot(args):
                 cob.Delete()
                 cob = None
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    _screenshot_cleanup(xl, ws)
                     print(f"シート: {ws.Name}   範囲: {rng.Address}")
                     print(f"画像保存: {out_path}")
+                    print("（注: 一時グラフの作成を伴うため、ブックの Undo 履歴は消えています）")
                     return True
                 last_err = "Export に失敗しました"
             else:
@@ -2276,14 +3275,25 @@ def cmd_screenshot(args):
                     pass
         time.sleep(0.4)
 
-    # 選択を A1 に戻す（ChartObject 操作で選択が動くため）
+    _screenshot_cleanup(xl, ws)
+    print(f"エラー: スクリーンショットに失敗しました ({last_err})")
+    return False
+
+
+def _screenshot_cleanup(xl, ws):
+    """screenshot の後始末（成功・失敗の両経路で共通）。
+
+    ChartObject 操作で選択が動くため A1 に戻し、CopyPicture で
+    クリップボードに残った画像もクリアする（copy-range と対称）。
+    """
     try:
         ws.Range("A1").Select()
     except Exception:
         pass
-
-    print(f"エラー: スクリーンショットに失敗しました ({last_err})")
-    return False
+    try:
+        xl.CutCopyMode = False
+    except Exception:
+        pass
 
 
 # ================================================================
@@ -2316,7 +3326,10 @@ def _hex_to_excel_color(hexstr):
 
 
 def _coerce_cell(s):
-    """文字列をセル値に変換。'='始まりは数式、数値は数値、空は None。"""
+    """文字列をセル値に変換。'='始まりは数式、数値は数値、空は None。
+
+    数値化しても文字列に戻したい場合（郵便番号 "007" 等）は write-range --raw を使う。
+    """
     if s is None or s == '':
         return None
     if s.startswith('='):
@@ -2327,22 +3340,29 @@ def _coerce_cell(s):
         except ValueError:
             return s
     try:
-        return float(s)
+        f = float(s)
     except ValueError:
         return s
+    # "nan"/"inf" は float 化すると Excel 上でエラー値になるため文字列のまま
+    if f != f or f in (float('inf'), float('-inf')):
+        return s
+    return f
 
 
-def _read_tsv_grid(path):
-    """TSV(タブ区切り)をセル値の 2次元タプルに変換。列数は最大行に揃える。"""
+def _read_tsv_grid(path, raw=False):
+    """TSV(タブ区切り)をセル値の 2次元タプルに変換（行の長さは不揃いのまま返す）。
+
+    以前は短い行を None で最大列数まで詰めていたが、None 代入は既存セルの
+    クリアとして作用し「触れないつもりの右側セル」を消すため、詰め物はしない。
+    矩形化の要否は書き込み側（cmd_write_range）が判断する。
+    """
     with open(path, 'r', encoding='utf-8-sig') as f:
         text = f.read()
     text = text.replace('\r\n', '\n').replace('\r', '\n').rstrip('\n')
     if text == '':
         return ()
-    rows = [tuple(_coerce_cell(c) for c in line.split('\t'))
-            for line in text.split('\n')]
-    ncols = max(len(r) for r in rows)
-    return tuple(r + (None,) * (ncols - len(r)) for r in rows)
+    return tuple(tuple((c if raw else _coerce_cell(c)) for c in line.split('\t'))
+                 for line in text.split('\n'))
 
 
 def cmd_write_range(args):
@@ -2356,13 +3376,52 @@ def cmd_write_range(args):
     spec = rest[0]
     inline_value = rest[1] if len(rest) >= 2 else None
     tsv_opt = getattr(args, 'tsv_opt', None)
+    if _reject_extra_args(rest, 2, '使い方: write-range [excel_file] <range> [値]'):
+        return False
 
     xl, wb = get_workbook(target_file)
-    ws, rng = _resolve_range(xl, wb, spec)
+    append = getattr(args, 'append', False)
+    if append:
+        # --append: spec は「シート名!列文字」または「列文字」。使用範囲の最終行の
+        # 次の行から書く（自動の最終行判定を使うため、書き込み先番地を必ず明示表示する）
+        if '!' in spec:
+            sheet_part, col_part = spec.split('!', 1)
+            ws = None
+            for sh in wb.Worksheets:
+                if sh.Name == sheet_part:
+                    ws = sh
+                    break
+            if ws is None:
+                print(f"エラー: シート '{sheet_part}' が見つかりません")
+                return False
+        else:
+            ws, col_part = wb.ActiveSheet, spec
+        if not re.fullmatch(r'[A-Za-z]{1,3}', col_part or ''):
+            print("エラー: --append の range は「シート名!列文字」（例: ログ!A）で指定してください")
+            return False
+        ur = ws.UsedRange
+        next_row = ur.Row + ur.Rows.Count if ur is not None else 1
+        rng = ws.Range(f"{col_part.upper()}{next_row}")
+        print(f"追記位置: {ws.Name}!{rng.Address}（使用範囲の最終行の次）")
+    else:
+        sheet_opt = getattr(args, 'sheet_opt', None)
+        whole = _whole_sheet_spec(wb, spec, sheet_opt)
+        if whole is not None:
+            print(f"エラー: '{spec}' はシート '{whole}' の使用範囲全域を指します。")
+            print(f"  全セルが同じ値で上書きされる危険があるため、write-range では")
+            print(f"  セル/範囲を明示してください（例: \"{whole}!A1\"）")
+            return False
+        ws, rng = _resolve_range(xl, wb, spec, sheet_opt)
+
+    raw = getattr(args, 'raw', False)
 
     if inline_value is not None:
         # インライン単一値: 範囲全体に同じ値 (数式可)
-        rng.Value = _coerce_cell(inline_value)
+        if raw:
+            rng.NumberFormat = "@"   # 文字列として保持（"007" 等の先頭ゼロを守る）
+            rng.Value = inline_value
+        else:
+            rng.Value = _coerce_cell(inline_value)
         print(f"書き込み: {ws.Name}!{rng.Address} ← {inline_value}")
     else:
         path = (smart_path_resolve(tsv_opt) if tsv_opt else _LAST_VALUES_FILE)
@@ -2370,20 +3429,40 @@ def cmd_write_range(args):
             print(f"エラー: TSVが見つかりません: {tsv_opt or _LAST_VALUES_FILE}")
             print("  単一値ならインラインで: write-range A1 \"値\"")
             return False
-        grid = _read_tsv_grid(path)
+        grid = _read_tsv_grid(path, raw=raw)
         if not grid:
             print("エラー: TSVが空です")
             return False
-        nrows = len(grid); ncols = len(grid[0])
+        nrows = len(grid)
+        lens = {len(r) for r in grid}
         top = ws.Cells(rng.Row, rng.Column)
-        if nrows == 1 and ncols == 1:
+        if nrows == 1 and len(grid[0]) == 1:
+            if raw:
+                top.NumberFormat = "@"
             top.Value = grid[0][0]
             print(f"書き込み: {ws.Name}!{top.Address} ← {grid[0][0]}")
-        else:
+        elif len(lens) == 1:
+            ncols = len(grid[0])
             target = ws.Range(top, ws.Cells(rng.Row + nrows - 1,
                                             rng.Column + ncols - 1))
+            if raw:
+                target.NumberFormat = "@"
             target.Value = grid
             print(f"書き込み: {ws.Name}!{target.Address} ← TSV {nrows}行 x {ncols}列")
+        else:
+            # 行の長さが不揃い: 矩形化して None を書くと右側の既存セルが消えるため、
+            # 行ごとに実際の長さぶんだけ書き込む
+            print(f"⚠ TSVの行の長さが不揃いです（{min(lens)}〜{max(lens)}列）。"
+                  "行ごとに書き込み、短い行の右側セルには触れません。")
+            for i, row in enumerate(grid):
+                if not row:
+                    continue
+                r_tgt = ws.Range(ws.Cells(rng.Row + i, rng.Column),
+                                 ws.Cells(rng.Row + i, rng.Column + len(row) - 1))
+                if raw:
+                    r_tgt.NumberFormat = "@"
+                r_tgt.Value = (row,)
+            print(f"書き込み: {ws.Name}!{top.Address} 起点 ← TSV {nrows}行（不揃い）")
 
     print("（保存はしていません。Excelで確認後に保存してください）")
     return True
@@ -2396,8 +3475,18 @@ def cmd_clear_range(args):
         print("使い方: clear-range [excel_file] <range> [--contents|--formats|--all]")
         return False
     spec = rest[0]
+    if _reject_extra_args(rest, 1, '範囲は「シート名!範囲」の単一引数で指定してください'
+                                   '（例: clear-range "Sheet1!A1:B2" --contents）'):
+        return False
     xl, wb = get_workbook(target_file)
-    ws, rng = _resolve_range(xl, wb, spec)
+    sheet_opt = getattr(args, 'sheet_opt', None)
+    whole = _whole_sheet_spec(wb, spec, sheet_opt)
+    if whole is not None and not getattr(args, 'whole_sheet', False):
+        print(f"エラー: '{spec}' はシート '{whole}' の使用範囲全域を指します。")
+        print(f"  全域を本当にクリアするなら --whole-sheet を付けてください。")
+        print(f"  範囲を消すつもりなら「シート名!範囲」で指定してください（例: \"{whole}!A1:B2\"）")
+        return False
+    ws, rng = _resolve_range(xl, wb, spec, sheet_opt)
     if getattr(args, 'contents', False):
         rng.ClearContents(); what = "値"
     elif getattr(args, 'formats', False):
@@ -2422,7 +3511,7 @@ def cmd_format_range(args):
         return False
     spec = rest[0]
     xl, wb = get_workbook(target_file)
-    ws, rng = _resolve_range(xl, wb, spec)
+    ws, rng = _resolve_range(xl, wb, spec, getattr(args, 'sheet_opt', None))
     applied = []
 
     if getattr(args, 'font', None):
@@ -2493,6 +3582,12 @@ def cmd_sheet(args):
         new_name = rest[1] if len(rest) >= 2 else None
         before = getattr(args, 'before', None)
         after = getattr(args, 'after', None)
+        # --before/--after の対象が実在しないと find_sheet が None になり、
+        # 無言でアクティブシート手前に追加されてしまうため先に検証する
+        if before and find_sheet(before) is None:
+            print(f"エラー: --before のシート '{before}' が見つかりません"); return False
+        if after and find_sheet(after) is None:
+            print(f"エラー: --after のシート '{after}' が見つかりません"); return False
         if before:
             sh = wb.Sheets.Add(find_sheet(before))
         elif after:
@@ -2604,7 +3699,7 @@ def cmd_table(args):
 
     if action == 'list':
         cnt = 0
-        for sh in wb.Sheets:
+        for sh in wb.Worksheets:   # グラフシートは ListObjects を持たないため除外
             for lo in sh.ListObjects:
                 cnt += 1
                 print(f"[{sh.Name}] {lo.Name}  範囲={lo.Range.Address}")
@@ -2628,7 +3723,7 @@ def cmd_table(args):
         if len(rest) < 2:
             print("使い方: table delete <name>"); return False
         name = rest[1]
-        for sh in wb.Sheets:
+        for sh in wb.Worksheets:   # グラフシートは ListObjects を持たないため除外
             for lo in sh.ListObjects:
                 if lo.Name == name:
                     lo.Unlist()                    # テーブル解除 (データは残す)
@@ -2640,7 +3735,7 @@ def cmd_table(args):
 
     # ---- 以降は <table名> を rest[1] に取る列・フィルタ・ソート操作 ----
     def _find_lo(name):
-        for sh in wb.Sheets:
+        for sh in wb.Worksheets:   # グラフシートは ListObjects を持たないため除外
             for lo in sh.ListObjects:
                 if lo.Name == name:
                     return sh, lo
@@ -2790,6 +3885,27 @@ def cmd_table(args):
             print(f"複数ソート: {tname} {' / '.join(applied)}")
             print("（保存はしていません）"); return True
 
+    if action == 'read':
+        # テーブル名で直接読む（従来は table list で番地を得て read-range する2段＝2接続だった）
+        tname = rest[1] if len(rest) >= 2 else None
+        sh, lo = _find_lo(tname) if tname else (None, None)
+        if not lo:
+            print(f"エラー: テーブル '{tname}' が見つかりません。（table list で確認）"); return False
+        rng = lo.Range
+        print(f"テーブル: {tname}   [{sh.Name}!{rng.Address}]")
+        print("=" * 60)
+        print(_values_to_grid(rng))
+        print("=" * 60)
+        tsv_out = getattr(args, 'tsv_out', None)
+        if tsv_out is not None:
+            path = _LAST_VALUES_FILE if tsv_out == '_DEFAULT_' else os.path.abspath(tsv_out)
+            rows = _range_values_2d(rng)
+            with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+                f.write('\n'.join('\t'.join(_cell_str(v) for v in r) for r in rows) + '\n')
+            print(f"TSV書き出し: {path}  ({len(rows)}行)")
+            print(f"  編集後の書き戻し: py vba_manager.py write-range \"{sh.Name}!{_col_letter(rng.Column)}{rng.Row}\"")
+        return True
+
     if action == 'ref':
         tname = rest[1] if len(rest) >= 2 else None
         sh, lo = _find_lo(tname) if tname else (None, None)
@@ -2845,12 +3961,27 @@ def cmd_name(args):
         if len(rest) < 2:
             print("使い方: name delete <name>"); return False
         nm_name = rest[1]
-        for nm in wb.Names:
-            if nm.Name == nm_name or nm.Name.split('!')[-1] == nm_name:
-                nm.Delete()
-                print(f"名前付き範囲を削除: {nm_name}")
-                print("（保存はしていません）")
-                return True
+        # 完全一致を優先。シートスコープ名（'Sheet1'!名前）の末尾一致は
+        # 同名が複数シートにあると最初の1個を消す取り違えになるため、
+        # 複数一致ならエラーで止めて候補を出す。
+        exact = [nm for nm in wb.Names if nm.Name == nm_name]
+        if exact:
+            exact[0].Delete()
+            print(f"名前付き範囲を削除: {nm_name}")
+            print("（保存はしていません）")
+            return True
+        suffix = [nm for nm in wb.Names if nm.Name.split('!')[-1] == nm_name]
+        if len(suffix) == 1:
+            actual = suffix[0].Name
+            suffix[0].Delete()
+            print(f"名前付き範囲を削除: {actual}")
+            print("（保存はしていません）")
+            return True
+        if len(suffix) > 1:
+            print(f"エラー: 名前 '{nm_name}' はシート違いで複数あります。完全名で指定してください:")
+            for nm in suffix:
+                print(f"  {nm.Name}")
+            return False
         print(f"エラー: 名前 '{nm_name}' が見つかりません")
         return False
 
@@ -2874,6 +4005,18 @@ def _col_num(s):
 
 # ---- a. 編集の足回り ----
 
+def _sheet_or_active(wb, sheet_name):
+    """--sheet 指定があればそのシート、なければアクティブシートを返す。
+    指定シートが見つからなければエラー表示して None。"""
+    if not sheet_name:
+        return wb.ActiveSheet
+    for sh in wb.Worksheets:
+        if sh.Name == sheet_name:
+            return sh
+    print(f"エラー: シート '{sheet_name}' が見つかりません")
+    return None
+
+
 def cmd_row(args):
     """行の挿入・削除: row <insert|delete> <行番号> [本数]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -2884,7 +4027,12 @@ def cmd_row(args):
     start = int(rest[1])
     count = int(rest[2]) if len(rest) >= 3 else 1
     xl, wb = get_workbook(target_file)
-    ws = wb.ActiveSheet
+    ws = _sheet_or_active(wb, getattr(args, 'sheet', None))
+    if ws is None:
+        return False
+    if action == 'delete':
+        # 破壊操作は実行前に対象を明示する（対象取り違え事故の防止）
+        print(f"対象シート: {ws.Name}（{wb.Name}）")
     rng = ws.Rows(f"{start}:{start + count - 1}")
     if action == 'insert':
         rng.Insert()
@@ -2909,7 +4057,12 @@ def cmd_col(args):
     count = int(rest[2]) if len(rest) >= 3 else 1
     end = _col_letter(_col_num(start) + count - 1)
     xl, wb = get_workbook(target_file)
-    ws = wb.ActiveSheet
+    ws = _sheet_or_active(wb, getattr(args, 'sheet', None))
+    if ws is None:
+        return False
+    if action == 'delete':
+        # 破壊操作は実行前に対象を明示する（対象取り違え事故の防止）
+        print(f"対象シート: {ws.Name}（{wb.Name}）")
     rng = ws.Columns(f"{start}:{end}")
     if action == 'insert':
         rng.Insert()
@@ -2950,8 +4103,16 @@ def cmd_fill(args):
     if not rest:
         print("使い方: fill <range> [--right]   範囲の先頭セルを残りに複写")
         return False
+    if _reject_extra_args(rest, 1, '使い方: fill <range> [--right]'):
+        return False
     xl, wb = get_workbook(target_file)
-    ws, rng = _resolve_range(xl, wb, rest[0])
+    sheet_opt = getattr(args, 'sheet_opt', None)
+    whole = _whole_sheet_spec(wb, rest[0], sheet_opt)
+    if whole is not None and not getattr(args, 'whole_sheet', False):
+        print(f"エラー: '{rest[0]}' はシート '{whole}' の使用範囲全域を指します。")
+        print(f"  先頭行/列が全域に複写される危険があるため、範囲を明示するか --whole-sheet を付けてください。")
+        return False
+    ws, rng = _resolve_range(xl, wb, rest[0], sheet_opt)
     if getattr(args, 'right', False):
         rng.FillRight(); direction = "右"
     else:
@@ -2967,8 +4128,16 @@ def cmd_sort(args):
     if not rest:
         print("使い方: sort <range> [--key 列文字] [--desc] [--header|--no-header]")
         return False
+    if _reject_extra_args(rest, 1, '使い方: sort <range> [--key 列文字] [--desc] [--header|--no-header]'):
+        return False
     xl, wb = get_workbook(target_file)
-    ws, rng = _resolve_range(xl, wb, rest[0])
+    sheet_opt = getattr(args, 'sheet_opt', None)
+    whole = _whole_sheet_spec(wb, rest[0], sheet_opt)
+    if whole is not None and not getattr(args, 'whole_sheet', False):
+        print(f"エラー: '{rest[0]}' はシート '{whole}' の使用範囲全域を指します。")
+        print(f"  全域を並べ替えるなら --whole-sheet を付けてください（--header の明示も推奨）。")
+        return False
+    ws, rng = _resolve_range(xl, wb, rest[0], sheet_opt)
     keycol = getattr(args, 'key', None)
     key_idx = _col_num(keycol) if keycol else rng.Column
     keycell = ws.Cells(rng.Row, key_idx)
@@ -3024,6 +4193,7 @@ def cmd_find(args):
     look_in = -4123 if getattr(args, 'formula', False) else -4163  # xlFormulas / xlValues
     look_at = 1 if getattr(args, 'whole', False) else 2            # xlWhole / xlPart
     total = 0
+    max_hits = getattr(args, 'max_hits', None) or 200
     for ws in sheets:
         rng = ws.UsedRange
         try:
@@ -3037,12 +4207,16 @@ def cmd_find(args):
                 first = addr
             elif addr == first:
                 break
-            print(f"[{ws.Name}] {addr}: {cell.Value}")
             total += 1
+            if total <= max_hits:
+                # 「シート名!$A$1」はそのまま write-range 等の range 引数に貼れる形
+                print(f"{ws.Name}!{addr}: {cell.Value}")
             cell = rng.FindNext(cell)
     if total == 0:
         print(f"'{needle}' は見つかりませんでした。")
     else:
+        if total > max_hits:
+            print(f"…他 {total - max_hits}件（--max で上限変更可）")
         print(f"--- {total}件 ヒット ---")
     return True
 
@@ -3055,15 +4229,35 @@ def cmd_find_replace(args):
         return False
     needle, repl = rest[0], rest[1]
     spec = rest[2] if len(rest) >= 3 else None
+    if _reject_extra_args(rest, 3, '使い方: find-replace <検索> <置換> [range] [--whole] [--match-case]'):
+        return False
     xl, wb = get_workbook(target_file)
-    if spec:
-        ws, rng = _resolve_range(xl, wb, spec)
+    sheet_opt = getattr(args, 'sheet_opt', None)
+    if spec or sheet_opt:
+        ws, rng = _resolve_range(xl, wb, spec, sheet_opt)
     else:
         ws = wb.ActiveSheet
         rng = ws.UsedRange
     look_at = 1 if getattr(args, 'whole', False) else 2
-    rng.Replace(What=needle, Replacement=repl, LookAt=look_at, MatchCase=False)
-    print(f"置換: {ws.Name}!{rng.Address}  '{needle}' → '{repl}'")
+    match_case = getattr(args, 'match_case', False)
+    # Range.Replace は置換件数を返さないため、置換前にヒットセル数を数える
+    # （LookIn は Replace と同じ数式(-4123)で揃える）
+    count = 0
+    first = None
+    cell = rng.Find(What=needle, LookAt=look_at, LookIn=-4123, MatchCase=match_case)
+    while cell is not None:
+        addr = cell.Address
+        if first is None:
+            first = addr
+        elif addr == first:
+            break
+        count += 1
+        cell = rng.FindNext(cell)
+    if count == 0:
+        print(f"'{needle}' は {ws.Name}!{rng.Address} に見つかりませんでした（置換なし）")
+        return True
+    rng.Replace(What=needle, Replacement=repl, LookAt=look_at, MatchCase=match_case)
+    print(f"置換: {ws.Name}!{rng.Address}  '{needle}' → '{repl}'  （{count}セルにヒット）")
     print("（保存はしていません）")
     return True
 
@@ -3084,22 +4278,99 @@ def cmd_save(args):
 
 
 def cmd_save_as(args):
-    """別名保存: save-as <path>（アクティブブックを対象）"""
+    """別名保存: save-as [excel_file] <path>（省略時はアクティブブックを対象）"""
+    # 他コマンドと同じ流儀: 引数2つなら第1引数を対象ブック、第2引数を出力パスとする。
+    # （以前は rest[0] を無条件に出力パスにしていたため、
+    #   `save-as 既存ブック.xlsx 新名.xlsx` で既存ブックが無言上書きされる罠があった）
     rest = list(args.posargs)
     if not rest:
-        print("使い方: save-as <path>")
+        print("使い方: save-as [excel_file] <出力path> [--overwrite]")
         return False
-    out = os.path.abspath(rest[0])
+    if len(rest) >= 3:
+        print("エラー: 引数が多すぎます。使い方: save-as [excel_file] <出力path> [--overwrite]")
+        return False
+    if len(rest) == 2:
+        target_file, out_arg = rest[0], rest[1]
+    else:
+        target_file, out_arg = None, rest[0]
+    out = os.path.abspath(out_arg)
+
+    FMT = {'.xlsx': 51, '.xlsm': 52, '.xlsb': 50, '.xls': 56,
+           '.csv': 6, '.txt': -4158}
     ext = os.path.splitext(out)[1].lower()
-    fmt = {'.xlsx': 51, '.xlsm': 52, '.xlsb': 50, '.xls': 56,
-           '.csv': 6, '.txt': -4158}.get(ext, 51)
-    xl, wb = get_workbook(None)
+    if ext not in FMT:
+        # 未知拡張子を黙って xlsx にフォールバックすると「中身xlsxの .pdf」等の壊れファイルになる
+        print(f"エラー: 対応していない拡張子です: '{ext or '(なし)'}'")
+        print(f"  対応: {' '.join(sorted(FMT))}")
+        return False
+    fmt = FMT[ext]
+
+    if os.path.exists(out) and not getattr(args, 'overwrite', False):
+        print(f"エラー: 出力先が既に存在します: {out}")
+        print("  上書きするなら --overwrite を付けてください。")
+        return False
+
+    xl, wb = get_workbook(target_file)
+    src_ext = os.path.splitext(wb.Name)[1].lower()
+    if src_ext in ('.xlsm', '.xlsb', '.xls') and ext == '.xlsx':
+        # DisplayAlerts=False で Excel の警告が出ないため、こちらで明示する
+        print("⚠ 注意: マクロ付きブックを .xlsx で保存するため、VBAマクロは保存されません。")
     xl.DisplayAlerts = False
     try:
         wb.SaveAs(out, FileFormat=fmt)
     finally:
         xl.DisplayAlerts = True
     print(f"別名保存しました: {out}")
+    print("  （以後、開いているブックの保存先はこの新パスになります）")
+    return True
+
+
+def cmd_export_pdf(args):
+    """PDF出力: export-pdf [excel_file] <出力.pdf> [--sheet 名 | --range "シート!範囲"]
+
+    ExportAsFixedFormat による出力。既定はブック全体、--sheet で1シート、
+    --range で範囲のみ。ブック自体は変更しない（保存フラグも汚さない）。
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: export-pdf [excel_file] <出力.pdf> [--sheet 名 | --range \"シート!A1:H50\"] [--overwrite]")
+        return False
+    out = os.path.abspath(rest[0])
+    if _reject_extra_args(rest, 1, '出力パスは1つだけ指定してください'):
+        return False
+    if not out.lower().endswith('.pdf'):
+        print(f"エラー: 出力は .pdf で指定してください: {out}")
+        return False
+    if os.path.exists(out) and not getattr(args, 'overwrite', False):
+        print(f"エラー: 出力先が既に存在します: {out}")
+        print("  上書きするなら --overwrite を付けてください。")
+        return False
+    sheet_opt = getattr(args, 'sheet_opt', None)
+    range_opt = getattr(args, 'range_opt', None)
+    if sheet_opt and range_opt:
+        print("エラー: --sheet と --range は同時に指定できません")
+        return False
+
+    xl, wb = get_workbook(target_file)
+    if range_opt:
+        ws, rng = _resolve_range(xl, wb, range_opt)
+        rng.ExportAsFixedFormat(0, out)               # 0 = xlTypePDF
+        scope = f"範囲 {ws.Name}!{rng.Address}"
+    elif sheet_opt:
+        ws = None
+        for sh in wb.Worksheets:
+            if sh.Name == sheet_opt:
+                ws = sh
+                break
+        if ws is None:
+            print(f"エラー: シート '{sheet_opt}' が見つかりません")
+            return False
+        ws.ExportAsFixedFormat(0, out)
+        scope = f"シート '{ws.Name}'"
+    else:
+        wb.ExportAsFixedFormat(0, out)
+        scope = "ブック全体"
+    print(f"PDF出力: {scope} → {out}")
     return True
 
 
@@ -3449,7 +4720,7 @@ def cmd_chart(args):
 
     if action == 'list':
         cnt = 0
-        for sh in wb.Sheets:
+        for sh in wb.Worksheets:   # グラフシートは ChartObjects を持たないため除外
             for co in sh.ChartObjects():
                 cnt += 1
                 try:
@@ -3499,7 +4770,7 @@ def cmd_chart(args):
         if len(rest) < 2:
             print("使い方: chart delete <name>"); return False
         name = rest[1]
-        for sh in wb.Sheets:
+        for sh in wb.Worksheets:   # グラフシートは ChartObjects を持たないため除外
             for co in sh.ChartObjects():
                 if co.Name == name:
                     co.Delete()
@@ -3548,7 +4819,7 @@ def cmd_chart_config(args):
     xl, wb = get_workbook(target_file)
 
     def find_chart(name):
-        for sh in wb.Sheets:
+        for sh in wb.Worksheets:   # グラフシートは ChartObjects を持たないため除外
             for co in sh.ChartObjects():
                 if co.Name == name:
                     return sh, co, co.Chart
@@ -3589,7 +4860,15 @@ def cmd_chart_config(args):
             print(f"近似曲線追加: {cname} 系列{sidx} {ttype}")
             print("（保存はしていません）"); return True
         if sub == 'delete':
-            tidx = int(rest[4]) if len(rest) >= 5 else 1
+            # 削除系のインデックス省略は「黙って#1が消える」事故のもと。明示必須。
+            if len(rest) < 5:
+                print("使い方: chart-config trendline delete <chart> <series_index> <trendline_index>")
+                print("  （削除対象の trendline_index は省略できません。trendline list で確認）")
+                return False
+            try:
+                tidx = int(rest[4])
+            except ValueError:
+                print("trendline_index は数値で指定してください。"); return False
             s.Trendlines().Item(tidx).Delete()
             print(f"近似曲線削除: {cname} 系列{sidx} #{tidx}")
             print("（保存はしていません）"); return True
@@ -3611,6 +4890,8 @@ def cmd_chart_config(args):
         return ch.Axes(_XL_AXIS[a])
 
     if action == 'set-source':
+        if len(rest) < 3:
+            print("使い方: chart-config set-source <chart> <range>"); return False
         ws, rng = _resolve_range(xl, wb, rest[2])
         ch.SetSourceData(rng)
         print(f"データ範囲再設定: {cname} ← {rng.Address}")
@@ -3695,12 +4976,18 @@ def cmd_chart_config(args):
         print("（保存はしていません）"); return True
 
     if action == 'style':
-        sid = int(rest[2]) if len(rest) >= 3 else 1
+        try:
+            sid = int(rest[2]) if len(rest) >= 3 else 1
+        except ValueError:
+            print("使い方: chart-config style <chart> <1-48の数値>"); return False
         ch.ChartStyle = sid
         print(f"スタイル設定: {cname} = {sid}"); print("（保存はしていません）"); return True
 
     if action == 'placement':
-        pl = int(rest[2]) if len(rest) >= 3 else 1
+        try:
+            pl = int(rest[2]) if len(rest) >= 3 else 1
+        except ValueError:
+            print("使い方: chart-config placement <chart> <1|2|3>"); return False
         co.Placement = pl
         names = {1: '移動+サイズ', 2: '移動のみ', 3: '自由配置'}
         print(f"配置方法: {cname} = {pl}（{names.get(pl, pl)}）"); print("（保存はしていません）"); return True
@@ -3714,11 +5001,19 @@ def cmd_chart_config(args):
         pos = getattr(args, 'position', None)
         if pos:
             posmap = {'center': -4108, 'insideend': 3, 'outsideend': 2, 'bestfit': 5, 'insidebase': 4}
-            if pos.lower() in posmap:
-                try:
-                    ch.SeriesCollection(1).DataLabels().Position = posmap[pos.lower()]
-                except Exception:
-                    pass
+            if pos.lower() not in posmap:
+                print(f"⚠ 未知の位置: {pos}（{'/'.join(posmap)}）位置指定はスキップしました。")
+            else:
+                # 全系列に適用（以前は系列1のみで、複数系列だと部分適用のまま成功表示だった）
+                pos_failed = []
+                for si in range(1, ch.SeriesCollection().Count + 1):
+                    try:
+                        ch.SeriesCollection(si).DataLabels().Position = posmap[pos.lower()]
+                    except Exception:
+                        pos_failed.append(si)
+                if pos_failed:
+                    print(f"⚠ 位置指定が適用できなかった系列: {pos_failed}"
+                          "（グラフ種別によって位置指定不可の場合があります）")
         print(f"データラベル設定: {cname}"); print("（保存はしていません）"); return True
 
     if action == 'add-series':
@@ -3733,7 +5028,15 @@ def cmd_chart_config(args):
         print(f"系列追加: {cname} ← {vrng.Address}"); print("（保存はしていません）"); return True
 
     if action == 'remove-series':
-        idx = int(rest[2]) if len(rest) >= 3 else 1
+        # 削除系のインデックス省略は「黙って系列1が消える」事故のもと。明示必須。
+        if len(rest) < 3:
+            print("使い方: chart-config remove-series <chart> <series_index>")
+            print("  （削除対象の series_index は省略できません）")
+            return False
+        try:
+            idx = int(rest[2])
+        except ValueError:
+            print("series_index は数値で指定してください。"); return False
         ch.SeriesCollection(idx).Delete()
         print(f"系列削除: {cname} #{idx}"); print("（保存はしていません）"); return True
 
@@ -3793,7 +5096,7 @@ def cmd_pivot(args):
 
     if action == 'list':
         cnt = 0
-        for sh in wb.Sheets:
+        for sh in wb.Worksheets:   # グラフシートは PivotTables を持たないため除外
             for pt in sh.PivotTables():
                 cnt += 1
                 print(f"[{sh.Name}] {pt.Name}")
@@ -3805,7 +5108,7 @@ def cmd_pivot(args):
         if len(rest) < 2:
             print("使い方: pivot delete <name>"); return False
         name = rest[1]
-        for sh in wb.Sheets:
+        for sh in wb.Worksheets:   # グラフシートは PivotTables を持たないため除外
             for pt in sh.PivotTables():
                 if pt.Name == name:
                     pt.TableRange2.Clear()
@@ -3878,7 +5181,7 @@ def cmd_pivot(args):
 
 
 def _find_pivot(wb, name):
-    for sh in wb.Sheets:
+    for sh in wb.Worksheets:   # グラフシートは PivotTables を持たないため除外
         for pt in sh.PivotTables():
             if pt.Name == name:
                 return sh, pt
@@ -3996,12 +5299,26 @@ def cmd_pivot_field(args):
         wanted = set(rest[3:])
         if not wanted:
             print("表示する値を1つ以上指定してください。"); return False
+        # 指定値が実在するか先に照合（全部タイポだと Excel が「全項目非表示」を拒否し、
+        # 実状態と成功メッセージが食い違うため）
+        item_names = []
+        for i in range(1, p.PivotItems().Count + 1):
+            item_names.append(p.PivotItems().Item(i).Name)
+        missing = wanted - set(item_names)
+        if missing:
+            print(f"エラー: 存在しない値が指定されています: {sorted(missing)}")
+            print(f"  このフィールドの値: {item_names}")
+            return False
+        failed = []
         for i in range(1, p.PivotItems().Count + 1):
             it = p.PivotItems().Item(i)
             try:
                 it.Visible = (it.Name in wanted)
             except Exception:
-                pass
+                failed.append(it.Name)
+        if failed:
+            print(f"⚠ 一部の項目の表示切替に失敗しました: {failed}")
+            print("  （Excel の制約: 全項目非表示は不可、など。実際の表示状態を確認してください）")
         print(f"値フィルタ: {pname}[{field}] = {sorted(wanted)}"); print("（保存はしていません）"); return True
 
     if action == 'sort':
@@ -4146,11 +5463,11 @@ def cmd_pivot_calc(args):
 
 def _find_pivot_or_table(wb, name):
     """名前からピボット or テーブル(ListObject)を探す。戻り値 (obj, kind, sheet) """
-    for sh in wb.Sheets:
+    for sh in wb.Worksheets:   # グラフシートは PivotTables を持たないため除外
         for pt in sh.PivotTables():
             if pt.Name == name:
                 return pt, 'pivot', sh
-    for sh in wb.Sheets:
+    for sh in wb.Worksheets:   # グラフシートは ListObjects を持たないため除外
         for lo in sh.ListObjects:
             if lo.Name == name:
                 return lo, 'table', sh
@@ -4176,7 +5493,15 @@ def cmd_slicer(args):
         for sc in wb.SlicerCaches:
             for sl in sc.Slicers:
                 cnt += 1
-                print(f"{sl.Name}  (フィールド={sc.SourceName}, シート={sl.Parent.Name})")
+                # Slicer.Parent は SlicerCache を返す実装があるため、シート名は Shape 経由で取る
+                try:
+                    sheet_name = sl.Shape.Parent.Name
+                except Exception:
+                    try:
+                        sheet_name = sl.Parent.Name
+                    except Exception:
+                        sheet_name = '?'
+                print(f"{sl.Name}  (フィールド={sc.SourceName}, シート={sheet_name})")
         if cnt == 0:
             print("スライサーはありません。")
         return True
@@ -4220,10 +5545,13 @@ def cmd_slicer(args):
         # Slicers.Add の Name 引数は効かないことがあるので作成後に明示セット
         req_name = getattr(args, 'name', None)
         if req_name:
+            eff_name = req_name.replace(' ', '')
+            if eff_name != req_name:
+                print(f"⚠ スライサー名のスペースは使えないため除去しました: '{req_name}' → '{eff_name}'")
             try:
-                sl.Name = req_name.replace(' ', '')
-            except Exception:
-                pass
+                sl.Name = eff_name
+            except Exception as ex:
+                print(f"⚠ 名前 '{eff_name}' を設定できませんでした（{ex}）。自動名のままです。")
         print(f"スライサー追加: {sl.Name}  ソース={src_name}({kind})  フィールド={field}  シート={dws.Name}")
         print("（保存はしていません）")
         return True
@@ -4502,9 +5830,30 @@ def cmd_powerquery(args):
         if to == 'model':
             # データモデル（Power Pivot）へ。Queries.Add が作る "Query - name"
             # 接続が残っていると衝突するので、あれば作り直す。
+            # ただしその接続がシートのテーブル（--to sheet の読み込み）に使われている
+            # 場合、削除するとシート側の更新配線が壊れるため停止する。
             cn_name = f"Query - {name}"
             for cn in list(wb.Connections):
                 if cn.Name == cn_name:
+                    used_by = None
+                    try:
+                        for ws_chk in wb.Worksheets:
+                            for lo_chk in ws_chk.ListObjects:
+                                try:
+                                    if lo_chk.QueryTable.WorkbookConnection.Name == cn_name:
+                                        used_by = f"{ws_chk.Name}!{lo_chk.Name}"
+                                        break
+                                except Exception:
+                                    continue
+                            if used_by:
+                                break
+                    except Exception:
+                        pass
+                    if used_by:
+                        print(f"エラー: 接続 '{cn_name}' はシートのテーブル {used_by} が使用中です。")
+                        print("  削除するとテーブルの更新ができなくなるため中止しました。")
+                        print("  モデルにも読み込みたい場合は、シート読み込みを解除してから実行してください。")
+                        return False
                     try:
                         cn.Delete()
                     except Exception:
@@ -4530,8 +5879,10 @@ def cmd_powerquery(args):
 # 重量級コマンド (5) コネクション / データモデル （管理・読み取り）
 # ================================================================
 
-_XL_CONN_TYPE = {1: 'OLEDB', 2: 'ODBC', 4: 'XMLMAP', 5: 'TEXT',
-                 6: 'WEB', 7: 'DATAFEED', 8: 'MODEL', 9: 'WORKSHEET', 10: 'NOSOURCE'}
+# XlConnectionType: xlConnectionTypeOLEDB=1, ODBC=2, XMLMAP=3, TEXT=4, WEB=5,
+#                   DATAFEED=6, MODEL=7, WORKSHEET=8, NOSOURCE=9
+_XL_CONN_TYPE = {1: 'OLEDB', 2: 'ODBC', 3: 'XMLMAP', 4: 'TEXT',
+                 5: 'WEB', 6: 'DATAFEED', 7: 'MODEL', 8: 'WORKSHEET', 9: 'NOSOURCE'}
 
 
 def cmd_connection(args):
@@ -4619,7 +5970,7 @@ def cmd_datamodel(args):
       datamodel relation add    <FKテーブル> <FK列> <PKテーブル> <PK列>   リレーション作成
       datamodel relation delete <FKテーブル> <FK列> <PKテーブル> <PK列>   リレーション削除
       datamodel measure add <テーブル> <メジャー名> --dax "式" [--format general|whole|decimal|currency|percent|scientific]
-                                                                 [--decimals N] [--thousands] [--symbol ¥]   メジャー(DAX)作成
+                                                                 [--decimals N] [--thousands] [--symbol JPY]   メジャー(DAX)作成
       datamodel measure delete <メジャー名>                              メジャー削除
       （※ テーブルの追加は powerquery load --to model）
     """
@@ -4715,10 +6066,12 @@ def cmd_datamodel(args):
             # 数値書式（既定 general）。引数付き書式は GetModelFormat* メソッドで取得
             #   （ModelFormat* プロパティは既定値専用で引数を渡せないため）。
             fmt_name = (getattr(args, 'format', None) or 'general').lower()
+            dec_arg = getattr(args, 'decimals', None)
             try:
-                decimals = int(getattr(args, 'decimals', None) or 2)
+                decimals = int(dec_arg) if dec_arg is not None else 2
             except (TypeError, ValueError):
-                decimals = 2
+                print(f"エラー: --decimals は数値で指定してください: '{dec_arg}'")
+                return False
             thousands = bool(getattr(args, 'thousands', False))
             symbol = getattr(args, 'symbol', None) or ''
             try:
@@ -4854,9 +6207,8 @@ def cmd_datamodel(args):
 # エントリポイント
 # ================================================================
 
-def main():
-    setup_encoding()
-
+def build_parser():
+    """argparse の構築（main と batch で共用）"""
     parser = argparse.ArgumentParser(
         description="VBAマネージャー (アクティブブック対応版)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4879,13 +6231,20 @@ def main():
     # diag
     sub.add_parser("diag")
 
+    # setup-check（導入セルフ診断・初心者が最初に打つ1コマンド）
+    p = sub.add_parser("setup-check", help="導入セルフ診断（Python/pywin32/Excel/VBOM信頼設定を○×表示）")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+
     # list-open
-    sub.add_parser("list-open")
+    p = sub.add_parser("list-open")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
 
     # list [excel_file]
     p = sub.add_parser("list")
     p.add_argument("posargs", nargs="*")
     p.add_argument("--standard", action="store_true", help="標準モジュールのみを抽出")
+    p.add_argument("--detail", action="store_true", help="所属モジュール・行数・先頭コメント付きで表示")
+    p.add_argument("--module", dest="module_opt", default=None, help="対象モジュールを限定")
     p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
     p.add_argument("--personal", action="store_true", help="個人用マクロブック (PERSONAL.XLSB) を対象にする")
     p.add_argument("--addin", action="store_true", help="アドインブック (秀.xlam 等) を対象にする")
@@ -4899,9 +6258,12 @@ def main():
     p.add_argument("--addin", action="store_true", help="アドインブック (秀.xlam 等) を対象にする")
     p.add_argument("--all", action="store_true", help="開いているすべてのブック・アドインを対象にする")
 
-    # get [excel_file] <macro_name>
+    # get [excel_file] <macro_name> [...]
     p = sub.add_parser("get")
     p.add_argument("posargs", nargs="+")
+    p.add_argument("--out", dest="out_opt", default=None,
+                   help="保存先ファイル（省略時は _last_proc.vba。参照用コピーを残したいときに）")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
 
     # replace-procedure [excel_file] [code_file] [--code-file file] [--module name]
     p = sub.add_parser("replace-procedure")
@@ -4913,6 +6275,52 @@ def main():
                    help="確認プロンプトをスキップして自動で置換を実行します")
     p.add_argument("--force", action="store_true", dest="force",
                    help="構文エラー警告を無視して強制適用します")
+
+    # add-procedure [excel_file] <module_name> [--code-file f] [-y]
+    p = sub.add_parser("add-procedure", help="新規プロシージャをモジュール末尾に追加（コードは _last_proc.vba から）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--code-file", dest="code_file_opt", default=None)
+    p.add_argument("-y", "--yes", action="store_true", dest="yes",
+                   help="確認プロンプトをスキップ")
+    p.add_argument("--force", action="store_true", dest="force",
+                   help="構文エラー警告・バックアップ失敗を無視して強行")
+
+    # delete-procedure [excel_file] <macro_name> [--module name] [-y]
+    p = sub.add_parser("delete-procedure", help="プロシージャを削除（削除コードを表示して確認）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--module", dest="module_opt", default=None,
+                   help="対象モジュール名（同名が複数ある場合に必須）")
+    p.add_argument("-y", "--yes", action="store_true", dest="yes",
+                   help="確認プロンプトをスキップ")
+    p.add_argument("--force", action="store_true", dest="force",
+                   help="バックアップ失敗時も強行する")
+
+    # grep [excel_file] <pattern>
+    p = sub.add_parser("grep", help="全モジュール横断のVBAコード検索")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--regex", action="store_true", help="正規表現として検索")
+    p.add_argument("-i", "--ignore-case", dest="ignore_case", action="store_true",
+                   help="大文字小文字を区別しない")
+    p.add_argument("--module", dest="module_opt", default=None, help="検索対象モジュールを限定")
+    p.add_argument("--max", dest="max_hits", type=int, default=None, help="表示件数の上限（既定200）")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+
+    # code-replace [excel_file] <検索> <置換>
+    p = sub.add_parser("code-replace", help="全マクロ横断の一括置換（diffプレビュー・バックアップ・確認つき）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--regex", action="store_true", help="正規表現として置換")
+    p.add_argument("--module", dest="module_opt", default=None, help="対象モジュールを限定")
+    p.add_argument("-y", "--yes", action="store_true", dest="yes", help="確認プロンプトをスキップ")
+    p.add_argument("--force", action="store_true", dest="force", help="バックアップ失敗時も強行する")
+
+    # list-backups [キーワード] / restore <バックアップファイル>
+    p = sub.add_parser("list-backups", help="backups のバックアップ一覧（COM不要）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--max", dest="max_hits", type=int, default=None, help="表示件数の上限（既定30）")
+    p = sub.add_parser("restore", help="モジュールバックアップ(.bas/.frm)を開いているブックへ書き戻す")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--force", action="store_true", dest="force",
+                   help="バックアップ失敗時も強行する")
 
     # list-shortcuts [excel_file]
     p = sub.add_parser("list-shortcuts")
@@ -4927,21 +6335,36 @@ def main():
     # replace-module [excel_file] <module_name> <bas_file>
     p = sub.add_parser("replace-module")
     p.add_argument("posargs", nargs="+")
+    p.add_argument("--force", action="store_true", dest="force",
+                   help="バックアップ失敗時も強行する")
 
     # export-module [excel_file] <module_name>
     p = sub.add_parser("export-module")
     p.add_argument("posargs", nargs="+")
+
+    # export-all [excel_file] [--dir 出力先] [--check]
+    p = sub.add_parser("export-all", help="全モジュールを一括エクスポート（1接続）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--dir", dest="dir_opt", default=None, help="出力先フォルダ（省略時はSCRIPTS）")
+    p.add_argument("--check", action="store_true", help="書き出した各ファイルに check-bas 相当の検査をかける")
 
     # reorder-macro <macro_name> <up|down>
     p = sub.add_parser("reorder-macro")
     p.add_argument("posargs", nargs="+")
 
     # --- 目コマンド ---
-    # read-range [excel_file] [range] [--formula]
+    # read-range [excel_file] [range ...] [--formula] [--tsv [f]] [--width N] [--json]
     p = sub.add_parser("read-range")
     p.add_argument("posargs", nargs="*")
     p.add_argument("--formula", action="store_true",
                    help="計算結果でなく数式(.Formula)を表示する")
+    p.add_argument("--tsv", dest="tsv_out", nargs="?", const="_DEFAULT_", default=None,
+                   help="TSVに書き出す（省略時 _last_values.tsv。編集して write-range で書き戻す往復用）")
+    p.add_argument("--width", dest="width", default=None,
+                   help="列の最大表示幅（既定40。超えた分は…付きで切り詰め）")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+    p.add_argument("--sheet", dest="sheet_opt", default=None,
+                   help="対象シート名（rangeと分離指定。'!'入り・記号入りシート名向け）")
 
     # read-selection [excel_file] [--formula]
     p = sub.add_parser("read-selection")
@@ -4949,9 +6372,11 @@ def main():
     p.add_argument("--formula", action="store_true",
                    help="計算結果でなく数式(.Formula)を表示する")
 
-    # sheet-info [excel_file]
+    # sheet-info [excel_file] [--preview N]
     p = sub.add_parser("sheet-info")
     p.add_argument("posargs", nargs="*")
+    p.add_argument("--preview", dest="preview", default=None,
+                   help="各シート使用範囲の先頭N行も表示（ブック俯瞰・1接続）")
 
     # screenshot [excel_file] [range] [--out file]
     p = sub.add_parser("screenshot")
@@ -4965,6 +6390,12 @@ def main():
     p.add_argument("posargs", nargs="*")
     p.add_argument("--tsv", dest="tsv_opt", default=None,
                    help="グリッドを読み込むTSVファイル（省略時は _last_values.tsv）")
+    p.add_argument("--raw", action="store_true",
+                   help="数値変換せず文字列として書き込む（セル書式を文字列にする。'007'等の先頭ゼロ保持）")
+    p.add_argument("--append", action="store_true",
+                   help="使用範囲の最終行の次に書く（rangeは「シート名!列文字」。ログ追記用）")
+    p.add_argument("--sheet", dest="sheet_opt", default=None,
+                   help="対象シート名（rangeと分離指定）")
 
     # clear-range [excel_file] <range> [--contents|--formats|--all]
     p = sub.add_parser("clear-range")
@@ -4972,6 +6403,10 @@ def main():
     p.add_argument("--contents", action="store_true", help="値のみクリア")
     p.add_argument("--formats", action="store_true", help="書式のみクリア")
     p.add_argument("--all", action="store_true", help="すべてクリア（既定）")
+    p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
+                   help="シート名だけの指定（使用範囲全域）を許可する")
+    p.add_argument("--sheet", dest="sheet_opt", default=None,
+                   help="対象シート名（rangeと分離指定）")
 
     # format-range [excel_file] <range> [書式オプション...]
     p = sub.add_parser("format-range")
@@ -4993,6 +6428,8 @@ def main():
     p.add_argument("--merge", action="store_true")
     p.add_argument("--unmerge", action="store_true")
     p.add_argument("--autofit", action="store_true")
+    p.add_argument("--sheet", dest="sheet_opt", default=None,
+                   help="対象シート名（rangeと分離指定）")
 
     # sheet [excel_file] <add|delete|rename|copy|activate|show|hide> ...
     p = sub.add_parser("sheet")
@@ -5007,6 +6444,8 @@ def main():
     p.add_argument("--no-headers", dest="no_headers", action="store_true")
     p.add_argument("--at", dest="at", default=None, help="column add の挿入位置(1始まり)")
     p.add_argument("--desc", dest="desc", action="store_true", help="sort を降順に")
+    p.add_argument("--tsv", dest="tsv_out", nargs="?", const="_DEFAULT_", default=None,
+                   help="table read の結果をTSVに書き出す（省略時 _last_values.tsv）")
 
     # name [excel_file] <add|list|delete> ...
     p = sub.add_parser("name")
@@ -5016,20 +6455,32 @@ def main():
     # a. 編集の足回り
     p = sub.add_parser("row")          # row <insert|delete> <行番号> [本数]
     p.add_argument("posargs", nargs="*")
+    p.add_argument("--sheet", dest="sheet", default=None,
+                   help="対象シート名（省略時はアクティブシート）")
     p = sub.add_parser("col")          # col <insert|delete> <列文字> [本数]
     p.add_argument("posargs", nargs="*")
+    p.add_argument("--sheet", dest="sheet", default=None,
+                   help="対象シート名（省略時はアクティブシート）")
     p = sub.add_parser("copy-range")   # copy-range <src> <dst> [--values]
     p.add_argument("posargs", nargs="*")
     p.add_argument("--values", action="store_true", help="値のみ貼り付け")
     p = sub.add_parser("fill")         # fill <range> [--right]
     p.add_argument("posargs", nargs="*")
     p.add_argument("--right", action="store_true", help="右方向にフィル（既定は下）")
+    p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
+                   help="シート名だけの指定（使用範囲全域）を許可する")
+    p.add_argument("--sheet", dest="sheet_opt", default=None,
+                   help="対象シート名（rangeと分離指定）")
     p = sub.add_parser("sort")         # sort <range> [--key 列] [--desc] [--header|--no-header]
     p.add_argument("posargs", nargs="*")
     p.add_argument("--key", help="並べ替えキー列（列文字）")
     p.add_argument("--desc", action="store_true", help="降順")
     p.add_argument("--header", action="store_true", help="先頭行を見出しとして扱う")
     p.add_argument("--no-header", dest="no_header", action="store_true", help="見出しなし")
+    p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
+                   help="シート名だけの指定（使用範囲全域）を許可する")
+    p.add_argument("--sheet", dest="sheet_opt", default=None,
+                   help="対象シート名（rangeと分離指定）")
     p = sub.add_parser("autofilter")   # autofilter [range] [--off]
     p.add_argument("posargs", nargs="*")
     p.add_argument("--off", action="store_true", help="オートフィルタを解除")
@@ -5040,15 +6491,27 @@ def main():
     p.add_argument("--book", action="store_true", help="全シート横断で検索")
     p.add_argument("--whole", action="store_true", help="完全一致")
     p.add_argument("--formula", action="store_true", help="数式も検索対象にする")
+    p.add_argument("--max", dest="max_hits", type=int, default=None,
+                   help="表示件数の上限（既定200）")
     p = sub.add_parser("find-replace") # find-replace <検索> <置換> [range] [--whole]
     p.add_argument("posargs", nargs="*")
     p.add_argument("--whole", action="store_true", help="完全一致のみ置換")
+    p.add_argument("--match-case", dest="match_case", action="store_true",
+                   help="大文字小文字を区別する（既定は区別しない）")
+    p.add_argument("--sheet", dest="sheet_opt", default=None,
+                   help="対象シート名（rangeと分離指定）")
 
     # c. 保存・印刷まわり
     p = sub.add_parser("save")         # save [excel_file]
     p.add_argument("posargs", nargs="*")
-    p = sub.add_parser("save-as")      # save-as <path>
+    p = sub.add_parser("save-as")      # save-as [excel_file] <path> [--overwrite]
     p.add_argument("posargs", nargs="*")
+    p.add_argument("--overwrite", action="store_true", help="出力先が既存でも上書きする")
+    p = sub.add_parser("export-pdf")   # export-pdf <出力.pdf> [--sheet|--range]
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--sheet", dest="sheet_opt", default=None, help="このシートだけをPDF化")
+    p.add_argument("--range", dest="range_opt", default=None, help='この範囲だけをPDF化（例 "集計!A1:H50"）')
+    p.add_argument("--overwrite", action="store_true", help="出力先が既存でも上書きする")
     p = sub.add_parser("print-setup")  # print-setup [opts]
     p.add_argument("posargs", nargs="*")
     p.add_argument("--area", help="印刷範囲（例 A1:H50）")
@@ -5186,23 +6649,126 @@ def main():
     p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
 
     # check-bas <file.bas> [--fix]  (COM不要・取り込み前の単体検査)
-    p = sub.add_parser("check-bas", help="取り込み前に .bas を単体検査（文字コード/改行二重化/重複）。COM不要")
+    p = sub.add_parser("check-bas", help="取り込み前に .bas を単体検査（文字コード/改行二重化/重複）。COM不要・複数可")
     p.add_argument("posargs", nargs="*")
     p.add_argument("--fix", action="store_true", help="改行二重化を CP932 のまま自動修正する")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
 
-    args, unknown = parser.parse_known_args()
+    # batch <コマンドファイル|->  （1接続・1プロセスでコマンド列を実行）
+    p = sub.add_parser("batch", help="コマンド列を1回の接続で連続実行（ファイル or 標準入力 '-'）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--keep-going", dest="keep_going", action="store_true",
+                   help="途中の失敗で止まらず最後まで実行する")
 
-    cmds = {
+    return parser
+
+
+def cmd_batch(args):
+    """コマンド列を1プロセス・1COM接続で連続実行: batch <file|->
+
+    各行は通常のCLI引数列そのもの（例: `get shu003 空白行の削除`）。
+    空行と # 始まりは無視。get_workbook の接続キャッシュにより全行が同じ
+    COM接続を使い回すため、「1コマンド毎の再接続で数分」級の一括作業が
+    数秒に縮む。各行の実行は既存コマンドの機械的な再生のみ（判断はしない）。
+    """
+    import shlex
+    src = args.posargs[0] if args.posargs else None
+    if not src:
+        print("使い方: batch <コマンドファイル|->   （- で標準入力から読む）")
+        print("  例: get shu003 マクロA")
+        print("      replace-procedure -y")
+        return False
+    if src == '-':
+        text = sys.stdin.read()
+    else:
+        path = smart_path_resolve(src)
+        if not path or not os.path.exists(path):
+            print(f"エラー: コマンドファイルが見つかりません: {src}")
+            return False
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            text = f.read()
+
+    parser = build_parser()
+    table = _command_table()
+    keep_going = getattr(args, 'keep_going', False)
+    total = ok_n = 0
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        total += 1
+        print(f"----- [batch:{lineno}] {line} -----")
+        try:
+            # Windows パスの \ をエスケープ扱いしない（クォートは通常どおり効く）
+            lex = shlex.shlex(line, posix=True)
+            lex.whitespace_split = True
+            lex.escape = ''
+            tokens = list(lex)
+        except ValueError as e:
+            print(f"[batch:{lineno}] 引数の解析に失敗: {e}")
+            if keep_going:
+                continue
+            print("[batch] 停止（--keep-going で続行可）")
+            return False
+        try:
+            sub_args, unknown = parser.parse_known_args(tokens)
+        except SystemExit:
+            print(f"[batch:{lineno}] 引数エラー")
+            if keep_going:
+                continue
+            print("[batch] 停止（--keep-going で続行可）")
+            return False
+        unknown = [u for u in unknown if u not in ("--visible", "-v")]
+        if unknown:
+            print(f"[batch:{lineno}] 不明な引数/オプション: {' '.join(unknown)}")
+            if keep_going:
+                continue
+            print("[batch] 停止（--keep-going で続行可）")
+            return False
+        if not sub_args.command or sub_args.command == 'batch':
+            print(f"[batch:{lineno}] このコマンドは batch 内で実行できません")
+            if keep_going:
+                continue
+            return False
+        try:
+            res = table[sub_args.command](sub_args)
+        except SystemExit as e:
+            # reorder-macro 等は sys.exit で終了コードを返すため、ここで吸収する
+            res = (e.code == 0)
+        except Exception as e:
+            print(f"[batch:{lineno}] エラー: {e}")
+            res = False
+        if res is not False:
+            ok_n += 1
+        elif not keep_going:
+            print(f"[batch] {lineno}行目で失敗したため停止（--keep-going で続行可）")
+            print(f"===== batch 結果: {ok_n}/{total} 成功 =====")
+            return False
+    print(f"===== batch 完了: {ok_n}/{total} 成功 =====")
+    return ok_n == total
+
+
+def _command_table():
+    """コマンド名→実装の対応表（main と batch で共用）"""
+    return {
         "check":             cmd_check,
         "check-bas":         cmd_check_bas,
         "diag":              cmd_diag,
+        "setup-check":       cmd_setup_check,
         "list-open":         cmd_list_open,
         "list":              cmd_list,
         "list-modules":      cmd_list_modules,
         "get":               cmd_get,
         "replace-procedure": cmd_replace_procedure,
+        "add-procedure":     cmd_add_procedure,
+        "delete-procedure":  cmd_delete_procedure,
+        "grep":              cmd_grep,
+        "code-replace":      cmd_code_replace,
         "replace-module":    cmd_replace_module,
         "export-module":     cmd_export_module,
+        "export-all":        cmd_export_all,
+        "list-backups":      cmd_list_backups,
+        "restore":           cmd_restore,
         "reorder-macro":     cmd_reorder_macro,
         "list-shortcuts":    cmd_list_shortcuts,
         "run-macro":         cmd_run_macro,
@@ -5226,6 +6792,7 @@ def main():
         "find-replace":      cmd_find_replace,
         "save":              cmd_save,
         "save-as":           cmd_save_as,
+        "export-pdf":        cmd_export_pdf,
         "print-setup":       cmd_print_setup,
         "cond-format":       cmd_cond_format,
         "hyperlink":         cmd_hyperlink,
@@ -5244,7 +6811,25 @@ def main():
         "datamodel":         cmd_datamodel,
         "printer-list":      cmd_printer_list,
         "printer-setup":     cmd_printer_setup,
+        "batch":             cmd_batch,
     }
+
+
+def main():
+    setup_encoding()
+    parser = build_parser()
+    args, unknown = parser.parse_known_args()
+
+    # 未知オプションの黙殺はタイポを事故に変える（例: clear-range --content が
+    # 「値のみクリア」でなく既定の全消し Clear() に化ける）。グローバルの
+    # --visible/-v だけ許容し、それ以外の残留はエラーで止める。
+    unknown = [u for u in unknown if u not in ("--visible", "-v")]
+    if unknown:
+        print(f"エラー: 不明な引数/オプションです: {' '.join(unknown)}")
+        print("  タイプミスの可能性があります。--help で正しいオプションを確認してください。")
+        sys.exit(1)
+
+    cmds = _command_table()
 
     if args.command in cmds:
         ok = False

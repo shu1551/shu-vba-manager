@@ -3,6 +3,7 @@ form_builder.py - UserForm作成のための共通ユーティリティ
 
 【使い方】
     from form_builder import FormBuilder, add_btn, add_lbl, add_txt, add_lst, add_combo
+    from form_builder import Grid, vstack, hstack
 
 【FormBuilder の基本フロー】
     with FormBuilder.connect(wb_path="path/to/file.xlsm") as fb:
@@ -22,6 +23,8 @@ import os
 import re
 import pythoncom
 import win32com.client
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ================================================================
@@ -104,11 +107,12 @@ def add_opt(frm, name, caption, left, top, width, height, *, font_size=12):
     return o
 
 
-def add_frame(frm, name, caption, left, top, width, height):
+def add_frame(frm, name, caption, left, top, width, height, *, font_size=12):
     """Frame を追加する"""
     f2 = frm.Controls.Add("Forms.Frame.1", name)
     f2.Caption = caption
     f2.Left = left; f2.Top = top; f2.Width = width; f2.Height = height
+    f2.Font.Size = font_size   # 他コントロールと同じく既定12pt（Caption に効く）
     return f2
 
 
@@ -132,6 +136,47 @@ def add_scroll(frm, name, left, top, width, height, *, orientation=0):
     sb.Left = left; sb.Top = top; sb.Width = width; sb.Height = height
     sb.Orientation = orientation
     return sb
+
+
+# ================================================================
+# 配置ヘルパー（機械的な座標計算のみ）
+# ================================================================
+
+class Grid:
+    """グリッド配置の座標計算。
+
+    g = Grid(left0, top0, col_w, row_h, gap_x=6, gap_y=6)
+    g.pos(row, col) -> (left, top)
+
+    例: カレンダーの 7列×6行 ボタン群
+        g = Grid(10, 40, 24, 20, gap_x=2, gap_y=2)
+        for i in range(42):
+            left, top = g.pos(i // 7, i % 7)
+            add_btn(f, f"btnDay{i}", "", left, top, 24, 20)
+    """
+
+    def __init__(self, left0, top0, col_w, row_h, gap_x=6, gap_y=6):
+        self.left0 = left0
+        self.top0 = top0
+        self.col_w = col_w
+        self.row_h = row_h
+        self.gap_x = gap_x
+        self.gap_y = gap_y
+
+    def pos(self, row, col):
+        """(row, col) セルの (left, top) を返す"""
+        return (self.left0 + col * (self.col_w + self.gap_x),
+                self.top0 + row * (self.row_h + self.gap_y))
+
+
+def vstack(prev, gap=6):
+    """直前コントロールの下端 + gap の top を返す"""
+    return prev.Top + prev.Height + gap
+
+
+def hstack(prev, gap=6):
+    """直前コントロールの右端 + gap の left を返す"""
+    return prev.Left + prev.Width + gap
 
 
 # ================================================================
@@ -171,30 +216,48 @@ class FormBuilder:
         """
         pythoncom.CoInitialize()
         try:
-            xl = win32com.client.GetActiveObject("Excel.Application")
-        except Exception:
-            xl = win32com.client.Dispatch("Excel.Application")
-            xl.Visible = True
+            try:
+                # gen_py キャッシュ破損の影響を受けない生の GetActiveObject
+                # （vba_manager.py の _get_active_excel と同方式）
+                unk = pythoncom.GetActiveObject("Excel.Application")
+                disp = unk.QueryInterface(pythoncom.IID_IDispatch)
+                xl = win32com.client.dynamic.Dispatch(disp)
+            except Exception:
+                if not wb_path:
+                    # 無警告で新規 Excel を起動すると、アドイン未ロードのインスタンスや
+                    # 空 Excel の残骸（ゾンビ）を生む。パス指定がない限り起動しない。
+                    raise RuntimeError(
+                        "起動中の Excel が見つかりません。"
+                        "対象ブックを Excel で開いてから実行してください。")
+                xl = win32com.client.dynamic.Dispatch("Excel.Application")
+                xl.Visible = True
+                print("注意: Excelが未起動だったため自動化用に新規起動しました。")
+                print("      このExcelにはアドイン・PERSONAL.XLSB が読み込まれていません。")
+                print("      作業後はこのExcelを閉じてください。")
 
-        if wb_path:
-            abs_path = os.path.abspath(wb_path).lower()
-            for w in xl.Workbooks:
-                if w.FullName.lower() == abs_path:
-                    return cls(xl, w)
-            wb = xl.Workbooks.Open(os.path.abspath(wb_path))
+            if wb_path:
+                abs_path = os.path.abspath(wb_path).lower()
+                for w in xl.Workbooks:
+                    if w.FullName.lower() == abs_path:
+                        return cls(xl, w)
+                wb = xl.Workbooks.Open(os.path.abspath(wb_path))
+                return cls(xl, wb)
+
+            if wb_keyword:
+                for w in xl.Workbooks:
+                    if wb_keyword in w.Name:
+                        return cls(xl, w)
+                raise RuntimeError(f"ブック '{wb_keyword}' が見つかりません。Excelで開いてください。")
+
+            # アクティブブック
+            wb = xl.ActiveWorkbook
+            if wb is None:
+                raise RuntimeError("アクティブなブックがありません。")
             return cls(xl, wb)
-
-        if wb_keyword:
-            for w in xl.Workbooks:
-                if wb_keyword in w.Name:
-                    return cls(xl, w)
-            raise RuntimeError(f"ブック '{wb_keyword}' が見つかりません。Excelで開いてください。")
-
-        # アクティブブック
-        wb = xl.ActiveWorkbook
-        if wb is None:
-            raise RuntimeError("アクティブなブックがありません。")
-        return cls(xl, wb)
+        except Exception:
+            # connect 失敗時は __exit__ に到達しないため、ここで対にして解放する
+            pythoncom.CoUninitialize()
+            raise
 
     # ---- コンテキストマネージャ ----
 
@@ -258,15 +321,39 @@ class FormBuilder:
                 try:
                     frm_comp.Name = form_name
                     print(f"新規 {form_name} を作成 (リトライ成功)")
-                except Exception:
-                    print(f"警告: リネーム失敗 ({frm_comp.Name} として続行)")
+                except Exception as ex:
+                    # 既定名（UserForm1等）のまま続行すると、以後の get_or_create が
+                    # 毎回「見つからない→新規作成」で同名フォームを量産するため停止する
+                    default_name = frm_comp.Name
+                    try:
+                        self.vbproject.VBComponents.Remove(frm_comp)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"フォームのリネームに失敗しました: {default_name} → {form_name} ({ex})\n"
+                        "  VBE のデザイナーウィンドウが開いているとリネームできないことがあります。"
+                        "Excel/VBE を確認して再実行してください。")
 
-        if caption is not None:
-            frm_comp.Properties("Caption").Value = caption
-        if width is not None:
-            frm_comp.Properties("Width").Value = width
-        if height is not None:
-            frm_comp.Properties("Height").Value = height
+        # 直前に Show/Unload されたフォーム等では Properties が一時的に COM エラーを
+        # 返すことがある。Designer に触れて実体化→少し待って再試行、で安定する。
+        def _set_props():
+            if caption is not None:
+                frm_comp.Properties("Caption").Value = caption
+            if width is not None:
+                frm_comp.Properties("Width").Value = width
+            if height is not None:
+                frm_comp.Properties("Height").Value = height
+        try:
+            _set_props()
+        except Exception:
+            import time
+            try:
+                _ = frm_comp.Designer.Controls.Count   # Designer を実体化
+            except Exception:
+                pass
+            time.sleep(0.5)
+            self._close_vbe_designer_windows()
+            _set_props()                               # 2回目も失敗なら例外を上げる
 
         return frm_comp
 
@@ -293,11 +380,14 @@ class FormBuilder:
         print(f"コントロールをクリア ({len(names)} 個削除)")
         return f
 
-    def inject_vba(self, frm_comp, vba_file):
+    def inject_vba(self, frm_comp, vba_file=None):
         """
         .vba ファイル (UTF-8) からコードを読み込み CodeModule に注入する。
         既存コードは全削除してから上書き。
+        vba_file 省略時はスクリプトと同じ場所の _last_form_code.vba を使う。
         """
+        if vba_file is None:
+            vba_file = os.path.join(SCRIPT_DIR, "_last_form_code.vba")
         abs_vba = os.path.abspath(vba_file)
         with open(abs_vba, "r", encoding="utf-8") as fp:
             code = fp.read()
