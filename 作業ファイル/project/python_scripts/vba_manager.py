@@ -95,6 +95,7 @@ _created_xl_pid = None
 
 def setup_encoding():
     sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')   # --json 時の情報行が stderr に行くため同様に固定
     os.environ['PYTHONIOENCODING'] = 'utf-8'
     pythoncom.CoInitialize()
 
@@ -351,27 +352,41 @@ def _running_excel_workbooks():
 _wb_cache = {}
 
 
-def get_workbook(target_file_arg=None, load_addins=False):
-    """get_workbook（接続キャッシュつきの入口）。戻り値: (xl, wb)"""
+def get_workbook(target_file_arg=None, load_addins=False, readonly=False):
+    """get_workbook（接続キャッシュつきの入口）。戻り値: (xl, wb)
+
+    readonly=True は診断系コマンド用。未起動ブックを自動で開く場合に
+    「読み取り専用＋イベント無効」で開く（Workbook_Open 等を起こさない健診モード）。
+    既に開いているブックには影響しない。
+    """
     key = "__active__"
     if target_file_arg:
         resolved = smart_path_resolve(target_file_arg)
         key = resolved.lower() if resolved else target_file_arg.lower()
     if key in _wb_cache:
-        xl, wb = _wb_cache[key]
+        xl, wb, was_ro = _wb_cache[key]
         try:
             _ = wb.Name          # 生存確認（閉じられていたら再接続）
+            if was_ro and not readonly:
+                print("⚠ このブックは診断用に読み取り専用で開いています。"
+                      "編集するには Excel で通常モードで開き直してください。")
             if load_addins:
                 load_excel_addins_and_personal(xl)
             return xl, wb
         except Exception:
             del _wb_cache[key]
-    xl, wb = _get_workbook_uncached(target_file_arg, load_addins)
-    _wb_cache[key] = (xl, wb)
+    xl, wb = _get_workbook_uncached(target_file_arg, load_addins, readonly)
+    # readonly フラグは「このツールが自動で開いた場合」だけ意味を持つ
+    opened_ro = readonly and target_file_arg is not None
+    try:
+        opened_ro = opened_ro and bool(wb.ReadOnly)
+    except Exception:
+        pass
+    _wb_cache[key] = (xl, wb, opened_ro)
     return xl, wb
 
 
-def _get_workbook_uncached(target_file_arg=None, load_addins=False):
+def _get_workbook_uncached(target_file_arg=None, load_addins=False, readonly=False):
     """
     target_file_arg が None/空 → アクティブExcelブックを自動使用
     それ以外 → 既に開いているか確認、なければ新規オープン
@@ -448,7 +463,10 @@ def _get_workbook_uncached(target_file_arg=None, load_addins=False):
             excel_running = False
 
     # 新規オープン
-    xl = win32com.client.dynamic.Dispatch("Excel.Application")
+    # ★必ず DispatchEx を使う。Dispatch は既存インスタンスがあるとそこに接続してしまい、
+    #   「自分が起動した Excel」と誤認 → 後始末でユーザーの Excel ごと閉じる大事故になる
+    #   （2026-07-03 実害。ユーザーのブックを巻き込んで Quit した）
+    xl = win32com.client.DispatchEx("Excel.Application")
     global _created_xl, _created_xl_pid
     _created_xl = xl
     try:
@@ -464,6 +482,17 @@ def _get_workbook_uncached(target_file_arg=None, load_addins=False):
 
     if load_addins:
         load_excel_addins_and_personal(xl)
+
+    if readonly:
+        # 健診モード: Workbook_Open 等の自動実行を起こさず、リンク更新もせず、
+        # 読み取り専用で開く（「診察に行ったら患者を起こしてしまった」の防止）
+        try:
+            xl.EnableEvents = False
+        except Exception:
+            pass
+        wb = xl.Workbooks.Open(target_path, 0, True)   # UpdateLinks=0, ReadOnly=True
+        print(f"対象ブック: {wb.Name}  (新規オープン・読み取り専用・イベント無効=健診モード)")
+        return xl, wb
 
     wb = xl.Workbooks.Open(target_path)
     print(f"対象ブック: {wb.Name}  (新規オープン)")
@@ -614,13 +643,16 @@ def validate_vba_code(code, force=False):
         print("警告: --force が指定されているため、検証エラーを無視して処理を続行します。")
 
     # 2. 簡易構文チェック (Sub/End Sub, Function/End Function の対のチェック)
-    # コメント行を除外して検索
+    # コメント行を除外して検索。マルチステートメント行（Sub x(): End Sub 等）は
+    # ':' で文に分割してから数える（1行書きを「End Sub 不足」と誤警告しない）
     clean_lines = []
     for line in code.split('\n'):
         stripped = line.strip()
         if stripped.startswith("'") or stripped.lower().startswith("rem "):
             continue
-        clean_lines.append(stripped)
+        blanked = re.sub(r'"[^"]*"', '""', stripped)   # 文字列内の ':' で誤分割しない
+        for seg in blanked.split(':'):
+            clean_lines.append(seg.strip())
     clean_code = '\n'.join(clean_lines)
 
     decl_sub = len(re.findall(r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?\bSub\b', clean_code, re.IGNORECASE | re.MULTILINE))
@@ -1984,6 +2016,64 @@ def cmd_delete_procedure(args):
     return True
 
 
+def cmd_delete_module(args):
+    """モジュール丸ごと削除: delete-module [excel_file] <モジュール名> [-y]
+
+    削除前に中身の要約を表示して確認。ブック＋モジュールの自動バックアップつき
+    （戻すのは restore）。ThisWorkbook / シートモジュールは削除できない（VBAの制約）。
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: delete-module [excel_file] <モジュール名> [-y]")
+        return False
+    module_name = rest[0]
+    if _reject_extra_args(rest, 1, '使い方: delete-module [excel_file] <モジュール名>'):
+        return False
+
+    xl, wb = get_workbook(target_file)
+    comp = None
+    for c in wb.VBProject.VBComponents:
+        if c.Name.lower() == module_name.lower():
+            comp = c
+            break
+    if comp is None:
+        print(f"エラー: モジュール '{module_name}' が見つかりません")
+        print("  存在するモジュール: " + ', '.join(c.Name for c in wb.VBProject.VBComponents))
+        return False
+    if int(comp.Type) == 100:
+        print(f"エラー: '{comp.Name}' はブック/シートのモジュールなので削除できません（VBAの制約）")
+        return False
+
+    cm = comp.CodeModule
+    n = cm.CountOfLines
+    kind = {1: '標準モジュール', 2: 'クラス', 3: 'フォーム'}.get(int(comp.Type), '?')
+    print(f"削除対象: [{comp.Name}]（{kind}・{n}行）")
+    if n > 0:
+        head = cm.Lines(1, min(n, 8)).replace('\r\n', '\n')
+        print("  --- 先頭8行 ---")
+        for ln in head.split('\n'):
+            print(f"  {ln}")
+        if n > 8:
+            print(f"  … 他 {n - 8}行")
+
+    if not getattr(args, 'yes', False):
+        ans = input(f"モジュール '{comp.Name}' を丸ごと削除しますか？ (y/N): ")
+        if ans.strip().lower() not in ('y', 'yes'):
+            print("キャンセルされました。")
+            return False
+    if make_backup(wb.FullName, f"delmod_{comp.Name}") is None and not getattr(args, 'force', False):
+        print("エラー: バックアップが取れないため中止しました（--force で強行可）。")
+        return False
+    backup = make_module_backup(wb, comp.Name)
+
+    wb.VBProject.VBComponents.Remove(comp)
+    wb.Save()
+    print(f"削除完了: モジュール '{module_name}' → 保存しました")
+    if backup:
+        print(f"  戻すには: py vba_manager.py restore {os.path.basename(backup)}")
+    return True
+
+
 def cmd_replace_module(args):
     """モジュール全体を Remove+Import で置換 (Attribute を正しく処理)"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -2173,10 +2263,6 @@ def _write_module(header, blocks, trailing):
     return '\r\n'.join(parts)
 
 
-# 一覧で非表示にしているマクロ（並べ替えの可視ブロック判定にも使う）
-_HIDDEN_MACROS = {"ホイール有効化", "ホイール無効化", "マウスホイールフック"}
-
-
 def cmd_reorder_macro(args):
     """
     マクロを同モジュール内で 1 つ上 / 下のマクロと入れ替える。
@@ -2236,15 +2322,14 @@ def cmd_reorder_macro(args):
         print(f"エラー: モジュール {module_name} に Sub '{macro_name}' が見つかりません")
         sys.exit(2)
 
-    # 一覧で見える Sub だけを「可視ブロック」として抽出
+    # 並べ替えの位置は Sub 単位で数える（Function は位置の数に入れない）
     visible_indices = [
-        i for i, b in enumerate(blocks)
-        if b['kind'] == 'sub' and b['name'] not in _HIDDEN_MACROS
+        i for i, b in enumerate(blocks) if b['kind'] == 'sub'
     ]
 
     if target_idx not in visible_indices:
         _remove_export_artifacts(tmp_bas)
-        print(f"エラー: '{macro_name}' は一覧表示対象ではありません")
+        print(f"エラー: '{macro_name}' は Sub ではないため並べ替えの対象外です")
         sys.exit(2)
 
     vis_pos = visible_indices.index(target_idx)
@@ -2653,6 +2738,1601 @@ def cmd_setup_check(args):
     return ng == 0
 
 
+def _collect_book_inventory(xl, wb, include_vba=True):
+    """ブックの棚卸しデータを機械収集する（docs / call-graph の共通土台）。
+
+    include_vba=False は VBA プロジェクトに触らない縮退モード
+    （パスワード保護・VBOM 未信頼のブックをシート側だけ診るために使う）。
+    """
+    inv = {'name': wb.Name, 'fullname': wb.FullName}
+
+    # シート
+    sheets = []
+    try:
+        active = wb.ActiveSheet.Name
+    except Exception:
+        active = None
+    for sh in wb.Sheets:
+        d = {'name': sh.Name, 'active': sh.Name == active}
+        try:
+            d['visible'] = int(sh.Visible)
+        except Exception:
+            d['visible'] = -1
+        try:
+            ur = sh.UsedRange
+            d['rows'] = ur.Rows.Count
+            d['cols'] = ur.Columns.Count
+            d['address'] = ur.Address
+        except Exception:
+            d['rows'] = d['cols'] = 0
+            d['address'] = None
+        sheets.append(d)
+    inv['sheets'] = sheets
+
+    # モジュールとプロシージャ（コード全文も保持＝call-graph が使う）
+    proc_pat = re.compile(
+        r'^\s*(?P<vis>Public\s+|Private\s+|Friend\s+)?(?:Static\s+)?'
+        r'(?P<kind>Sub|Function)\s+(?P<name>[^\s\(\)]+)',
+        re.IGNORECASE | re.MULTILINE)
+    type_names = {1: '標準', 2: 'クラス', 3: 'フォーム', 100: 'ブック/シート'}
+    modules = []
+    for comp in (wb.VBProject.VBComponents if include_vba else ()):
+        cm = comp.CodeModule
+        n = cm.CountOfLines
+        code = cm.Lines(1, n) if n > 0 else ""
+        lines = code.split('\r\n') if code else []
+        procs = []
+        for m in proc_pat.finditer(code):
+            name = m.group('name')
+            info = {'name': name,
+                    'kind': m.group('kind').capitalize(),
+                    'private': bool(m.group('vis') and 'private' in m.group('vis').lower())}
+            try:
+                info['lines'] = cm.ProcCountLines(name, 0)
+                body = cm.ProcBodyLine(name, 0)
+                if body < len(lines):
+                    first = lines[body].strip()
+                    if first.startswith("'"):
+                        info['comment'] = first.lstrip("'").strip()
+            except Exception:
+                pass
+            procs.append(info)
+        modules.append({'name': comp.Name, 'type': int(comp.Type),
+                        'type_name': type_names.get(int(comp.Type), str(comp.Type)),
+                        'total_lines': n, 'procs': procs, 'code': code})
+    inv['modules'] = modules
+
+    # フォーム（コントロール数）
+    forms = []
+    for comp in (wb.VBProject.VBComponents if include_vba else ()):
+        if int(comp.Type) != 3:
+            continue
+        d = {'name': comp.Name}
+        try:
+            d['caption'] = comp.Properties("Caption").Value
+        except Exception:
+            d['caption'] = None
+        try:
+            d['controls'] = comp.Designer.Controls.Count
+        except Exception:
+            d['controls'] = None
+        forms.append(d)
+    inv['forms'] = forms
+
+    # ショートカット（Attribute 走査。エクスポート方式は list-shortcuts と同じ）
+    shortcuts = {}
+    attr_pat = re.compile(
+        r'Attribute\s+([^.\s]+)\.VB_ProcData\.VB_Invoke_Func\s*=\s*"([^"]+)"',
+        re.IGNORECASE | re.DOTALL)
+    for comp in (wb.VBProject.VBComponents if include_vba else ()):
+        if int(comp.Type) not in (1, 2, 3, 100):
+            continue
+        tmp = os.path.join(SCRIPT_DIR, f"_tmp_doc_{comp.Name}.bas")
+        try:
+            comp.Export(tmp)
+            with open(tmp, 'rb') as f:
+                content = f.read().decode('cp932', errors='replace')
+            for m in attr_pat.finditer(content):
+                raw = m.group(2).replace('\\n', '\n').replace('\\r', '\r')
+                key = raw.split('\n')[0].split('\r')[0]
+                if key:
+                    shortcuts[m.group(1)] = f"Ctrl+{key}"
+        except Exception:
+            pass
+        finally:
+            _remove_export_artifacts(tmp)
+    inv['shortcuts'] = shortcuts
+
+    # 図形・フォームコントロールに登録されたマクロ（OnAction）＝ボタンからの実行入口。
+    # VBA ロック中でも読める（Shapes はシート側の情報）
+    onaction = []
+    for sh in wb.Worksheets:
+        try:
+            shapes = list(sh.Shapes)
+        except Exception:
+            continue
+        for shp in shapes:
+            try:
+                oa = shp.OnAction
+            except Exception:
+                continue
+            if oa:
+                macro = oa.split('!')[-1].strip("'\" ")
+                try:
+                    shp_name = shp.Name
+                except Exception:
+                    shp_name = '(図形)'
+                onaction.append((sh.Name, shp_name, macro))
+    inv['onaction'] = onaction
+
+    # テーブル・ピボット
+    tables, pivots = [], []
+    for sh in wb.Worksheets:
+        try:
+            for lo in sh.ListObjects:
+                tables.append({'sheet': sh.Name, 'name': lo.Name,
+                               'address': lo.Range.Address})
+        except Exception:
+            pass
+        try:
+            for pt in sh.PivotTables():
+                pivots.append({'sheet': sh.Name, 'name': pt.Name})
+        except Exception:
+            pass
+    inv['tables'] = tables
+    inv['pivots'] = pivots
+
+    # PowerQuery・接続・名前付き範囲
+    queries = []
+    try:
+        for q in wb.Queries:
+            queries.append({'name': q.Name})
+    except Exception:
+        pass
+    inv['queries'] = queries
+    conns = []
+    try:
+        for cn in wb.Connections:
+            conns.append({'name': cn.Name})
+    except Exception:
+        pass
+    inv['connections'] = conns
+    names = []
+    try:
+        for nm in wb.Names:
+            try:
+                names.append({'name': nm.Name, 'refers_to': nm.RefersTo})
+            except Exception:
+                names.append({'name': nm.Name, 'refers_to': None})
+    except Exception:
+        pass
+    inv['names'] = names
+    return inv
+
+
+def _inventory_or_explain(xl, wb):
+    """棚卸しを試み、VBA に触れないブック（パスワード保護/VBOM未信頼）なら
+    生の COM エラーで転ばず理由を説明して None を返す（docs/call-graph/impact 用）"""
+    try:
+        return _collect_book_inventory(xl, wb)
+    except Exception as e:
+        print("エラー: VBA プロジェクトに触れません（パスワード保護または VBOM 未信頼）。")
+        print("  シート側だけの診断なら checkup（健康診断）が縮退モードで実行できます。")
+        print(f"  詳細: {e}")
+        return None
+
+
+def cmd_docs(args):
+    """ブックの取扱説明書を自動生成: docs [excel_file] [--out f.md]
+
+    シート構成・モジュール別マクロ表（行数/ショートカット/先頭コメント）・
+    フォーム・テーブル/ピボット/クエリ/接続/名前付き範囲を Markdown 1枚に棚卸しする。
+    「このブックに何が入っているか」を機械が書く＝ブックと会話するための自己紹介文。
+    """
+    target_file, _ = parse_target_and_rest(args.posargs)
+    xl, wb = get_workbook(target_file, readonly=True)   # 健診モード（診断は読むだけ）
+    inv = _inventory_or_explain(xl, wb)
+    if inv is None:
+        return False
+
+    if getattr(args, 'json', False):
+        import json
+        slim = {k: v for k, v in inv.items()}
+        slim['modules'] = [{k: v for k, v in m.items() if k != 'code'}
+                           for m in inv['modules']]
+        print(json.dumps({"success": True, **slim}, ensure_ascii=False), file=sys.stdout)
+        return True
+
+    L = []
+    total_procs = sum(len(m['procs']) for m in inv['modules'])
+    total_lines = sum(m['total_lines'] for m in inv['modules'])
+    L.append(f"# {inv['name']} の構成ドキュメント")
+    L.append("")
+    L.append(f"- 生成: {time.strftime('%Y-%m-%d %H:%M')}（vba_manager docs）")
+    L.append(f"- パス: {inv['fullname']}")
+    L.append(f"- シート {len(inv['sheets'])} / マクロ {total_procs}（{total_lines}行） / "
+             f"フォーム {len(inv['forms'])} / テーブル {len(inv['tables'])} / "
+             f"ピボット {len(inv['pivots'])} / クエリ {len(inv['queries'])}")
+    L.append("")
+
+    L.append("## シート")
+    L.append("")
+    L.append("| シート | 使用範囲 | 大きさ | 状態 |")
+    L.append("|---|---|---|---|")
+    vis_label = {-1: '', 0: '非表示', 2: '完全非表示'}
+    for s in inv['sheets']:
+        mark = '（アクティブ）' if s['active'] else ''
+        L.append(f"| {s['name']}{mark} | {s['address'] or '-'} | "
+                 f"{s['rows']}行×{s['cols']}列 | {vis_label.get(s['visible'], '')} |")
+    L.append("")
+
+    # --preview N: 各シートの先頭N行を Markdown 表で（初見ブックの中身の見取り）
+    try:
+        preview = int(getattr(args, 'preview', None) or 0)
+    except (TypeError, ValueError):
+        preview = 0
+    if preview > 0:
+        def _md_cell(v):
+            return _cell_str(v).replace('|', '\\|').replace('\n', ' ')
+        for sh in wb.Sheets:
+            try:
+                ur = sh.UsedRange
+                nrows = min(preview, ur.Rows.Count)
+                ncols = min(ur.Columns.Count, 12)   # 横に広すぎる表は12列で切る
+                head = sh.Range(ur.Cells(1, 1), ur.Cells(nrows, ncols))
+                rows_v = _range_values_2d(head)
+            except Exception:
+                continue
+            L.append(f"### {sh.Name} の先頭{nrows}行")
+            L.append("")
+            start_col = ur.Column
+            headers = [_col_letter(start_col + j) for j in range(ncols)]
+            L.append("| 行 | " + " | ".join(headers) + " |")
+            L.append("|---|" + "---|" * ncols)
+            for ri, r in enumerate(rows_v):
+                cells = [_md_cell(v) for v in r] + [''] * (ncols - len(r))
+                L.append(f"| {ur.Row + ri} | " + " | ".join(cells[:ncols]) + " |")
+            if ur.Columns.Count > ncols:
+                L.append(f"（横は {ncols} 列まで表示・実際は {ur.Columns.Count} 列）")
+            L.append("")
+
+    L.append("## マクロ")
+    L.append("")
+    for m in inv['modules']:
+        if not m['procs'] and m['total_lines'] == 0:
+            continue
+        L.append(f"### [{m['name']}]（{m['type_name']}・{len(m['procs'])}プロシージャ・{m['total_lines']}行）")
+        if m['procs']:
+            L.append("")
+            L.append("| プロシージャ | 種別 | 行数 | ショートカット | 説明（先頭コメント） |")
+            L.append("|---|---|---|---|---|")
+            for p in m['procs']:
+                sc = inv['shortcuts'].get(p['name'], '')
+                priv = 'Private ' if p.get('private') else ''
+                L.append(f"| {p['name']} | {priv}{p['kind']} | {p.get('lines', '')} | "
+                         f"{sc} | {p.get('comment', '')} |")
+        L.append("")
+
+    if inv['forms']:
+        L.append("## フォーム")
+        L.append("")
+        L.append("| フォーム | キャプション | コントロール数 |")
+        L.append("|---|---|---|")
+        for f in inv['forms']:
+            L.append(f"| {f['name']} | {f.get('caption') or ''} | {f.get('controls') or ''} |")
+        L.append("")
+
+    def _simple_list(title, items, fmt):
+        if not items:
+            return
+        L.append(f"## {title}")
+        L.append("")
+        for it in items:
+            L.append(f"- {fmt(it)}")
+        L.append("")
+
+    _simple_list("テーブル", inv['tables'],
+                 lambda t: f"{t['name']}（{t['sheet']} {t['address']}）")
+    _simple_list("ピボットテーブル", inv['pivots'],
+                 lambda t: f"{t['name']}（{t['sheet']}）")
+    _simple_list("PowerQuery", inv['queries'], lambda t: t['name'])
+    _simple_list("接続", inv['connections'], lambda t: t['name'])
+    _simple_list("名前付き範囲", inv['names'],
+                 lambda t: f"{t['name']} → {t.get('refers_to') or '?'}")
+
+    out_path = getattr(args, 'out_opt', None)
+    out_path = os.path.abspath(out_path) if out_path else os.path.join(SCRIPT_DIR, "_last_docs.md")
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(L) + '\n')
+    print(f"構成ドキュメントを生成: {out_path}")
+    print(f"  シート {len(inv['sheets'])} / マクロ {total_procs}（{total_lines}行） / "
+          f"フォーム {len(inv['forms'])} / テーブル {len(inv['tables'])} / "
+          f"ピボット {len(inv['pivots'])} / クエリ {len(inv['queries'])}")
+    return True
+
+
+def _analyze_calls(inv):
+    """呼び出し関係の解析本体（call-graph / checkup 共用・COM 不要の純粋処理）。
+
+    戻り値: {'known', 'edges', 'unresolved', 'orphans'}
+    """
+    known = {}
+    form_modules = {m['name'] for m in inv['modules'] if m['type'] == 3}
+    doc_modules = {m['name'] for m in inv['modules'] if m['type'] == 100}
+    for m in inv['modules']:
+        for p in m['procs']:
+            known.setdefault(p['name'].lower(), (p['name'], m['name']))
+
+    defn_pat = re.compile(r'^\s*(?:Public\s+|Private\s+|Friend\s+)?(?:Static\s+)?'
+                          r'(?:Sub|Function)\s+([^\s\(\)]+)', re.IGNORECASE)
+    end_pat = re.compile(r'^\s*End\s+(?:Sub|Function)\b', re.IGNORECASE)
+    call_pat = re.compile(r'\bCall\s+([^\s\(\):=]+)', re.IGNORECASE)
+    # Declare 宣言された外部 API（Win32 等）は実在する呼び先＝未解決扱いにしない
+    decl_pat = re.compile(r'^\s*(?:Public\s+|Private\s+)?Declare\s+(?:PtrSafe\s+)?'
+                          r'(?:Sub|Function)\s+([^\s\(]+)', re.IGNORECASE)
+    api_names = set()
+    for m in inv['modules']:
+        for line in m['code'].split('\r\n'):
+            dm = decl_pat.match(line)
+            if dm:
+                api_names.add(dm.group(1).lower())
+    # Run の呼び先が丸ごと1つの文字列リテラルのときだけ静的に解決する。
+    # 閉じクォート直後に & が続く（"…" & 変数）は動的呼び出し＝対象外
+    any_run_pat = re.compile(r'Application\s*\.\s*Run\b', re.IGNORECASE)
+    run_pat = re.compile(r'Application\s*\.\s*Run\s*\(?\s*"(?:[^"!]*!)?([^"]+)"(?!\s*&)',
+                         re.IGNORECASE)
+    # 裸呼び用: 全既知名の一括照合（ドット直後=他オブジェクトのメソッドは除外）
+    if known:
+        names_alt = '|'.join(sorted((re.escape(v[0]) for v in known.values()),
+                                    key=len, reverse=True))
+        bare_pat = re.compile(r'(?<![\w.])(' + names_alt + r')(?![\w])')
+    else:
+        bare_pat = None
+
+    edges = {}         # (caller_mod, caller_proc) -> {callee正式名, ...}
+    unresolved = []    # (mod, proc, 呼び名, 行番号, 行テキスト)
+    dynamic_runs = []  # (mod, proc, 行番号, 行テキスト) 呼び先が実行時に決まる Run
+    for m in inv['modules']:
+        cur = None
+        for i, raw in enumerate(m['code'].split('\r\n'), 1):
+            dm = defn_pat.match(raw)
+            if dm:
+                cur = dm.group(1)
+                continue
+            if end_pat.match(raw):
+                cur = None
+                continue
+            # 文字列リテラルを潰してからコメントを落とす（' の誤爆防止）
+            line = re.sub(r'"[^"]*"', '""', raw).split("'")[0]
+            caller = (m['name'], cur or '(宣言部)')
+
+            for cm_ in call_pat.finditer(line):
+                name = cm_.group(1)
+                if '.' in name:
+                    # Call obj.Method(...) はオブジェクトのメソッド。ただし
+                    # Call モジュール名.マクロ名 の修飾呼びは末尾で解決を試みる
+                    tail = name.rsplit('.', 1)[-1]
+                    hit = known.get(tail.lower())
+                    if hit:
+                        edges.setdefault(caller, set()).add(hit[0])
+                    continue
+                hit = known.get(name.lower())
+                if hit:
+                    edges.setdefault(caller, set()).add(hit[0])
+                elif name.lower() not in api_names:
+                    unresolved.append((m['name'], cur, name, i, raw.strip()))
+            ran_static = False
+            # Run の名前は文字列内にあるのでコメントだけ除いた原文から拾う
+            # （生 raw だとコメントアウトされた Run を誤検知する）
+            for rm_ in run_pat.finditer(_strip_vba_comment(raw)):
+                ran_static = True
+                name = rm_.group(1)
+                hit = known.get(name.lower())
+                if hit:
+                    edges.setdefault(caller, set()).add(hit[0])
+                else:
+                    unresolved.append((m['name'], cur, f'Run "{name}"', i, raw.strip()))
+            if not ran_static and any_run_pat.search(line):
+                # リテラル1本で解決できない Run（"…" & 変数 / 変数のみ）＝動的呼び出し
+                dynamic_runs.append((m['name'], cur or '(宣言部)', i, raw.strip()[:60]))
+            if bare_pat:
+                for bm in bare_pat.finditer(line):
+                    name = bm.group(1)
+                    if cur and name == cur:
+                        continue          # 自分自身の再帰は流れの把握には不要
+                    edges.setdefault(caller, set()).add(name)
+
+    # 図形・ボタンに登録されたマクロ（OnAction）＝ボタンからの実行入口
+    onaction = {}
+    for sheet, shp, macro in inv.get('onaction', ()):
+        hit = known.get(macro.lower())
+        if hit:
+            onaction.setdefault(hit[0], []).append(f"{sheet}/{shp}")
+
+    # 呼ばれる側の集合と孤立
+    called = set()
+    for callees in edges.values():
+        called |= callees
+    orphans = []
+    for m in inv['modules']:
+        for p in m['procs']:
+            if p['name'] in called:
+                continue
+            if p['name'] in onaction:
+                continue      # シート上のボタン/図形から呼ばれている＝孤立ではない
+            # フォーム/ブック/シートのイベントプロシージャ、Private はイベント・内部用が
+            # 多いので孤立には数えない（機械的な絞り込み）
+            if m['name'] in form_modules or m['name'] in doc_modules:
+                continue
+            orphans.append((m['name'], p['name']))
+    return {'known': known, 'edges': edges, 'onaction': onaction,
+            'unresolved': unresolved, 'orphans': orphans,
+            'dynamic_runs': dynamic_runs}
+
+
+def _strip_vba_comment(raw):
+    """行からコメント部を落とす（文字列リテラル内の ' は誤爆させない）"""
+    in_str = False
+    for i, ch in enumerate(raw):
+        if ch == '"':
+            in_str = not in_str
+        elif ch == "'" and not in_str:
+            return raw[:i]
+    return raw
+
+
+_AUTO_EXEC_STD = {'auto_open', 'auto_close'}
+_AUTO_EXEC_PREFIXES = ('workbook_', 'worksheet_', 'chart_')
+
+
+def _extra_code_scans(inv):
+    """checkup の参考所見スキャン（COM 不要の純粋処理・事実の列挙のみ）。
+
+    自動実行イベント / Option Explicit なし / On Error Resume Next /
+    ハードコードされたパス / 長いプロシージャ / 破壊的な操作の所在 /
+    ScreenUpdating・Calculation の戻し忘れ。いずれも要不要の判断はしない。
+    """
+    res = {'auto_exec': [], 'no_option_explicit': [], 'error_resume': [],
+           'hardcoded_paths': [], 'long_procs': [], 'destructive': [],
+           'no_restore': []}
+    path_pat = re.compile(r'"((?:[A-Za-z]:\\|\\\\)[^"]{2,})"')
+    oern_pat = re.compile(r'\bOn\s+Error\s+Resume\s+Next\b', re.IGNORECASE)
+    defn_pat = re.compile(r'^\s*(?:Public\s+|Private\s+|Friend\s+)?(?:Static\s+)?'
+                          r'(?:Sub|Function)\s+([^\s\(\)]+)', re.IGNORECASE)
+    end_pat = re.compile(r'^\s*End\s+(?:Sub|Function)\b', re.IGNORECASE)
+    destr_pats = [
+        (re.compile(r'(?<![\w.])(?:Kill|RmDir)\b', re.IGNORECASE), 'ファイル/フォルダ削除'),
+        (re.compile(r'\.(?:DeleteFile|DeleteFolder|MoveFile|MoveFolder)\b',
+                    re.IGNORECASE), 'FSOのファイル操作'),
+        (re.compile(r'\b(?:Worksheets|Sheets)\s*\([^)]*\)\s*\.Delete\b'
+                    r'|\bActiveSheet\s*\.Delete\b', re.IGNORECASE), 'シート削除'),
+        (re.compile(r'(?:\bRows\b|\bColumns\b|\.EntireRow|\.EntireColumn)'
+                    r'[^\n]*\.Delete\b', re.IGNORECASE), '行/列の削除'),
+    ]
+    su_off = re.compile(r'\bScreenUpdating\s*=\s*False\b', re.IGNORECASE)
+    su_on = re.compile(r'\bScreenUpdating\s*=\s*True\b', re.IGNORECASE)
+    ca_off = re.compile(r'\bCalculation\s*=\s*xl(?:Calculation)?Manual\b', re.IGNORECASE)
+    ca_on = re.compile(r'\bCalculation\s*=\s*xl(?:Calculation)?Automatic\b', re.IGNORECASE)
+    ee_off = re.compile(r'\bEnableEvents\s*=\s*False\b', re.IGNORECASE)
+    ee_on = re.compile(r'\bEnableEvents\s*=\s*True\b', re.IGNORECASE)
+
+    for m in inv['modules']:
+        code = m['code']
+        if not code:
+            continue
+        lines = code.split('\r\n')
+        if not any(re.match(r'\s*Option\s+Explicit\b', ln, re.IGNORECASE)
+                   for ln in lines):
+            res['no_option_explicit'].append(m['name'])
+        for p in m['procs']:
+            nl = p['name'].lower()
+            if (m['type'] == 100 and nl.startswith(_AUTO_EXEC_PREFIXES)) or \
+               (m['type'] == 1 and nl in _AUTO_EXEC_STD):
+                res['auto_exec'].append((m['name'], p['name'], p.get('lines')))
+            if p.get('lines') and p['lines'] >= 150:
+                res['long_procs'].append((m['name'], p['name'], p['lines']))
+
+        cur = None
+        state = {'su_off': False, 'su_on': False, 'ca_off': False, 'ca_on': False,
+                 'ee_off': False, 'ee_on': False}
+
+        def flush(proc, _m=m, _state=state):
+            # プロシージャ末尾で ScreenUpdating/Calculation/EnableEvents の戻し忘れを確定する
+            if proc:
+                if _state['su_off'] and not _state['su_on']:
+                    res['no_restore'].append(
+                        (_m['name'], proc, 'ScreenUpdating を False にしたまま True に戻す行がない'))
+                if _state['ca_off'] and not _state['ca_on']:
+                    res['no_restore'].append(
+                        (_m['name'], proc, 'Calculation を手動にしたまま自動に戻す行がない'))
+                if _state['ee_off'] and not _state['ee_on']:
+                    res['no_restore'].append(
+                        (_m['name'], proc, 'EnableEvents を False にしたまま True に戻す行がない'
+                                           '（イベントが死んだままになる）'))
+            for k in _state:
+                _state[k] = False
+
+        for i, raw in enumerate(lines, 1):
+            dm = defn_pat.match(raw)
+            if dm:
+                flush(cur)
+                cur = dm.group(1)
+            elif end_pat.match(raw):
+                flush(cur)
+                cur = None
+            body = _strip_vba_comment(raw)
+            blanked = re.sub(r'"[^"]*"', '""', body)
+            for pm in path_pat.finditer(body):
+                res['hardcoded_paths'].append((m['name'], cur or '(宣言部)', i,
+                                               pm.group(1)))
+            if oern_pat.search(blanked):
+                res['error_resume'].append((m['name'], cur or '(宣言部)', i))
+            for pat, label in destr_pats:
+                if pat.search(blanked):
+                    res['destructive'].append((m['name'], cur or '(宣言部)', i,
+                                               label, body.strip()[:60]))
+            if su_off.search(blanked):
+                state['su_off'] = True
+            if su_on.search(blanked):
+                state['su_on'] = True
+            if ca_off.search(blanked):
+                state['ca_off'] = True
+            if ca_on.search(blanked):
+                state['ca_on'] = True
+            if ee_off.search(blanked):
+                state['ee_off'] = True
+            if ee_on.search(blanked):
+                state['ee_on'] = True
+        flush(cur)
+    res['long_procs'].sort(key=lambda t: -t[2])
+    return res
+
+
+CHECKUP_HISTORY_DIR = os.path.join(SCRIPT_DIR, "_checkup_history")
+
+
+def _checkup_history_path(book_name):
+    safe = re.sub(r'[\\/:*?"<>|]', '_', book_name)
+    return os.path.join(CHECKUP_HISTORY_DIR, safe + ".json")
+
+
+def _load_checkup_history(book_name):
+    """ブック別の診断履歴（新しい順でなく古い順のリスト）を読む。無ければ空"""
+    import json
+    try:
+        with open(_checkup_history_path(book_name), 'r', encoding='utf-8') as f:
+            hist = json.load(f)
+        return hist if isinstance(hist, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_checkup_history(book_name, hist, keep=12):
+    import json
+    os.makedirs(CHECKUP_HISTORY_DIR, exist_ok=True)
+    with open(_checkup_history_path(book_name), 'w', encoding='utf-8') as f:
+        json.dump(hist[-keep:], f, ensure_ascii=False, indent=1)
+
+
+# --- 確認済み（意図的）所見の記録 ---
+# 「フォント混在」「同じ行のボタン幅」等、目で見て意図的なデザインと判断した所見は
+# ここに登録すると次回以降の「所見サマリ」の件数・総合判定から除外される
+# （消すのではなく「## 確認済み（意図的・件数から除外）」セクションに移すだけ＝事実は残す）。
+CHECKUP_ACK_DIR = os.path.join(SCRIPT_DIR, "_checkup_ack")
+
+
+def _checkup_ack_path(book_name):
+    safe = re.sub(r'[\\/:*?"<>|]', '_', book_name)
+    return os.path.join(CHECKUP_ACK_DIR, safe + ".json")
+
+
+def _load_checkup_ack(book_name):
+    """確認済み（意図的）として除外する所見キーの集合を読む。無ければ空集合"""
+    import json
+    try:
+        with open(_checkup_ack_path(book_name), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return set(data) if isinstance(data, list) else set()
+    except (OSError, ValueError):
+        return set()
+
+
+def _save_checkup_ack(book_name, ack_set):
+    import json
+    os.makedirs(CHECKUP_ACK_DIR, exist_ok=True)
+    with open(_checkup_ack_path(book_name), 'w', encoding='utf-8') as f:
+        json.dump(sorted(ack_set), f, ensure_ascii=False, indent=1)
+
+
+def _checkup_diff(prev, cur):
+    """前回スナップショットとの差分（純粋処理）。prev が無ければ None。
+
+    所見キーは行番号を含まない形にしてあるので、行ずれでは差分にならない。
+    """
+    if not prev:
+        return None
+    # 履歴ファイルは外部データ＝どちら側もキー欠損に耐える（cur も .get で読む）
+    pk, ck = set(prev.get('keys', [])), set(cur.get('keys', []))
+    d = {'prev_time': prev.get('time'),
+         'new': sorted(ck - pk), 'resolved': sorted(pk - ck)}
+    pp = {m: set(v) for m, v in (prev.get('procs') or {}).items()}
+    cp = {m: set(v) for m, v in (cur.get('procs') or {}).items()}
+    added, removed = [], []
+    for m in sorted(cp):
+        for p in sorted(cp[m] - pp.get(m, set())):
+            added.append(f"[{m}] {p}")
+    for m in sorted(pp):
+        for p in sorted(pp[m] - cp.get(m, set())):
+            removed.append(f"[{m}] {p}")
+    d['procs_added'], d['procs_removed'] = added, removed
+    cur_lines = cur.get('total_lines', 0)
+    d['lines_delta'] = cur_lines - prev.get('total_lines', cur_lines)
+    cur_sheets, cur_forms = set(cur.get('sheets', [])), set(cur.get('forms', []))
+    d['sheets_added'] = sorted(cur_sheets - set(prev.get('sheets', [])))
+    d['sheets_removed'] = sorted(set(prev.get('sheets', [])) - cur_sheets)
+    d['forms_added'] = sorted(cur_forms - set(prev.get('forms', [])))
+    d['forms_removed'] = sorted(set(prev.get('forms', [])) - cur_forms)
+    d['changed'] = bool(d['new'] or d['resolved'] or added or removed
+                        or d['lines_delta'] or d['sheets_added'] or d['sheets_removed']
+                        or d['forms_added'] or d['forms_removed'])
+    return d
+
+
+def _vba_references(wb):
+    """VBA 参照設定の一覧と破損（MISSING）の検出（読み取りのみ）。
+
+    眠っていたブックが動かない原因の筆頭＝「参照不可: ライブラリが見つかりません」を
+    VBE を開かずに検出する。
+    """
+    total, broken = 0, []
+    try:
+        refs = wb.VBProject.References
+    except Exception:
+        return {'total': 0, 'broken': []}
+    for r in refs:
+        total += 1
+        try:
+            name = r.Name
+        except Exception:
+            name = "(名前不明)"
+        try:
+            is_broken = bool(r.IsBroken)
+        except Exception:
+            is_broken = True      # IsBroken すら読めない参照は破損として報告
+        if is_broken:
+            try:
+                path = r.FullPath
+            except Exception:
+                path = None
+            broken.append((name, path))
+    return {'total': total, 'broken': broken}
+
+
+def _sheet_health(wb):
+    """シート側の健診（読み取りのみ）: エラーセル数。
+
+    ※ ゴースト（使用範囲と実データの差）検査は撤去した（2026-07-05・shuさん指示）。
+    値の無い行は「意図して罫線を引いた記入欄」のことが普通にあり（例:
+    ファイル一覧.xlsm の修正シート＝連続修正の記入欄100行）、機械には
+    取り残しと区別できない。この種の自動判定を根拠にした肥大縮小で
+    取説シートの結合を壊した実害もある（2026-06-19）。復活させないこと。
+    """
+    out = {'error_cells': []}
+    for sh in wb.Worksheets:
+        try:
+            ur = sh.UsedRange
+        except Exception:
+            continue
+        n_err = 0
+        for cell_type in (-4123, 2):          # 数式(-4123) / 定数(2)
+            try:
+                n_err += ur.SpecialCells(cell_type, 16).Count   # 16 = xlErrors
+            except Exception:
+                pass                           # 該当なしは SpecialCells が例外を投げる
+        if n_err:
+            out['error_cells'].append((sh.Name, n_err))
+    return out
+
+
+def _broken_links(wb):
+    """外部ブックへのリンクのうち、参照先ファイルが存在しないもの（読み取りのみ）"""
+    broken = []
+    try:
+        links = wb.LinkSources(1)              # 1 = xlExcelLinks
+    except Exception:
+        links = None
+    for src in (links or ()):
+        s = str(src)
+        if re.match(r'^[A-Za-z]:\\|^\\\\', s) and not os.path.exists(s):
+            broken.append(s)
+    return broken
+
+
+def _checkup_rating(total_findings, n_critical):
+    """総合判定（機械的な分類。判断はしない）:
+    C=壊れた参照・呼び出しあり / B=その他の所見あり / A=所見なし"""
+    if n_critical:
+        return "C（要確認）"
+    if total_findings:
+        return "B（軽度所見）"
+    return "A（異常なし）"
+
+
+def cmd_call_graph(args):
+    """マクロの呼び出し関係を解析: call-graph [excel_file] [--macro 名]
+
+    Call 文・Application.Run・既知プロシージャ名の裸呼びを機械的に解析する。
+    - 未解決 Call: **存在しないマクロを呼んでいる行**（コピペ残骸の一語バグ検出器）
+    - 呼び出し関係: どのマクロがどのマクロを使っているか
+    - 孤立: どこからも呼ばれていないマクロ（メニュー/イベント直実行の可能性があるため
+      機械は事実だけ報告し、要不要の判断はしない）
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    focus = getattr(args, 'macro_opt', None)
+    xl, wb = get_workbook(target_file, readonly=True)   # 健診モード（診断は読むだけ）
+    inv = _inventory_or_explain(xl, wb)
+    if inv is None:
+        return False
+    res = _analyze_calls(inv)
+    known, edges = res['known'], res['edges']
+    unresolved, orphans = res['unresolved'], res['orphans']
+
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({
+            "success": True, "file": inv['name'],
+            "edges": [{"caller_module": k[0], "caller": k[1], "callees": sorted(v)}
+                      for k, v in sorted(edges.items())],
+            "unresolved": [{"module": u[0], "proc": u[1], "name": u[2],
+                            "line": u[3], "text": u[4]} for u in unresolved],
+            "orphans": [{"module": o[0], "name": o[1]} for o in orphans],
+        }, ensure_ascii=False), file=sys.stdout)
+        return not unresolved
+
+    if getattr(args, 'mermaid', None) is not None:
+        # Mermaid 図（GitHub / Qiita でそのまま描画される）。モジュール別 subgraph、
+        # 未解決の呼び先は赤ノード。呼び出しのあるマクロだけを図に載せる
+        out_path = (os.path.join(SCRIPT_DIR, "_last_callgraph.md")
+                    if args.mermaid == '_DEFAULT_' else os.path.abspath(args.mermaid))
+        node_ids = {}
+
+        def nid(name):
+            if name not in node_ids:
+                node_ids[name] = f"n{len(node_ids)}"
+            return node_ids[name]
+
+        used = set()
+        for (mod, proc), callees in edges.items():
+            if proc == '(宣言部)' or not callees:
+                continue
+            used.add(proc)
+            used |= callees
+        ml = [f"# {inv['name']} 呼び出し関係図", "",
+              f"生成: {time.strftime('%Y-%m-%d %H:%M')}（vba_manager call-graph --mermaid）", "",
+              "```mermaid", "flowchart LR"]
+        by_mod = {}
+        for m in inv['modules']:
+            for p in m['procs']:
+                if p['name'] in used:
+                    by_mod.setdefault(m['name'], []).append(p['name'])
+        for mod, procs in by_mod.items():
+            ml.append(f'    subgraph {mod}')
+            for p in procs:
+                ml.append(f'        {nid(p)}["{p}"]')
+            ml.append('    end')
+        for (mod, proc), callees in sorted(edges.items()):
+            if proc == '(宣言部)':
+                continue
+            for c in sorted(callees):
+                ml.append(f'    {nid(proc)} --> {nid(c)}')
+        bad_ids = []
+        for _, proc, name, _, _ in unresolved:
+            if proc:
+                bid = nid(f"？{name}")
+                bad_ids.append(bid)
+                ml.append(f'    {bid}["{name}（存在しない）"]')
+                ml.append(f'    {nid(proc)} -.-> {bid}')
+        for b in set(bad_ids):
+            ml.append(f'    style {b} fill:#ffcccc,stroke:#cc0000')
+        ml.append("```")
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(ml) + '\n')
+        print(f"Mermaid 図を生成: {out_path}  "
+              f"（ノード {len(node_ids)} / 未解決 {len(unresolved)}）")
+        return not unresolved
+
+    print(f"===== 呼び出し関係の解析: {inv['name']} =====")
+
+    # 1. 未解決（最重要＝存在しないマクロを呼んでいる）
+    if unresolved:
+        print(f"\n⚠ 未解決の呼び出し（{len(unresolved)}件）— 存在しないマクロを呼んでいます:")
+        for mod, proc, name, ln, text in unresolved:
+            print(f"  [{mod}] {proc or '(宣言部)'} :{ln}  →  {name}")
+            print(f"      {text}")
+    else:
+        print("\n未解決の呼び出し: なし（Call/Run はすべて実在のマクロを指しています）")
+
+    # 2. 呼び出し関係（focus 指定ならそのマクロを起点にツリー展開）
+    if focus:
+        hit = known.get(focus.lower())
+        if not hit:
+            print(f"\nエラー: マクロ '{focus}' が見つかりません")
+            _suggest_similar(focus, [v[0] for v in known.values()])
+            return False
+        root = hit[0]
+        print(f"\n--- {root} からの呼び出しツリー ---")
+
+        # 正式名→callee集合（モジュール横断で合算）
+        by_name = {}
+        for (mod, proc), callees in edges.items():
+            by_name.setdefault(proc, set()).update(callees)
+
+        def walk(name, depth, seen):
+            for callee in sorted(by_name.get(name, ())):
+                loop = "（循環）" if callee in seen else ""
+                print("  " * depth + f"└ {callee}{loop}")
+                if not loop and depth < 6:
+                    walk(callee, depth + 1, seen | {callee})
+        walk(root, 1, {root})
+        callers = sorted({f"[{k[0]}] {k[1]}" for k, v in edges.items() if root in v})
+        print(f"--- {root} を呼んでいるマクロ ---")
+        for c in callers or ["  (なし)"]:
+            print(f"  {c}" if not c.startswith("  ") else c)
+    else:
+        callers_with_edges = [(k, v) for k, v in sorted(edges.items())
+                              if v and k[1] != '(宣言部)']
+        print(f"\n--- 呼び出し関係（{len(callers_with_edges)}マクロが他マクロを使用） ---")
+        for (mod, proc), callees in callers_with_edges:
+            print(f"  [{mod}] {proc} → {', '.join(sorted(callees))}")
+
+        if orphans:
+            print(f"\n--- どこからも呼ばれていないマクロ（{len(orphans)}件・"
+                  "メニュー/ショートカット直実行の可能性あり） ---")
+            for mod, name in orphans[:40]:
+                sc = inv['shortcuts'].get(name)
+                print(f"  [{mod}] {name}" + (f"  ({sc})" if sc else ""))
+            if len(orphans) > 40:
+                print(f"  … 他 {len(orphans) - 40}件")
+    return not unresolved
+
+
+def _checkup_one(xl, wb, note=None, ack_all=False):
+    """1ブックぶんの健康診断（収集・検査・履歴比較まで）。
+
+    note はカルテのメモ＝今回のスナップショットに添付して履歴に残す
+    （「何をどう直した回か」を後から思い出すための治療欄）。
+    ack_all=True のとき、今回のコード/フォーム所見を全て「確認済み（意図的）」
+    として登録し、以降の所見サマリ・総合判定から除外する
+    （存在しないマクロ呼び出し等の致命的所見は対象外＝常に表示する）。
+    戻り値: {'name','rating','total','counts','diff','lines','json'}
+    レポートの書き出しと画面表示は cmd_checkup 側で行う。
+    """
+    # VBA プロジェクトに触れないブック（パスワード保護・VBOM 未信頼）は
+    # シート側だけの縮退診断に切り替える（入口で転ばない）
+    vba_error = None
+    try:
+        inv = _collect_book_inventory(xl, wb)
+    except Exception as e:
+        vba_error = str(e).strip() or "VBAプロジェクトにアクセスできません"
+        inv = _collect_book_inventory(xl, wb, include_vba=False)
+    calls = _analyze_calls(inv)
+    extra = _extra_code_scans(inv)
+    refs = _vba_references(wb) if not vba_error else {'total': 0, 'broken': []}
+    sheet_h = _sheet_health(wb)
+    dead_links = _broken_links(wb)
+    ref_names = [n['name'] for n in inv['names']
+                 if n.get('refers_to') and '#REF!' in str(n.get('refers_to'))]
+
+    # --- コードの機械検査（モジュール単位） ---
+    # (比較キー, 表示文) のペア。キーは行番号を含めない＝行ずれで差分を出さない
+    code_findings = []
+    for m in inv['modules']:
+        if not m['code']:
+            continue
+        norm = m['code'].replace('\r\n', '\n')
+        dups = _find_duplicate_procedures(norm)
+        for nm, lns in dups.items():
+            code_findings.append((f"重複プロシージャ: [{m['name']}] {nm}",
+                                  f"[{m['name']}] プロシージャ名の重複: {nm}"
+                                  f"（行 {', '.join(map(str, lns))}）"))
+        for ln, s in _find_consecutive_dup_lines(norm)[:10]:
+            code_findings.append((f"連続重複行: [{m['name']}] 「{s[:40]}」",
+                                  f"[{m['name']}] 連続する同一コード行: 行{ln} 「{s[:40]}」"))
+
+    # --- フォームの検査（form_inspect の lint を統合） ---
+    form_findings = {}
+    forms_checked = 0
+    try:
+        if vba_error:
+            raise ImportError     # ロック中はフォームにも触れない（未検査扱い）
+        import form_inspect as _fi
+        for comp in wb.VBProject.VBComponents:
+            if int(comp.Type) != 3:
+                continue
+            forms_checked += 1
+            try:
+                info = _fi.get_form_info(comp)
+                controls = _fi.collect_controls(comp)
+                cm = comp.CodeModule
+                code_txt = cm.Lines(1, cm.CountOfLines) if cm.CountOfLines > 0 else None
+                f = _fi.lint_form(comp.Name, info, controls, code=code_txt)
+                if f:
+                    form_findings[comp.Name] = f
+            except Exception as e:
+                form_findings[comp.Name] = [f"(検査不可: {e})"]
+    except ImportError:
+        form_findings = None      # form_inspect.py が無い構成（マクロ管理のみ）
+
+    # --- バックアップ状況 ---
+    base = os.path.splitext(inv['name'])[0]
+    bk_count, bk_latest = 0, None
+    if os.path.isdir(BACKUP_DIR):
+        for name in os.listdir(BACKUP_DIR):
+            if base in name:
+                bk_count += 1
+                t = os.path.getmtime(os.path.join(BACKUP_DIR, name))
+                if bk_latest is None or t > bk_latest:
+                    bk_latest = t
+
+    # --- 確認済み（意図的）所見の除外 ---
+    # コード検査・フォーム検査の所見だけが対象（存在しないマクロ呼び出し等の
+    # 致命的な所見は対象外＝常に表示する）。ack_all 指定時はここで今回の
+    # 所見を全て確認済みとして登録してから、その状態でフィルタする。
+    ack_set = _load_checkup_ack(inv['name'])
+    if ack_all:
+        new_keys = {k for k, _ in code_findings}
+        for fname, findings in (form_findings or {}).items():
+            new_keys |= {f"フォーム {fname}: {s}" for s in findings}
+        ack_new = new_keys - ack_set
+        ack_set = ack_set | new_keys
+        if ack_new:
+            _save_checkup_ack(inv['name'], ack_set)
+    else:
+        ack_new = set()
+
+    code_findings_active = [(k, t) for k, t in code_findings if k not in ack_set]
+    code_findings_acked = [(k, t) for k, t in code_findings if k in ack_set]
+    form_findings_active, form_findings_acked = {}, {}
+    for fname, findings in (form_findings or {}).items():
+        act, ackd = [], []
+        for s in findings:
+            (ackd if f"フォーム {fname}: {s}" in ack_set else act).append(s)
+        if act:
+            form_findings_active[fname] = act
+        if ackd:
+            form_findings_acked[fname] = ackd
+    n_ack = len(code_findings_acked) + sum(len(v) for v in form_findings_acked.values())
+
+    unresolved = calls['unresolved']
+    n_form = sum(len(v) for v in form_findings_active.values())
+    n_critical = (len(unresolved) + len(refs['broken'])
+                  + len(dead_links) + len(ref_names))
+    total_findings = n_critical + len(code_findings_active) + n_form
+    rating = _checkup_rating(total_findings, n_critical)
+    if vba_error:
+        rating = "C（要確認）" if n_critical else "判定保留（VBA未検査）"
+    total_procs = sum(len(m['procs']) for m in inv['modules'])
+    total_lines = sum(m['total_lines'] for m in inv['modules'])
+    n_err_cells = sum(n for _, n in sheet_h['error_cells'])
+
+    # --- 定期健診: 前回スナップショットと比較して履歴に積む ---
+    finding_keys = []
+    for mod, proc, name, ln, text in unresolved:
+        finding_keys.append(f"未解決Call: [{mod}] {proc or '(宣言部)'} → {name}")
+    for name, path in refs['broken']:
+        finding_keys.append(f"参照切れ: {name}")
+    for s in dead_links:
+        finding_keys.append(f"リンク切れ: {s}")
+    for nm in ref_names:
+        finding_keys.append(f"#REF!名前: {nm}")
+    finding_keys += [k for k, _ in code_findings]
+    for fname, findings in (form_findings or {}).items():
+        finding_keys += [f"フォーム {fname}: {s}" for s in findings]
+
+    # --- 確認済みリストの自動整理 ---
+    # lintのロジック変更（閾値追加・チェック撤去等）で二度と出ない古いキーが
+    # 確認済みリストに残り続けないよう、今回の生の所見に無いキーは毎回自動で
+    # 除く。ただし検査が不完全な回は整理しない：
+    #   - vba_error 時（縮退診断＝コード/フォームを見られていない）
+    #   - form_findings is None 時（form_inspect.py が無い構成。フォームを
+    #     検査できていないだけなのに、フォーム系の確認済みを「古いキー」と
+    #     誤判定して全消しし、次にフォーム検査できる環境で全部復活してしまう）
+    n_ack_pruned = 0
+    if not vba_error and form_findings is not None:
+        stale_ack = ack_set - set(finding_keys)
+        if stale_ack:
+            _save_checkup_ack(inv['name'], ack_set - stale_ack)
+            n_ack_pruned = len(stale_ack)
+
+    snap = {
+        'time': time.strftime('%Y-%m-%d %H:%M'),
+        'counts': {'unresolved': len(unresolved), 'code': len(code_findings_active),
+                   'form': n_form, 'orphans': len(calls['orphans'])},
+        'keys': sorted(finding_keys),
+        'procs': {m['name']: [p['name'] for p in m['procs']] for m in inv['modules']},
+        'total_procs': total_procs, 'total_lines': total_lines,
+        'total_findings': total_findings, 'rating': rating, 'ack_count': n_ack,
+        'sheets': [s['name'] for s in inv['sheets']],
+        'forms': [f['name'] for f in inv['forms']],
+    }
+    if note:
+        snap['note'] = note
+    if vba_error:
+        diff = None       # ロック中の縮退診断は履歴に混ぜない（解除後の差分が乱れる）
+    else:
+        hist = _load_checkup_history(inv['name'])
+        diff = _checkup_diff(hist[-1] if hist else None, snap)
+        try:
+            _save_checkup_history(inv['name'], hist + [snap])
+        except OSError as e:
+            print(f"警告: 診断履歴を保存できませんでした（{e}）。比較機能は次回も初回扱いになります")
+
+    json_payload = {
+        "success": total_findings == 0, "file": inv['name'], "rating": rating,
+        "total_findings": total_findings,
+        "unresolved_calls": len(unresolved),
+        "broken_references": [{"name": n, "path": p} for n, p in refs['broken']],
+        "broken_links": dead_links, "ref_error_names": ref_names,
+        "code_findings": [d for _, d in code_findings_active],
+        "form_findings": form_findings_active, "orphans": len(calls['orphans']),
+        "acknowledged_count": n_ack, "newly_acknowledged": len(ack_new),
+        "backups": bk_count,
+        "error_cells": [{"sheet": s, "count": n} for s, n in sheet_h['error_cells']],
+        "auto_exec": len(extra['auto_exec']),
+        "hardcoded_paths": len(extra['hardcoded_paths']),
+        "no_option_explicit": extra['no_option_explicit'],
+        "error_resume": len(extra['error_resume']),
+        "long_procs": len(extra['long_procs']),
+        "destructive": len(extra['destructive']),
+        "no_restore": len(extra['no_restore']),
+        "onaction": calls['onaction'],
+        "dynamic_runs": len(calls['dynamic_runs']),
+        "vba_error": vba_error,
+        "diff": diff,
+    }
+    L = []
+    L.append(f"# {inv['name']} 健康診断レポート")
+    L.append("")
+    L.append(f"- 診断日時: {time.strftime('%Y-%m-%d %H:%M')}（vba_manager checkup）")
+    if vba_error:
+        L.append(f"- 規模: シート {len(inv['sheets'])} / マクロ・フォームは VBA 未検査のため不明")
+    else:
+        L.append(f"- 規模: シート {len(inv['sheets'])} / マクロ {total_procs}（{total_lines}行） / "
+                 f"フォーム {len(inv['forms'])}")
+    L.append(f"- 総合判定: **{rating}**"
+             "（A=所見なし / B=所見あり / C=壊れた参照・呼び出しあり。機械的な分類です）")
+    if vba_error:
+        L.append("- ⚠ **VBA は検査できませんでした**（プロジェクトのパスワード保護、"
+                 "または VBOM 未信頼）。以下はシート側だけの縮退診断です")
+    L.append("")
+
+    L.append("## 所見サマリ")
+    L.append("")
+    mark = "✅" if total_findings == 0 else "⚠"
+    L.append(f"{mark} **検出された所見: {total_findings}件**"
+             + (f"（確認済み・意図的として除外: {n_ack}件 → 末尾参照）" if n_ack else ""))
+    if ack_new:
+        L.append(f"　今回 {len(ack_new)}件を新たに確認済み登録しました。")
+    L.append("")
+    L.append(f"| 診察項目 | 所見 |")
+    L.append(f"|---|---|")
+    if vba_error:
+        L.append(f"| 外部ブックへのリンク切れ | **{len(dead_links)}件** |")
+        L.append(f"| #REF! になった名前付き範囲 | **{len(ref_names)}件** |")
+        L.append(f"| エラーセル（#REF!/#NAME?等） | {n_err_cells}個/"
+                 f"{len(sheet_h['error_cells'])}シート（参考） |")
+        L.append(f"| ボタン/図形に登録されたマクロ | {len(inv['onaction'])}箇所（参考） |")
+        L.append("| VBAの検査（コード/フォーム/参照設定） | 実施できず（保護または未信頼） |")
+    else:
+        L.append(f"| 存在しないマクロへの呼び出し | **{len(unresolved)}件** |")
+        L.append(f"| 参照設定の破損（MISSING） | **{len(refs['broken'])}件**（全{refs['total']}参照） |")
+        L.append(f"| 外部ブックへのリンク切れ | **{len(dead_links)}件** |")
+        L.append(f"| #REF! になった名前付き範囲 | **{len(ref_names)}件** |")
+        L.append(f"| コードの機械検査（重複等） | {len(code_findings_active)}件 |")
+        if form_findings is not None:
+            L.append(f"| フォームの検査（{forms_checked}フォーム） | {n_form}件 |")
+        if n_ack:
+            L.append(f"| 確認済み（意図的・上記から除外済み） | {n_ack}件 |")
+        L.append(f"| エラーセル（#REF!/#NAME?等） | {n_err_cells}個/"
+                 f"{len(sheet_h['error_cells'])}シート（参考） |")
+        L.append(f"| 破壊的な操作（Kill/シート削除等） | {len(extra['destructive'])}箇所（参考） |")
+        L.append(f"| ScreenUpdating/Calculation/EnableEvents 戻し忘れ | {len(extra['no_restore'])}件（参考） |")
+        L.append(f"| どこからも呼ばれていないマクロ | {len(calls['orphans'])}件（参考・"
+                 "メニュー/直実行の可能性あり） |")
+        L.append(f"| ボタン/図形に登録されたマクロ | {len(calls['onaction'])}件（参考） |")
+        L.append(f"| 動的な Application.Run（実行時に呼び先決定） | "
+                 f"{len(calls['dynamic_runs'])}箇所（参考） |")
+        L.append(f"| 自動実行イベント（開く/変更等で起動） | {len(extra['auto_exec'])}件（参考） |")
+        L.append(f"| ハードコードされたパス | {len(extra['hardcoded_paths'])}箇所（参考） |")
+        L.append(f"| Option Explicit なしのモジュール | {len(extra['no_option_explicit'])}件（参考） |")
+        L.append(f"| On Error Resume Next | {len(extra['error_resume'])}箇所（参考） |")
+        L.append(f"| 150行を超えるプロシージャ | {len(extra['long_procs'])}件（参考） |")
+    L.append(f"| バックアップ | {bk_count}件"
+             + (f"（最新: {time.strftime('%Y-%m-%d %H:%M', time.localtime(bk_latest))}）"
+                if bk_latest else "（なし）") + " |")
+    L.append("")
+
+    L.append("## 前回との比較（定期健診）")
+    L.append("")
+    if vba_error:
+        L.append("VBA 未検査の縮退診断のため、履歴への記録と前回比較は行いません。")
+    elif diff is None:
+        L.append("初回の診断のため比較対象がありません（今回の結果を記録しました。"
+                 "次回からここに前回との差分が出ます）。")
+    elif not diff['changed']:
+        L.append(f"前回（{diff['prev_time']}）から変化はありません。")
+    else:
+        L.append(f"前回の診断: {diff['prev_time']}")
+        L.append("")
+        for s in diff['new']:
+            L.append(f"- ＋ 新しい所見: {s}")
+        for s in diff['resolved']:
+            L.append(f"- － 解消した所見: {s}")
+        for s in diff['procs_added']:
+            L.append(f"- ＋ マクロ追加: {s}")
+        for s in diff['procs_removed']:
+            L.append(f"- － マクロ削除: {s}")
+        if diff['lines_delta']:
+            sign = '+' if diff['lines_delta'] > 0 else ''
+            L.append(f"- コード行数: {sign}{diff['lines_delta']}行（計{total_lines}行）")
+        for s in diff['sheets_added']:
+            L.append(f"- ＋ シート追加: {s}")
+        for s in diff['sheets_removed']:
+            L.append(f"- － シート削除: {s}")
+        for s in diff['forms_added']:
+            L.append(f"- ＋ フォーム追加: {s}")
+        for s in diff['forms_removed']:
+            L.append(f"- － フォーム削除: {s}")
+    L.append("")
+
+    if unresolved:
+        L.append("## ⚠ 存在しないマクロへの呼び出し（最優先で確認）")
+        L.append("")
+        for mod, proc, name, ln, text in unresolved:
+            L.append(f"- `[{mod}] {proc or '(宣言部)'}` の {ln} 行目 → **{name}**")
+            L.append(f"  ```vba")
+            L.append(f"  {text}")
+            L.append(f"  ```")
+        L.append("")
+
+    if refs['broken'] or dead_links or ref_names:
+        L.append("## ⚠ 壊れた参照（最優先で確認）")
+        L.append("")
+        for name, path in refs['broken']:
+            L.append(f"- 参照設定の破損（MISSING）: **{name}**"
+                     + (f" `{path}`" if path else ""))
+        if refs['broken']:
+            L.append("  （VBE の [ツール]→[参照設定] で「参照不可」になっている項目。"
+                     "コンパイルエラーの典型原因）")
+        for s in dead_links:
+            L.append(f"- 外部ブックへのリンク切れ: `{s}`（参照先ファイルが存在しません）")
+        for nm in ref_names:
+            L.append(f"- #REF! になった名前付き範囲: **{nm}**")
+        L.append("")
+
+    if code_findings_active:
+        L.append("## コードの機械検査")
+        L.append("")
+        for _, s in code_findings_active:
+            L.append(f"- {s}")
+        L.append("")
+
+    if form_findings_active:
+        L.append("## フォームの検査")
+        L.append("")
+        for fname, findings in form_findings_active.items():
+            L.append(f"### {fname}")
+            for s in findings:
+                L.append(f"- {s}")
+            L.append("")
+
+    if n_ack:
+        L.append("## 確認済み（意図的・件数から除外）")
+        L.append("")
+        L.append("目で見て意図的なデザイン等と判断し、`checkup --ack-all` で確認済み登録した"
+                 "所見です。事実としては残しつつ、所見サマリ・総合判定からは除外しています。"
+                 "判断を見直す場合は `checkup --unack \"文字列\"` で確認済みから外せます。")
+        L.append("")
+        for _, s in code_findings_acked:
+            L.append(f"- {s}")
+        for fname, findings in form_findings_acked.items():
+            L.append(f"### {fname}")
+            for s in findings:
+                L.append(f"- {s}")
+        L.append("")
+
+    if sheet_h['error_cells']:
+        L.append("## シートの検査（参考）")
+        L.append("")
+        for s, n in sheet_h['error_cells']:
+            L.append(f"- {s}: エラーセル {n}個（#REF!/#NAME?/#VALUE! 等）")
+        L.append("")
+
+    if calls['orphans']:
+        L.append("## どこからも呼ばれていないマクロ（参考）")
+        L.append("")
+        L.append("メニューやショートカットからの直実行用かもしれません（機械には判断できません）。")
+        L.append("")
+        for mod, name in calls['orphans'][:40]:
+            sc = inv['shortcuts'].get(name)
+            L.append(f"- [{mod}] {name}" + (f"（{sc}）" if sc else ""))
+        if len(calls['orphans']) > 40:
+            L.append(f"- … 他 {len(calls['orphans']) - 40}件")
+        L.append("")
+
+    if extra['auto_exec']:
+        L.append("## 自動実行される処理（参考）")
+        L.append("")
+        L.append("ブックを開く・保存する・セルを変更する等で自動的に動くマクロです。"
+                 "眠っていたブックを起こす前の問診に。")
+        L.append("")
+        for mod, name, lns in extra['auto_exec']:
+            L.append(f"- [{mod}] {name}" + (f"（{lns}行）" if lns else ""))
+        L.append("")
+
+    if calls['onaction']:
+        L.append("## ボタン・図形から実行されるマクロ（参考）")
+        L.append("")
+        L.append("シート上のボタン/図形に登録（OnAction）されているマクロです。"
+                 "これらは「どこからも呼ばれていないマクロ」には数えていません。")
+        L.append("")
+        for name, places in sorted(calls['onaction'].items()):
+            more = f" 他{len(places) - 5}箇所" if len(places) > 5 else ""
+            L.append(f"- {name} ← {', '.join(places[:5])}{more}")
+        L.append("")
+
+    if calls['dynamic_runs']:
+        L.append("## 動的な Application.Run（参考）")
+        L.append("")
+        L.append("呼び先が実行時に変数で決まる Run です（メニュー機構などの正常な作り）。"
+                 "静的検査では実在確認ができないため、事実として所在だけ記します。")
+        L.append("")
+        for mod, proc, ln, text in calls['dynamic_runs'][:15]:
+            L.append(f"- [{mod}] {proc}:{ln} `{text}`")
+        if len(calls['dynamic_runs']) > 15:
+            L.append(f"- … 他 {len(calls['dynamic_runs']) - 15}箇所")
+        L.append("")
+
+    if extra['hardcoded_paths']:
+        L.append("## ハードコードされたパス（参考）")
+        L.append("")
+        L.append("フォルダ構成が変わると動かなくなる箇所の候補です（古いブックの復活時に特に確認）。")
+        L.append("")
+        for mod, proc, ln, path in extra['hardcoded_paths'][:20]:
+            L.append(f"- [{mod}] {proc}:{ln} `{path}`")
+        if len(extra['hardcoded_paths']) > 20:
+            L.append(f"- … 他 {len(extra['hardcoded_paths']) - 20}箇所")
+        L.append("")
+
+    if extra['destructive']:
+        L.append("## 破壊的な操作の所在（参考・問診）")
+        L.append("")
+        L.append("ファイル削除・シート削除などを行う箇所です（悪ではありません。"
+                 "眠っていたブックを起こす前に「どこで何を消すか」を知っておくための一覧）。")
+        L.append("")
+        for mod, proc, ln, label, snippet in extra['destructive'][:20]:
+            L.append(f"- [{mod}] {proc}:{ln} {label} `{snippet}`")
+        if len(extra['destructive']) > 20:
+            L.append(f"- … 他 {len(extra['destructive']) - 20}箇所")
+        L.append("")
+
+    if (extra['no_option_explicit'] or extra['error_resume'] or extra['long_procs']
+            or extra['no_restore']):
+        L.append("## その他の参考情報")
+        L.append("")
+        for mod, proc, desc in extra['no_restore']:
+            L.append(f"- {desc}: [{mod}] {proc}")
+        if extra['no_option_explicit']:
+            L.append(f"- Option Explicit なしのモジュール: "
+                     f"{', '.join(extra['no_option_explicit'])}")
+        for mod, proc, ln in extra['error_resume'][:15]:
+            L.append(f"- On Error Resume Next: [{mod}] {proc}:{ln}")
+        if len(extra['error_resume']) > 15:
+            L.append(f"- … On Error Resume Next 他 {len(extra['error_resume']) - 15}箇所")
+        for mod, name, lns in extra['long_procs'][:10]:
+            L.append(f"- 150行超のプロシージャ: [{mod}] {name}（{lns}行）")
+        if len(extra['long_procs']) > 10:
+            L.append(f"- … 150行超 他 {len(extra['long_procs']) - 10}件")
+        L.append("")
+
+    L.append("## 次の一手")
+    L.append("")
+    L.append("- 構成の全貌: `py vba_manager.py docs --preview 3`")
+    L.append("- 呼び出し関係の図: `py vba_manager.py call-graph --mermaid`")
+    L.append("- 修正前の影響確認: `py vba_manager.py impact <マクロ名>`（呼び元・呼び先を間接まで一覧）")
+    L.append("- 経過観察: `py vba_manager.py 健康診断 --history`（診断履歴の一覧表）")
+    if form_findings_active:
+        L.append("- フォームの修正: `py form_tool.py`（move / align / tab-order …）")
+    if unresolved:
+        L.append("- 呼び先の検索: `py vba_manager.py grep \"<マクロ名>\"`")
+    if total_findings and not vba_error:
+        L.append("- 意図的な所見の除外: `py vba_manager.py checkup --ack-all`"
+                 "（今回の所見を確認済みとして次回以降の件数・判定から除外）")
+    L.append("")
+
+    return {'name': inv['name'], 'rating': rating, 'total': total_findings,
+            'counts': {'unresolved': len(unresolved), 'code': len(code_findings_active),
+                       'form': n_form,
+                       'broken': len(refs['broken']) + len(dead_links) + len(ref_names)},
+            'ack_new': len(ack_new), 'ack_total': n_ack, 'ack_pruned': n_ack_pruned,
+            'diff': diff, 'vba_error': vba_error, 'lines': L, 'json': json_payload}
+
+
+def cmd_checkup(args):
+    """ブックの健康診断レポート: checkup(健康診断) [excel_file] [--out f.md]
+
+    構成（docs）＋呼び出し関係（call-graph）＋壊れた参照/リンク＋シート検査＋
+    フォーム検査（lint）＋コードの機械検査＋バックアップ状況を 1枚の Markdown に
+    束ね、総合判定（A/B/C）を付ける。所見は事実の列挙のみ（要不要の判断はしない）。
+    診断のたびにブック別の履歴（_checkup_history/）へ結果を残し、
+    次回の診断で「前回との比較（定期健診）」を自動で出す。
+    --history=経過観察（履歴の一覧表・診断はしない）、--all=開いている全ブックを一括診断。
+    --ack-all=今回の所見を確認済み（意図的）として登録し、以降の件数・判定から除外。
+    --show-ack=確認済み一覧を表示、--unack 文字列=部分一致するものを確認済みから外す。
+    """
+    # --- 確認済み一覧の表示（診断はしない） ---
+    if getattr(args, 'show_ack', False):
+        if args.posargs:
+            name = os.path.basename(args.posargs[0])
+        else:
+            _, wb = get_workbook(None, readonly=True)
+            name = wb.Name
+        ack = _load_checkup_ack(name)
+        if not ack:
+            print(f"{name} に確認済み（意図的）の所見はありません")
+            return True
+        print(f"===== {name} の確認済み（意図的・件数から除外）所見 {len(ack)}件 =====")
+        for k in sorted(ack):
+            print(f"  - {k}")
+        return True
+
+    # --- 確認済みの取り消し（部分一致で解除） ---
+    if getattr(args, 'unack', None):
+        if args.posargs:
+            name = os.path.basename(args.posargs[0])
+        else:
+            _, wb = get_workbook(None, readonly=True)
+            name = wb.Name
+        ack = _load_checkup_ack(name)
+        pat = args.unack
+        matched = {k for k in ack if pat in k}
+        if not matched:
+            print(f"'{pat}' に一致する確認済み所見が見つかりません")
+            return False
+        _save_checkup_ack(name, ack - matched)
+        print(f"{len(matched)}件を確認済みから外しました:")
+        for k in sorted(matched):
+            print(f"  - {k}")
+        return True
+
+    # --- 経過観察モード: 診断せず履歴を表で表示 ---
+    if getattr(args, 'history', False):
+        if args.posargs:
+            name = os.path.basename(args.posargs[0])
+        else:
+            _, wb = get_workbook(None, readonly=True)
+            name = wb.Name
+        hist = _load_checkup_history(name)
+        if not hist:
+            print(f"{name} の診断履歴はまだありません（checkup を実行すると記録されます）")
+            return False
+        print(f"===== {name} の経過観察（診断履歴 {len(hist)}回） =====")
+        print(f"{'日時':<18}{'判定':<12}{'所見':>4} {'未解決':>4} {'フォーム':>4} "
+              f"{'マクロ':>4} {'行数':>7}  メモ")
+        prev = None
+        for s in hist:
+            c = s.get('counts', {})
+            tf = s.get('total_findings')
+            if tf is None:      # 旧形式のスナップショット（判定・合計なし）
+                tf = c.get('unresolved', 0) + c.get('code', 0) + c.get('form', 0)
+            note = s.get('note', '')
+            print(f"{s.get('time', ''):<18}{s.get('rating', '-'):<12}{tf:>4} "
+                  f"{c.get('unresolved', 0):>6} {c.get('form', 0):>7} "
+                  f"{s.get('total_procs', 0):>6} {s.get('total_lines', 0):>7}"
+                  + (f"  {note}" if note else ""))
+            if getattr(args, 'detail', False) and prev is not None:
+                d = _checkup_diff(prev, s)
+                if d and d['changed']:
+                    for x in d['new']:
+                        print(f"        ＋ {x}")
+                    for x in d['resolved']:
+                        print(f"        － {x}")
+                    for x in d['procs_added']:
+                        print(f"        ＋ マクロ追加 {x}")
+                    for x in d['procs_removed']:
+                        print(f"        － マクロ削除 {x}")
+                    if d['lines_delta']:
+                        sign = '+' if d['lines_delta'] > 0 else ''
+                        print(f"        行数 {sign}{d['lines_delta']}")
+            prev = s
+        return True
+
+    target_file, _ = parse_target_and_rest(args.posargs)
+    xl, wb = get_workbook(target_file, readonly=True)   # 健診モード（診断は読むだけ）
+    if getattr(args, 'all_books', False):
+        books = list(xl.Workbooks)
+    else:
+        books = [wb]
+
+    results = []
+    for b in books:
+        try:
+            results.append(_checkup_one(xl, b, note=getattr(args, 'note', None),
+                                        ack_all=getattr(args, 'ack_all', False)))
+        except Exception as e:
+            print(f"警告: {getattr(b, 'Name', '?')} の診断に失敗しました: {e}")
+    if not results:
+        print("エラー: 診断できたブックがありません")
+        return False
+
+    if getattr(args, 'json', False):
+        import json
+        if len(results) == 1:
+            payload = results[0]['json']
+        else:
+            payload = {"success": all(r['json']['success'] for r in results),
+                       "books": [r['json'] for r in results]}
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stdout)
+        if getattr(args, 'strict', False):
+            return all(r['total'] == 0 for r in results)
+        return True
+
+    if len(results) > 1:
+        lines = [f"# 開いている全ブックの健康診断（{len(results)}冊）", "",
+                 f"- 診断日時: {time.strftime('%Y-%m-%d %H:%M')}（vba_manager checkup --all）",
+                 "", "| ブック | 総合判定 | 所見 |", "|---|---|---|"]
+        for r in results:
+            lines.append(f"| {r['name']} | {r['rating']} | {r['total']}件 |")
+        lines.append("")
+        for r in results:
+            lines += ["---", ""] + r['lines'] + [""]
+    else:
+        lines = results[0]['lines']
+
+    out_path = getattr(args, 'out_opt', None)
+    out_path = os.path.abspath(out_path) if out_path else os.path.join(SCRIPT_DIR, "_last_checkup.md")
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f"健康診断レポートを生成: {out_path}")
+    for r in results:
+        c = r['counts']
+        print(f"[{r['name']}] 総合判定 {r['rating']} / 所見 {r['total']}件"
+              f"（未解決Call {c['unresolved']} / 参照・リンク切れ {c['broken']} / "
+              f"コード {c['code']} / フォーム {c['form']}）")
+        if r.get('ack_new'):
+            print(f"  今回 {r['ack_new']}件を確認済み（意図的）として新規登録"
+                  f"（確認済み合計 {r['ack_total']}件）")
+        if r.get('ack_pruned'):
+            print(f"  確認済みのうち {r['ack_pruned']}件は今回の所見に存在しないため自動整理しました"
+                  "（lintロジック変更で二度と出ないキー等）")
+        d = r['diff']
+        if r.get('vba_error'):
+            print("  VBA未検査（プロジェクト保護またはVBOM未信頼）＝シート側のみの縮退診断・履歴記録なし")
+        elif d is None:
+            print("  前回比: 初回診断（履歴を記録しました。次回から差分が出ます）")
+        elif not d['changed']:
+            print(f"  前回比: 変化なし（前回 {d['prev_time']}）")
+        else:
+            print(f"  前回比: 新規所見 {len(d['new'])} / 解消 {len(d['resolved'])} / "
+                  f"マクロ +{len(d['procs_added'])}−{len(d['procs_removed'])}"
+                  f"（前回 {d['prev_time']}）")
+    # 所見があっても「診断の完了」は成功（終了コード0）。所見の有無で合否を
+    # 判定したい自動化（CI/batch のゲート）だけ --strict で従来挙動にする
+    if getattr(args, 'strict', False):
+        return all(r['total'] == 0 for r in results)
+    return True
+
+
+def cmd_impact(args):
+    """マクロ修正前の影響範囲予告: impact(影響範囲) [excel_file] <マクロ名>
+
+    「このマクロに手を入れると、どこまで波及するか」を修正前に一覧する。
+    - 呼び元（上流・間接含む）＝動作を変えたとき影響が及ぶ先
+    - 呼び先（下流・間接含む）＝このマクロが依存している部品
+    - 入口（ショートカット/自動実行イベント）も注記する
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: impact [excel_file] <マクロ名> [--json]")
+        return False
+    focus = rest[0]
+    xl, wb = get_workbook(target_file, readonly=True)   # 健診モード（読むだけ）
+    inv = _inventory_or_explain(xl, wb)
+    if inv is None:
+        return False
+    res = _analyze_calls(inv)
+    known, edges = res['known'], res['edges']
+    hit = known.get(focus.lower())
+    if not hit:
+        print(f"エラー: マクロ '{focus}' が見つかりません")
+        _suggest_similar(focus, [v[0] for v in known.values()])
+        return False
+    root = hit[0]
+    mod_of = {v[0]: v[1] for v in known.values()}
+    auto_names = {name for _, name, _ in _extra_code_scans(inv)['auto_exec']}
+    oa = res.get('onaction', {})      # マクロ名 → ["シート/図形", ...]
+
+    # 名前レベルの正方向・逆方向グラフ（call-graph と同じ粒度）
+    fwd, rev = {}, {}
+    for (mod, proc), callees in edges.items():
+        fwd.setdefault(proc, set()).update(callees)
+        for c in callees:
+            rev.setdefault(c, set()).add(proc)
+
+    def reach(graph, start):
+        seen, stack = set(), [start]
+        while stack:
+            for nxt in graph.get(stack.pop(), ()):
+                if nxt not in seen and nxt != start:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return seen
+
+    upstream, downstream = reach(rev, root), reach(fwd, root)
+
+    def entry_note(name):
+        notes = []
+        sc = inv['shortcuts'].get(name)
+        if sc:
+            notes.append(sc)
+        if name in auto_names:
+            notes.append("自動実行イベント")
+        if name in oa:
+            notes.append("ボタン: " + ", ".join(oa[name][:3])
+                         + (f" 他{len(oa[name]) - 3}" if len(oa[name]) > 3 else ""))
+        return f"（{'/'.join(notes)}）" if notes else ""
+
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({
+            "success": True, "file": inv['name'], "macro": root,
+            "upstream": sorted(upstream), "downstream": sorted(downstream),
+            "entries": {n: (inv['shortcuts'].get(n) or
+                            ("ボタン: " + ", ".join(oa[n]) if n in oa else "自動実行イベント"))
+                        for n in sorted(upstream | {root})
+                        if n in inv['shortcuts'] or n in auto_names or n in oa},
+        }, ensure_ascii=False), file=sys.stdout)
+        return True
+
+    def label(name):
+        m = mod_of.get(name)
+        return (f"[{m}] {name}" if m else name) + entry_note(name)
+
+    print(f"===== 影響範囲の予告: {label(root)} =====")
+
+    print(f"\n■ 呼び元（このマクロを直すと影響が及ぶ先・間接含む {len(upstream)}件）")
+    if upstream:
+        def walk_up(name, depth, seen):
+            for caller in sorted(rev.get(name, ())):
+                loop = "（循環）" if caller in seen else ""
+                print("  " * depth + f"└ {label(caller)}{loop}")
+                if not loop and depth < 6:
+                    walk_up(caller, depth + 1, seen | {caller})
+        walk_up(root, 1, {root})
+    else:
+        print("  (なし) — メニュー/ショートカット/ボタン/イベント直実行の可能性があります")
+
+    print(f"\n■ 呼び先（このマクロが依存している部品・間接含む {len(downstream)}件）")
+    if downstream:
+        def walk_down(name, depth, seen):
+            for callee in sorted(fwd.get(name, ())):
+                loop = "（循環）" if callee in seen else ""
+                print("  " * depth + f"└ {label(callee)}{loop}")
+                if not loop and depth < 6:
+                    walk_down(callee, depth + 1, seen | {callee})
+        walk_down(root, 1, {root})
+    else:
+        print("  (なし) — 単体で完結しています")
+
+    entries = [n for n in sorted(upstream | {root})
+               if n in inv['shortcuts'] or n in auto_names or n in oa]
+    if entries:
+        print(f"\n■ 入口（ショートカット/ボタン/自動実行から届く経路）")
+        for n in entries:
+            print(f"  {label(n)}")
+    return True
+
+
 def cmd_grep(args):
     """全モジュール横断のVBAコード検索: grep [excel_file] <検索文字列>
 
@@ -2862,11 +4542,19 @@ def cmd_run_macro(args):
         else:
             print(f"[WARNING] Macro '{macro_name}' not found in open projects. Trying direct run.", file=sys.stderr)
 
-    print(f"マクロ実行中: {full_macro_path}", file=sys.stderr)
+    # 引数（rest[1:]）。数値に見えるものは数値化して渡す（Excel MCP の run 相当）
+    run_args = []
+    for a in rest[1:]:
+        v = _coerce_cell(a)
+        run_args.append(a if v is None else v)
+    if run_args:
+        print(f"マクロ実行中: {full_macro_path}  引数: {run_args}", file=sys.stderr)
+    else:
+        print(f"マクロ実行中: {full_macro_path}", file=sys.stderr)
 
     try:
         # マクロ実行
-        result = xl.Application.Run(full_macro_path)
+        result = xl.Application.Run(full_macro_path, *run_args)
 
         if getattr(args, 'json', False):
             import json
@@ -3554,6 +5242,10 @@ def cmd_format_range(args):
         rng.UnMerge(); applied.append("unmerge")
     if getattr(args, 'autofit', False):
         rng.Columns.AutoFit(); applied.append("autofit")
+    if getattr(args, 'lock', False):
+        rng.Locked = True; applied.append("lock（シート保護時に有効）")
+    if getattr(args, 'unlock', False):
+        rng.Locked = False; applied.append("unlock（シート保護時に有効）")
 
     if not applied:
         print("書式オプションが指定されていません。--bold --bg '#FFFF00' などを指定してください。")
@@ -3636,6 +5328,24 @@ def cmd_sheet(args):
             print(f"エラー: シート '{rest[1]}' が見つかりません"); return False
         sh.Activate()
         print(f"アクティブ化: {rest[1]}")
+    elif action in ('protect', 'unprotect'):
+        if len(rest) < 2:
+            print(f"使い方: sheet {action} <name> [--password パスワード]"); return False
+        sh = find_sheet(rest[1])
+        if not sh:
+            print(f"エラー: シート '{rest[1]}' が見つかりません"); return False
+        pw = getattr(args, 'password', None)
+        if action == 'protect':
+            sh.Protect(Password=pw) if pw else sh.Protect()
+            print(f"シート保護: {rest[1]}" + ("（パスワード付き）" if pw else ""))
+            print("  ※ format-range --lock/--unlock で設定した Locked がここで効きます")
+        else:
+            try:
+                sh.Unprotect(Password=pw) if pw else sh.Unprotect()
+            except Exception as e:
+                print(f"エラー: 保護解除に失敗しました（パスワード違いの可能性）: {e}")
+                return False
+            print(f"シート保護解除: {rest[1]}")
     elif action in ('show', 'hide', 'very-hide'):
         if len(rest) < 2:
             print(f"使い方: sheet {action} <name>"); return False
@@ -4563,21 +6273,31 @@ def cmd_cond_format(args):
         print("（保存はしていません）")
         return True
 
-    op = None; f1 = None; f2 = None
-    for name in ('gt', 'lt', 'eq', 'ne', 'ge', 'le'):
-        v = getattr(args, name, None)
-        if v is not None:
-            op = _XL_COND_OP[name]; f1 = str(v); break
-    if op is None and getattr(args, 'between', None):
-        op = _XL_COND_OP['between']; f1, f2 = args.between[0], args.between[1]
-    if op is None:
-        print("比較条件がありません。--gt 100 などを指定してください。")
-        return False
-
-    if f2 is not None:
-        fc = rng.FormatConditions.Add(Type=1, Operator=op, Formula1=f1, Formula2=f2)
+    formula = getattr(args, 'formula_opt', None)
+    if formula:
+        # 数式ベースのルール（xlExpression=2）。'=' 始まりの数式が TRUE のセルに書式。
+        # 相対参照は範囲の左上セル基準（Excel の条件付き書式と同じ規約）
+        if not formula.startswith('='):
+            formula = '=' + formula
+        # xlExpression は名前付き引数だと DISP_E_PARAMNOTOPTIONAL になるため位置渡し
+        # （Operator は式タイプでは無視されるがスロットとして必要。1=xlBetween をダミーに）
+        fc = rng.FormatConditions.Add(2, 1, formula)
     else:
-        fc = rng.FormatConditions.Add(Type=1, Operator=op, Formula1=f1)
+        op = None; f1 = None; f2 = None
+        for name in ('gt', 'lt', 'eq', 'ne', 'ge', 'le'):
+            v = getattr(args, name, None)
+            if v is not None:
+                op = _XL_COND_OP[name]; f1 = str(v); break
+        if op is None and getattr(args, 'between', None):
+            op = _XL_COND_OP['between']; f1, f2 = args.between[0], args.between[1]
+        if op is None:
+            print("比較条件がありません。--gt 100 か --formula \"=数式\" を指定してください。")
+            return False
+
+        if f2 is not None:
+            fc = rng.FormatConditions.Add(Type=1, Operator=op, Formula1=f1, Formula2=f2)
+        else:
+            fc = rng.FormatConditions.Add(Type=1, Operator=op, Formula1=f1)
 
     if getattr(args, 'bg', None):
         fc.Interior.Color = _hex_to_excel_color(args.bg)
@@ -4591,12 +6311,46 @@ def cmd_cond_format(args):
 
 
 def cmd_hyperlink(args):
-    """ハイパーリンク: hyperlink <cell> <url> [--text 表示文字] / --remove"""
+    """ハイパーリンク: hyperlink <cell> <url> [--text 表示文字] / --remove / --list
+
+    url を省略して単セルを指定すると、そのセルのリンクを表示する（取得）。
+    --list でシート内の全ハイパーリンクを一覧する。
+    """
     target_file, rest = parse_target_and_rest(args.posargs)
-    if not rest:
-        print("使い方: hyperlink <cell> <url> [--text 表示文字]  /  hyperlink <cell> --remove")
-        return False
     xl, wb = get_workbook(target_file)
+
+    list_opt = getattr(args, 'list_links', None)
+    if list_opt is not None:
+        # シート内の全リンク。シート名は --list シート名 か 位置引数、無ければアクティブ
+        want = None
+        if list_opt != "__ACTIVE__":
+            want = list_opt
+        elif rest:
+            want = rest[0]
+        ws = wb.ActiveSheet
+        if want:
+            for sh in wb.Worksheets:
+                if sh.Name == want:
+                    ws = sh
+                    break
+        cnt = ws.Hyperlinks.Count
+        print(f"--- {ws.Name} のハイパーリンク（{cnt}件） ---")
+        for i in range(1, cnt + 1):
+            hl = ws.Hyperlinks.Item(i)
+            try:
+                addr = hl.Range.Address
+            except Exception:
+                addr = '(図形)'
+            sub = f"#{hl.SubAddress}" if getattr(hl, 'SubAddress', '') else ''
+            print(f"  {ws.Name}!{addr}: {hl.Address or ''}{sub}")
+        return True
+
+    if not rest:
+        print("使い方: hyperlink <cell> <url> [--text 表示文字]")
+        print("       hyperlink <cell>            # そのセルのリンクを表示")
+        print("       hyperlink <cell> --remove   # 削除")
+        print("       hyperlink --list [シート名]  # シート内の全リンク一覧")
+        return False
     ws, rng = _resolve_range(xl, wb, rest[0])
     if getattr(args, 'remove', False):
         rng.Hyperlinks.Delete()
@@ -4604,8 +6358,16 @@ def cmd_hyperlink(args):
         print("（保存はしていません）")
         return True
     if len(rest) < 2:
-        print("使い方: hyperlink <cell> <url> [--text 表示文字]")
-        return False
+        # 取得モード: そのセルのリンクを表示
+        cell = rng.Cells(1, 1)
+        if cell.Hyperlinks.Count == 0:
+            print(f"{ws.Name}!{cell.Address}: ハイパーリンクはありません")
+        else:
+            hl = cell.Hyperlinks.Item(1)
+            sub = f"#{hl.SubAddress}" if getattr(hl, 'SubAddress', '') else ''
+            print(f"{ws.Name}!{cell.Address}: {hl.Address or ''}{sub}"
+                  f"  表示=「{cell.Value}」")
+        return True
     url = rest[1]
     cell = rng.Cells(1, 1)
     ws.Hyperlinks.Add(Anchor=cell, Address=url)
@@ -6295,6 +8057,56 @@ def build_parser():
     p.add_argument("--force", action="store_true", dest="force",
                    help="バックアップ失敗時も強行する")
 
+    # docs [excel_file] [--out f.md]
+    p = sub.add_parser("docs", help="ブックの構成ドキュメント（取説）を自動生成")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--out", dest="out_opt", default=None,
+                   help="出力Markdownパス（省略時は _last_docs.md）")
+    p.add_argument("--preview", dest="preview", default=None,
+                   help="各シートの先頭N行をMarkdown表で含める")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+
+    # checkup(健康診断) [excel_file] [--out f.md]
+    p = sub.add_parser("checkup", aliases=["健康診断"],
+                       help="ブックの健康診断レポート（総合判定+壊れた参照+シート検査+前回との比較）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--out", dest="out_opt", default=None,
+                   help="出力Markdownパス（省略時は _last_checkup.md）")
+    p.add_argument("--all", dest="all_books", action="store_true",
+                   help="開いている全ブックを一括診断（PERSONAL.XLSB含む）")
+    p.add_argument("--history", action="store_true",
+                   help="診断せず過去の診断履歴（経過観察）を表で表示")
+    p.add_argument("--detail", action="store_true",
+                   help="--history で各回の間に起きた所見/マクロの増減も表示")
+    p.add_argument("--note", default=None,
+                   help="今回の診断にカルテのメモを添付（例: --note \"ボタン18を一語修正\"）")
+    p.add_argument("--strict", action="store_true",
+                   help="所見が1件でもあれば終了コード1（自動化のゲート用。既定は診断完了=0）")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+    p.add_argument("--ack-all", dest="ack_all", action="store_true",
+                   help="今回のコード/フォーム所見を全て確認済み（意図的）として登録し、"
+                        "以降の所見サマリ・総合判定から除外する"
+                        "（存在しないマクロ呼び出し等の致命的所見は対象外）")
+    p.add_argument("--show-ack", dest="show_ack", action="store_true",
+                   help="診断はせず、確認済み（意図的）所見の一覧を表示")
+    p.add_argument("--unack", default=None, metavar="文字列",
+                   help="部分一致する確認済み所見を確認済みから外す（見直したくなった時）")
+
+    # call-graph [excel_file] [--macro 名]
+    p = sub.add_parser("call-graph", help="マクロの呼び出し関係を解析（未解決Call＝一語バグ検出つき）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--macro", dest="macro_opt", default=None,
+                   help="このマクロを起点に呼び出しツリーを展開")
+    p.add_argument("--mermaid", nargs="?", const="_DEFAULT_", default=None,
+                   help="Mermaid図をMarkdownに出力（省略時 _last_callgraph.md。GitHub/Qiitaで描画可）")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+
+    # impact(影響範囲) [excel_file] <マクロ名>
+    p = sub.add_parser("impact", aliases=["影響範囲"],
+                       help="マクロ修正前の影響範囲予告（呼び元/呼び先を間接まで一覧）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+
     # grep [excel_file] <pattern>
     p = sub.add_parser("grep", help="全モジュール横断のVBAコード検索")
     p.add_argument("posargs", nargs="*")
@@ -6337,6 +8149,12 @@ def build_parser():
     p.add_argument("posargs", nargs="+")
     p.add_argument("--force", action="store_true", dest="force",
                    help="バックアップ失敗時も強行する")
+
+    # delete-module [excel_file] <module_name> [-y]
+    p = sub.add_parser("delete-module", help="モジュール丸ごと削除（要約表示→確認→バックアップつき）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("-y", "--yes", action="store_true", dest="yes", help="確認プロンプトをスキップ")
+    p.add_argument("--force", action="store_true", dest="force", help="バックアップ失敗時も強行する")
 
     # export-module [excel_file] <module_name>
     p = sub.add_parser("export-module")
@@ -6428,6 +8246,8 @@ def build_parser():
     p.add_argument("--merge", action="store_true")
     p.add_argument("--unmerge", action="store_true")
     p.add_argument("--autofit", action="store_true")
+    p.add_argument("--lock", action="store_true", help="セルをロック（sheet protect 時に有効）")
+    p.add_argument("--unlock", action="store_true", help="セルのロック解除（保護中も編集可に）")
     p.add_argument("--sheet", dest="sheet_opt", default=None,
                    help="対象シート名（rangeと分離指定）")
 
@@ -6437,6 +8257,7 @@ def build_parser():
     p.add_argument("--after")
     p.add_argument("--before")
     p.add_argument("--clear", action="store_true", help="tab-color のクリア")
+    p.add_argument("--password", default=None, help="protect/unprotect のパスワード")
 
     # table [excel_file] <create|list|delete> ...
     p = sub.add_parser("table")
@@ -6532,13 +8353,17 @@ def build_parser():
     p.add_argument("--ge"); p.add_argument("--le")
     p.add_argument("--eq"); p.add_argument("--ne")
     p.add_argument("--between", nargs=2, metavar=("V1", "V2"))
+    p.add_argument("--formula", dest="formula_opt", default=None,
+                   help='数式ベースのルール（例 --formula "=B2>AVERAGE($B$2:$B$20)"）')
     p.add_argument("--bg"); p.add_argument("--color")
     p.add_argument("--bold", action="store_true")
     p.add_argument("--clear", action="store_true", help="条件付き書式を全削除")
-    p = sub.add_parser("hyperlink")    # hyperlink <cell> <url> [--text t] / --remove
+    p = sub.add_parser("hyperlink")    # hyperlink <cell> <url> [--text t] / --remove / --list
     p.add_argument("posargs", nargs="*")
     p.add_argument("--text", help="表示文字")
     p.add_argument("--remove", action="store_true", help="ハイパーリンク削除")
+    p.add_argument("--list", dest="list_links", nargs="?", const="__ACTIVE__", default=None,
+                   help="シート内の全ハイパーリンクを一覧（--list シート名 で対象指定）")
     p = sub.add_parser("validation")   # validation <range> --list 'A,B,C' / --clear
     p.add_argument("posargs", nargs="*")
     p.add_argument("--list", help="ドロップダウン候補（カンマ区切り）")
@@ -6660,6 +8485,9 @@ def build_parser():
     p.add_argument("--keep-going", dest="keep_going", action="store_true",
                    help="途中の失敗で止まらず最後まで実行する")
 
+    # shell（対話セッション。接続を張ったままコマンドを打ち続ける）
+    sub.add_parser("shell", help="対話セッション（接続維持のREPL。2コマンド目から再接続なし）")
+
     return parser
 
 
@@ -6679,6 +8507,12 @@ def cmd_batch(args):
         print("      replace-procedure -y")
         return False
     if src == '-':
+        # パイプ経由の入力はロケール(CP932)で誤読されるため UTF-8 に固定する（shell と同じ対処）
+        if not sys.stdin.isatty():
+            try:
+                sys.stdin.reconfigure(encoding='utf-8')
+            except Exception:
+                pass
         text = sys.stdin.read()
     else:
         path = smart_path_resolve(src)
@@ -6748,6 +8582,93 @@ def cmd_batch(args):
     return ok_n == total
 
 
+def cmd_shell(args):
+    """対話セッション: shell
+
+    接続を張ったままコマンドを打ち続ける REPL。batch のファイル版に対する対話版で、
+    get_workbook の接続キャッシュにより2コマンド目からは COM 再接続なしで動く
+    （1コマンド約1秒 → 体感即応）。exit / quit / Ctrl+C で終了。
+    """
+    import shlex
+    # パイプ/リダイレクト経由の入力はロケール(CP932)で誤読されるため UTF-8 に固定する
+    # （対話（コンソール直打ち）は Windows のコンソールAPIが処理するので触らない）
+    if not sys.stdin.isatty():
+        try:
+            sys.stdin.reconfigure(encoding='utf-8')
+        except Exception:
+            pass
+    parser = build_parser()
+    table = _command_table()
+    hist_cmds = []
+    print("===== vba_manager 対話セッション =====")
+    print("  コマンドをそのまま入力（例: list / get マクロ名 / read-range A1:D10）")
+    print("  help で使い方、history で履歴（!番号 で再実行・!! は直前）、exit で終了。")
+    while True:
+        try:
+            line = input("vba> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n終了します。")
+            break
+        if not line or line.startswith('#'):
+            continue
+        if line.lower() in ('exit', 'quit', 'q'):
+            print("終了します。")
+            break
+        if line.lower() == 'help':
+            parser.print_help()
+            continue
+        if line.lower() == 'history':
+            for i, h in enumerate(hist_cmds, 1):
+                print(f"  {i}: {h}")
+            if not hist_cmds:
+                print("  (まだ履歴はありません)")
+            continue
+        if line.startswith('!'):
+            ref = line[1:].strip()
+            if ref == '!':
+                idx = len(hist_cmds)
+            else:
+                try:
+                    idx = int(ref)
+                except ValueError:
+                    idx = 0
+            if not (1 <= idx <= len(hist_cmds)):
+                print("履歴にありません。history で番号を確認して !番号 で再実行（!! は直前）")
+                continue
+            line = hist_cmds[idx - 1]
+            print(f"vba> {line}")
+        hist_cmds.append(line)
+        try:
+            lex = shlex.shlex(line, posix=True)
+            lex.whitespace_split = True
+            lex.escape = ''                      # Windows パスの \ をエスケープ扱いしない
+            tokens = list(lex)
+        except ValueError as e:
+            print(f"引数の解析に失敗: {e}")
+            continue
+        try:
+            sub_args, unknown = parser.parse_known_args(tokens)
+        except SystemExit:
+            continue                             # 引数エラーは argparse が表示済み
+        unknown = [u for u in unknown if u not in ("--visible", "-v")]
+        if unknown:
+            print(f"不明な引数/オプション: {' '.join(unknown)}")
+            continue
+        if not sub_args.command or sub_args.command in ('shell',):
+            print("このコマンドはセッション内で実行できません")
+            continue
+        try:
+            table[sub_args.command](sub_args)
+        except SystemExit as e:
+            if e.code not in (0, None):
+                print(f"（終了コード {e.code}）")
+        except KeyboardInterrupt:
+            print("（中断しました）")
+        except Exception as e:
+            print(f"エラー: {e}")
+    return True
+
+
 def _command_table():
     """コマンド名→実装の対応表（main と batch で共用）"""
     return {
@@ -6764,7 +8685,14 @@ def _command_table():
         "delete-procedure":  cmd_delete_procedure,
         "grep":              cmd_grep,
         "code-replace":      cmd_code_replace,
+        "docs":              cmd_docs,
+        "call-graph":        cmd_call_graph,
+        "checkup":           cmd_checkup,
+        "健康診断":            cmd_checkup,
+        "impact":            cmd_impact,
+        "影響範囲":            cmd_impact,
         "replace-module":    cmd_replace_module,
+        "delete-module":     cmd_delete_module,
         "export-module":     cmd_export_module,
         "export-all":        cmd_export_all,
         "list-backups":      cmd_list_backups,
@@ -6812,6 +8740,7 @@ def _command_table():
         "printer-list":      cmd_printer_list,
         "printer-setup":     cmd_printer_setup,
         "batch":             cmd_batch,
+        "shell":             cmd_shell,
     }
 
 

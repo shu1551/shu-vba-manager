@@ -237,3 +237,206 @@ def test_cluster_rows_groups_by_center():
     rows = fi._cluster_rows(items)
     assert len(rows) == 2
     assert [c["name"] for c in rows[0]] == ["lbl1", "txtA"]
+
+
+# ================================================================
+# vba_manager: 健康診断（checkup）強化まわりの純粋ロジック
+# ================================================================
+
+def _mod(name, type_, code, procs=()):
+    return {'name': name, 'type': type_, 'type_name': '',
+            'total_lines': code.count('\r\n'), 'procs': list(procs), 'code': code}
+
+
+def test_strip_vba_comment_keeps_quote_in_string():
+    assert vm._strip_vba_comment('x = "a\'b" \' comment') == 'x = "a\'b" '
+    assert vm._strip_vba_comment("' 全部コメント") == ""
+
+
+def test_extra_scans_hardcoded_path_and_comment_excluded():
+    code = ('Sub A()\r\n'
+            '    p = "C:\\data\\in.csv"\r\n'
+            '    \' 例: "C:\\old\\path"\r\n'
+            '    On Error Resume Next\r\n'
+            'End Sub\r\n')
+    inv = {'modules': [_mod('M1', 1, code, [{'name': 'A', 'lines': 5}])]}
+    res = vm._extra_code_scans(inv)
+    assert [(m, p, path) for m, p, _, path in res['hardcoded_paths']] == \
+        [('M1', 'A', 'C:\\data\\in.csv')]
+    assert [(m, p) for m, p, _ in res['error_resume']] == [('M1', 'A')]
+    assert res['no_option_explicit'] == ['M1']
+
+
+def test_extra_scans_auto_exec_and_option_explicit():
+    code = 'Option Explicit\r\nPrivate Sub Workbook_Open()\r\nEnd Sub\r\n'
+    inv = {'modules': [_mod('ThisWorkbook', 100, code,
+                            [{'name': 'Workbook_Open', 'lines': 3}]),
+                       _mod('Module1', 1, 'Sub Auto_Open()\r\nEnd Sub\r\n',
+                            [{'name': 'Auto_Open', 'lines': 2}])]}
+    res = vm._extra_code_scans(inv)
+    assert {n for _, n, _ in res['auto_exec']} == {'Workbook_Open', 'Auto_Open'}
+    assert res['no_option_explicit'] == ['Module1']
+
+
+def test_checkup_diff_line_shift_is_not_a_change():
+    prev = {'time': '2026-07-03 23:00', 'keys': ['未解決Call: [M1] 親 → 子'],
+            'procs': {'M1': ['親']}, 'total_lines': 100, 'sheets': ['S1'], 'forms': []}
+    cur = {'time': '2026-07-04 09:00', 'keys': ['未解決Call: [M1] 親 → 子'],
+           'procs': {'M1': ['親']}, 'total_lines': 100, 'sheets': ['S1'], 'forms': []}
+    assert vm._checkup_diff(prev, cur)['changed'] is False
+
+
+def test_checkup_diff_detects_new_resolved_and_growth():
+    prev = {'time': 't0', 'keys': ['重複プロシージャ: [M1] A'],
+            'procs': {'M1': ['A']}, 'total_lines': 50, 'sheets': ['S1'], 'forms': []}
+    cur = {'time': 't1', 'keys': ['未解決Call: [M2] B → 消えた子'],
+           'procs': {'M1': ['A'], 'M2': ['B']}, 'total_lines': 80,
+           'sheets': ['S1', 'S2'], 'forms': ['F_New']}
+    d = vm._checkup_diff(prev, cur)
+    assert d['changed']
+    assert d['new'] == ['未解決Call: [M2] B → 消えた子']
+    assert d['resolved'] == ['重複プロシージャ: [M1] A']
+    assert d['procs_added'] == ['[M2] B']
+    assert d['lines_delta'] == 30
+    assert d['sheets_added'] == ['S2'] and d['forms_added'] == ['F_New']
+
+
+def test_checkup_diff_first_run_returns_none():
+    assert vm._checkup_diff(None, {'keys': [], 'procs': {}, 'total_lines': 0,
+                                   'sheets': [], 'forms': []}) is None
+
+
+def test_extra_scans_destructive_and_no_restore():
+    code = ('Sub 掃除()\r\n'
+            '    Application.ScreenUpdating = False\r\n'
+            '    Kill "C:\\tmp\\old.txt"\r\n'
+            '    Worksheets("作業").Delete\r\n'
+            '    ActiveSheet.Rows("2:" & lastRow).Delete\r\n'
+            'End Sub\r\n'
+            'Sub 正常()\r\n'
+            '    Application.ScreenUpdating = False\r\n'
+            '    Application.ScreenUpdating = True\r\n'
+            'End Sub\r\n')
+    inv = {'modules': [_mod('M1', 1, code,
+                            [{'name': '掃除', 'lines': 6}, {'name': '正常', 'lines': 4}])]}
+    res = vm._extra_code_scans(inv)
+    labels = {(p, lab) for _, p, _, lab, _ in res['destructive']}
+    assert ('掃除', 'ファイル/フォルダ削除') in labels
+    assert ('掃除', 'シート削除') in labels
+    assert ('掃除', '行/列の削除') in labels
+    # 行削除の行が「シート削除」と誤ラベルされないこと
+    row_line_labels = {lab for _, _, ln, lab, _ in res['destructive'] if ln == 5}
+    assert row_line_labels == {'行/列の削除'}
+    assert [(m, p) for m, p, _ in res['no_restore']] == [('M1', '掃除')]
+
+
+def test_extra_scans_no_restore_ignores_comment_and_string():
+    code = ('Sub A()\r\n'
+            '    \' Application.ScreenUpdating = False と書いたコメント\r\n'
+            '    s = "Kill されそうな文字列"\r\n'
+            'End Sub\r\n')
+    inv = {'modules': [_mod('M1', 1, code, [{'name': 'A', 'lines': 4}])]}
+    res = vm._extra_code_scans(inv)
+    assert res['no_restore'] == [] and res['destructive'] == []
+
+
+def test_extra_scans_enableevents_no_restore():
+    code = ('Sub 事故りがち()\r\n'
+            '    Application.EnableEvents = False\r\n'
+            'End Sub\r\n'
+            'Sub 正しい()\r\n'
+            '    Application.EnableEvents = False\r\n'
+            '    Application.EnableEvents = True\r\n'
+            'End Sub\r\n')
+    inv = {'modules': [_mod('M1', 1, code, [{'name': '事故りがち', 'lines': 3},
+                                            {'name': '正しい', 'lines': 4}])]}
+    res = vm._extra_code_scans(inv)
+    assert [(m, p) for m, p, _ in res['no_restore']] == [('M1', '事故りがち')]
+    assert 'EnableEvents' in res['no_restore'][0][2]
+
+
+def test_checkup_rating():
+    assert vm._checkup_rating(0, 0) == "A（異常なし）"
+    assert vm._checkup_rating(5, 0) == "B（軽度所見）"
+    assert vm._checkup_rating(5, 2) == "C（要確認）"
+
+
+def test_analyze_calls_declared_api_is_not_unresolved():
+    code = ('Private Declare PtrSafe Sub MoveMemory Lib "kernel32" '
+            'Alias "RtlMoveMemory" (d As LongPtr, s As LongPtr, ByVal n As LongPtr)\r\n'
+            'Sub A()\r\n'
+            '    Call MoveMemory(1, 2, 3)\r\n'
+            '    Call 存在しない子\r\n'
+            'End Sub\r\n')
+    inv = {'modules': [_mod('M1', 1, code, [{'name': 'A', 'lines': 4}])]}
+    res = vm._analyze_calls(inv)
+    assert [u[2] for u in res['unresolved']] == ['存在しない子']
+
+
+def test_analyze_calls_object_method_and_qualified_call():
+    code = ('Sub A()\r\n'
+            '    Call wCompo.Export(sFilePath)\r\n'          # オブジェクトのメソッド＝対象外
+            '    Call M1.子マクロ\r\n'                        # モジュール修飾の実マクロ＝辺
+            'End Sub\r\n'
+            'Sub 子マクロ()\r\n'
+            'End Sub\r\n')
+    inv = {'modules': [_mod('M1', 1, code, [{'name': 'A', 'lines': 4},
+                                            {'name': '子マクロ', 'lines': 2}])]}
+    res = vm._analyze_calls(inv)
+    assert res['unresolved'] == []
+    assert res['edges'][('M1', 'A')] == {'子マクロ'}
+
+
+def test_analyze_calls_dynamic_run_not_unresolved():
+    code = ('Sub メニュー実行()\r\n'
+            '    Application.Run "\'PERSONAL.XLSB\'!" & AAA\r\n'   # 動的＝未解決にしない
+            '    Application.Run "\'" & ZZZ & "\'!" & AAA\r\n'     # 動的
+            '    Application.Run "実在マクロ"\r\n'                  # 静的＝辺
+            '    Application.Run "居ないマクロ"\r\n'                # 静的＝未解決
+            'End Sub\r\n'
+            'Sub 実在マクロ()\r\n'
+            'End Sub\r\n')
+    inv = {'modules': [_mod('M1', 1, code, [{'name': 'メニュー実行', 'lines': 6},
+                                            {'name': '実在マクロ', 'lines': 2}])]}
+    res = vm._analyze_calls(inv)
+    assert [u[2] for u in res['unresolved']] == ['Run "居ないマクロ"']
+    assert len(res['dynamic_runs']) == 2
+    assert res['edges'][('M1', 'メニュー実行')] >= {'実在マクロ'}
+
+
+def test_analyze_calls_commented_run_is_ignored():
+    # コメントアウトされた Application.Run を未解決Callにしない（総点検で発見）
+    code = ('Sub A()\r\n'
+            "    ' Application.Run \"居ないマクロ\"  ←コメント行\r\n"
+            '    x = "文字列の中の Application.Run も無視"\r\n'
+            'End Sub\r\n')
+    inv = {'modules': [_mod('M1', 1, code, [{'name': 'A', 'lines': 4}])]}
+    res = vm._analyze_calls(inv)
+    assert res['unresolved'] == []
+    assert res['dynamic_runs'] == []
+
+
+def test_checkup_diff_survives_missing_fields():
+    # 履歴ファイルは外部データ＝フィールド欠損でも落ちない
+    d = vm._checkup_diff({'time': 't0'}, {'time': 't1'})
+    assert d['changed'] is False
+
+
+def test_analyze_calls_onaction_macro_is_not_orphan():
+    inv = {'modules': [_mod('M1', 1,
+                            'Sub ボタン処理()\r\nEnd Sub\r\nSub 本当の孤立()\r\nEnd Sub\r\n',
+                            [{'name': 'ボタン処理', 'lines': 2},
+                             {'name': '本当の孤立', 'lines': 2}])],
+           'onaction': [('メニュー', '角丸四角形 1', 'ボタン処理')]}
+    res = vm._analyze_calls(inv)
+    assert res['onaction'] == {'ボタン処理': ['メニュー/角丸四角形 1']}
+    assert [n for _, n in res['orphans']] == ['本当の孤立']
+
+
+def test_validate_vba_code_single_line_sub():
+    # 1行書き Sub x(): End Sub を「End Sub 不足」と誤警告しない
+    assert vm.validate_vba_code('Sub x(): End Sub\n') is True
+    # 文字列内の ':' で誤分割しない
+    assert vm.validate_vba_code('Sub y()\n    s = "a:b"\nEnd Sub\n') is True
+    # 本当に対応が取れていないものは引き続き検出する
+    assert vm.validate_vba_code('Sub z()\n', force=False) is False

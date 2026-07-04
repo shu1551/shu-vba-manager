@@ -286,6 +286,9 @@ def lint_form(form_name, info, controls, code=None):
         return (c["left"], c["top"], c["left"] + c["width"], c["top"] + c["height"])
 
     # 1. 重なり（同じ親の中だけ比較）
+    #    境界がぴったり接する（座標の丸め誤差含む）だけのケースを誤検知しないよう、
+    #    重複幅・高さが共に OVERLAP_EPS を超える場合だけを実質的な重なりとする。
+    OVERLAP_EPS = 2.0
     by_parent = {}
     for c in ok_items:
         by_parent.setdefault(c["parent"], []).append(c)
@@ -293,7 +296,9 @@ def lint_form(form_name, info, controls, code=None):
         for i in range(len(items)):
             for j in range(i + 1, len(items)):
                 a, b = rect(items[i]), rect(items[j])
-                if a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]:
+                ox = min(a[2], b[2]) - max(a[0], b[0])
+                oy = min(a[3], b[3]) - max(a[1], b[1])
+                if ox > OVERLAP_EPS and oy > OVERLAP_EPS:
                     findings.append(f"重なり: {items[i]['name']} と {items[j]['name']}"
                                     + (f"（{parent} 内）" if parent and parent != form_name else ""))
 
@@ -308,8 +313,10 @@ def lint_form(form_name, info, controls, code=None):
                 findings.append(f"はみ出し: {c['name']} (L{c['left']:g} T{c['top']:g} "
                                 f"W{c['width']:g} H{c['height']:g} / 内寸 {iw:g}x{ih:g})")
 
-    # 3. ボタンのサイズ不揃い（同じ行のボタン同士だけ比較。
+    # 3. ボタンの高さ不揃い（同じ行のボタン同士だけ比較。
     #    行が違えば役割も違う＝入力欄に高さを合わせた「選択」ボタン等は対象外）
+    #    幅の不揃いは「役割によって幅を変える」意図的な設計が普通にあり、
+    #    何種類までなら妥当かの基準がないため検査しない（ボタン幅3種チェックは廃止）
     btns = [c for c in ok_items if (c.get("type") or "").startswith("CommandButton")]
     if len(btns) >= 2:
         bands = {}
@@ -320,15 +327,16 @@ def lint_form(form_name, info, controls, code=None):
             if len(bs) < 2:
                 continue
             hs = sorted({c["height"] for c in bs})
-            ws = sorted({c["width"] for c in bs})
             if len(hs) > 1:
                 findings.append(f"同じ行のボタン高さが不揃い: {hs}  "
                                 f"({', '.join(c['name'] for c in bs)})")
-            if len(ws) > 2:
-                findings.append(f"同じ行のボタン幅が3種以上: {ws}  "
-                                f"({', '.join(c['name'] for c in bs)})")
 
     # 4. フォントサイズの混在（見出し＝太字ラベルは意図的な大きさなので対象外）
+    #    多数派から 1.5pt 未満しか離れていない値は無視する。長年の手作業で
+    #    フォームを拡縮・複製するたびに生じる丸め誤差（11.8/10.9/14.1pt 等の
+    #    半端な値）が大半で、実際の見た目では区別が付かず「混在」と呼ぶには
+    #    値しない。目に見える差（1.5pt以上）だけを報告する。
+    FONT_DIFF_MIN = 1.5
     sizes = {}
     for c in ok_items:
         if (c.get("type") or "").startswith("Label") and c.get("bold"):
@@ -338,7 +346,7 @@ def lint_form(form_name, info, controls, code=None):
     if len(sizes) > 1:
         major = max(sizes, key=lambda k: len(sizes[k]))
         for sz, names in sorted(sizes.items()):
-            if sz != major:
+            if sz != major and abs(sz - major) >= FONT_DIFF_MIN:
                 findings.append(f"フォント混在: {sz}pt = {', '.join(names)}（多数派は {major}pt）")
 
     # 5. TabIndex が視線順（上→下、左→右）と食い違う
@@ -354,11 +362,19 @@ def lint_form(form_name, info, controls, code=None):
 
     # 5b. 右端の「揃いかけのズレ」（最大右端から 2〜16pt だけ短い入力は
     #    揃え忘れの可能性が高い。大きく短いのは意図的な短欄とみなして対象外）
+    #    比較はフォーム全体ではなく「同じ列（Left が近い）」の入力同士に限る。
+    #    Left がバラバラな入力を比較すると、無関係な別セクション同士を
+    #    揃え忘れ扱いしてしまう（倍率回転フォームで実際に誤検知した）。
     inputs = [c for c in ok_items if c["parent"] in (None, form_name)
               and (c.get("type") or "").startswith(("TextBox", "ComboBox", "ListBox"))]
-    if len(inputs) >= 2:
-        max_r = max(round(c["left"] + c["width"]) for c in inputs)
-        near_miss = [c for c in inputs
+    by_left = {}
+    for c in inputs:
+        by_left.setdefault(round(c["left"]), []).append(c)
+    for col in by_left.values():
+        if len(col) < 2:
+            continue
+        max_r = max(round(c["left"] + c["width"]) for c in col)
+        near_miss = [c for c in col
                      if 2 <= max_r - round(c["left"] + c["width"]) <= 16]
         for c in near_miss:
             findings.append(f"右端の揃い忘れの疑い: {c['name']}"
@@ -377,11 +393,12 @@ def lint_form(form_name, info, controls, code=None):
             if abs(cy - iy) > 3:
                 findings.append(f"中央ずれ: {c['name']} と {i['name']}（差 {abs(cy - iy):.0f}pt）")
 
-    # 5d. Default / Cancel / Accelerator（キーボード操作の作法）
+    # 5d. Cancel / Accelerator（キーボード操作の作法）
+    # Default(Enter) は全フォームでほぼ確実に「未設定」と出る割に、単一ボタンの
+    # 終了フォームや複数択一フォームでは意味を持たないケースが大半のため、
+    # 発火率が低く実際に修正につながった Cancel(Esc) だけを検査する。
     btns2 = [c for c in ok_items if (c.get("type") or "").startswith("CommandButton")]
     if btns2:
-        if not any(c.get("default") for c in btns2):
-            findings.append("Default(Enter) のボタンが未設定")
         if not any(c.get("cancel") for c in btns2):
             findings.append("Cancel(Esc) のボタンが未設定")
         accs = {}
@@ -418,14 +435,9 @@ def lint_form(form_name, info, controls, code=None):
                 if f"{c['name'].lower()}_click" not in handler_set:
                     findings.append(f"Click ハンドラ未実装: {c['name']}")
 
-    # 6. 左端ラインの数（縦の整列ライン。2〜3本が目安）
-    #    右寄せのボタンバーと行内のチェック/オプションは設計上ラインが増えるので対象外
-    line_kinds = ('Label', 'TextBox', 'ComboBox', 'ListBox', 'Frame')
-    lefts = sorted({round(c["left"]) for c in ok_items
-                    if c["parent"] in (None, form_name)
-                    and any((c.get("type") or "").startswith(k) for k in line_kinds)})
-    if len(lefts) >= 4:
-        findings.append(f"左端の縦ライン（ラベル/入力系）が{len(lefts)}本: {lefts}（2〜3本が目安）")
+    # 6. （廃止）左端ラインの数チェック。ヘッダー行除外後も実際の修正には
+    #    一度も繋がらず、性質の違う区画が並ぶだけの小さいフォームでは区画数が
+    #    そのまま発火するだけだったため撤去した。
 
     return findings
 

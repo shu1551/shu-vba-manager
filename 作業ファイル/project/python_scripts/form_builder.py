@@ -229,7 +229,9 @@ class FormBuilder:
                     raise RuntimeError(
                         "起動中の Excel が見つかりません。"
                         "対象ブックを Excel で開いてから実行してください。")
-                xl = win32com.client.dynamic.Dispatch("Excel.Application")
+                # DispatchEx＝必ず別インスタンス（Dispatch は既存に接続してしまい
+                # ユーザーの Excel を巻き込む事故のもと。2026-07-03 に vba_manager 側で実害）
+                xl = win32com.client.DispatchEx("Excel.Application")
                 xl.Visible = True
                 print("注意: Excelが未起動だったため自動化用に新規起動しました。")
                 print("      このExcelにはアドイン・PERSONAL.XLSB が読み込まれていません。")
