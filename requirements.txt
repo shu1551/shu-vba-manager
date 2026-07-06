@@ -1,5 +1,6 @@
 pywin32
 customtkinter
+mcp          # vba_mcp_server.py（MCPサーバー）を使う場合
 
 # 開発用（任意・自動テストを回す場合のみ）
 # pytest

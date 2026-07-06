@@ -46,6 +46,7 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 | ツール | 役割 |
 |---|---|
 | **`vba_manager.py`** | 中核ツール。VBA の `list / get / replace-module / replace-procedure / add-procedure / delete-procedure` に、コード検索 `grep`・一括置換 `code-replace`・復元 `restore`・一括実行 `batch`・導入診断 `setup-check`、シート読取（`read-range` / `sheet-info` / `screenshot`）・編集（`write-range` / `format-range` / `find-replace` / `export-pdf` 等）・グラフ／ピボット／PowerQuery／データモデルまで **58コマンド** |
+| **`vba_mcp_server.py`** | vba_manager を **MCP サーバー化**する薄い窓口（2026-07 追加）。常駐 COM 接続でコマンドごとの再接続が消え、応答は実測 0.01〜0.2 秒級。`vba`（1行で全コマンド）＋ `get_procedure / set_procedure_code / replace_procedure / vba_help` の5ツール |
 | **`form_layout.py`** | UserForm を**宣言で構築**するレイアウトエンジン。行構造を書くだけでラベル整列・ボタンバー・タブ順・イベント雛形まで自動。Excel 不要の配置プレビューも（`py form_layout.py preview 宣言.py`） |
 | **`form_inspect.py`** | フォームの点検。コントロール配置＋コードを1接続で取得、実表示PNG撮影（`--png` / `--png-all`）、機械検査（`--lint`）、既存フォームの宣言コード逆変換（`--to-layout`） |
 | **`form_tool.py`** | フォームの幾何操作 CLI。`scale / set / move / align / size-match / distribute / tab-order / rename-control / delete-control / copy-form` |
@@ -218,6 +219,27 @@ py menu_launcher.py
 ```
 
 customtkinter 製 GUI が起動。登録された Public Sub を一覧から検索・実行できます。
+
+### `vba_mcp_server.py` — MCP サーバー（2026-07 追加）
+
+Claude Code などの MCP クライアントに登録すると、AI がこのツールキットを直接呼び出せます。
+CLI が1コマンドごとに払っていた COM 再接続（全工程で最も重い処理）が消え、
+常駐接続により 2 回目以降の応答は **実測 0.01〜0.2 秒級** になります。
+
+```powershell
+# Claude Code への登録（ユーザースコープ）
+claude mcp add vba-manager --scope user -- py "<このフォルダの絶対パス>\作業ファイル\project\python_scripts\vba_mcp_server.py"
+```
+
+ツールは5つだけの薄い窓口です（実体は vba_manager.py そのもの）：
+
+- `vba(command)` — CLI と同じ引数列を1行で渡す。58コマンド全部使える
+- `vba_help` — コマンド一覧・個別ヘルプ
+- `get_procedure` / `set_procedure_code` / `replace_procedure` — プロシージャ修正の定番3手
+
+対象は常に「**今アクティブに開いている Excel ブック**」。特定のブックやパスには依存しません。
+
+---
 
 ---
 

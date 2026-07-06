@@ -41,6 +41,7 @@ _wheel_dump/
 # =============================================================================
 作業ファイル/project/python_scripts/*.py
 !作業ファイル/project/python_scripts/vba_manager.py
+!作業ファイル/project/python_scripts/vba_mcp_server.py
 !作業ファイル/project/python_scripts/form_builder.py
 !作業ファイル/project/python_scripts/form_inspect.py
 !作業ファイル/project/python_scripts/form_layout.py
