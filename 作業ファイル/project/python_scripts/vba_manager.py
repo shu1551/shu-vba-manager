@@ -1957,6 +1957,59 @@ def cmd_add_procedure(args):
     return True
 
 
+def cmd_add_module(args):
+    """新規モジュールを追加: add-module [excel_file] <モジュール名> [--type std|class|form]
+
+    add-procedure/replace-module は既存モジュール前提のため、まっさらなブックには
+    器を作れなかった。これはその穴を埋める純機械コマンド（VBComponents.Add）。
+    std=標準モジュール / class=クラスモジュール / form=UserForm。
+    """
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: add-module [excel_file] <モジュール名> [--type std|class|form]")
+        return False
+    module_name = rest[0]
+    if _reject_extra_args(rest, 1, '使い方: add-module [excel_file] <モジュール名> [--type std|class|form]'):
+        return False
+
+    type_opt = (getattr(args, 'type_opt', None) or 'std').lower()
+    type_map = {'std': 1, 'standard': 1, 'class': 2, 'cls': 2, 'form': 3, 'userform': 3}
+    if type_opt not in type_map:
+        print(f"エラー: 不明な --type '{type_opt}'（std|class|form のいずれか）")
+        return False
+    comp_type = type_map[type_opt]
+
+    if re.search(r'\s', module_name):
+        print("エラー: モジュール名に空白は使えません。")
+        return False
+
+    xl, wb = get_workbook(target_file)
+    for c in wb.VBProject.VBComponents:
+        if c.Name.lower() == module_name.lower():
+            print(f"エラー: モジュール '{c.Name}' は既に存在します。（別名にするか delete-module で消してから）")
+            return False
+
+    if make_backup(wb.FullName, f"add_module_{module_name}") is None and not getattr(args, 'force', False):
+        print("エラー: バックアップが取れないため中止しました（--force で強行可）。")
+        return False
+
+    try:
+        comp = wb.VBProject.VBComponents.Add(comp_type)
+    except Exception as e:
+        print(f"エラー: モジュールを追加できませんでした: {e}")
+        print("  VBProject へのアクセスが信頼されているか確認してください（setup-check）。")
+        return False
+    try:
+        comp.Name = module_name
+    except Exception as e:
+        print(f"エラー: モジュール名 '{module_name}' を設定できませんでした: {e}")
+        return False
+    wb.Save()
+    label = {1: '標準モジュール', 2: 'クラスモジュール', 3: 'ユーザーフォーム'}[comp_type]
+    print(f"追加完了: {label} '{comp.Name}' → 保存しました")
+    return True
+
+
 def cmd_delete_procedure(args):
     """プロシージャを削除: delete-procedure [excel_file] <Sub名>
 
@@ -4487,6 +4540,134 @@ def cmd_code_replace(args):
     return True
 
 
+def _start_dialog_watcher(xl, mode):
+    """run-macro 実行中に出る MsgBox/InputBox(#32770) を自動応答する監視スレッド。
+
+    xl.Application.Run は MsgBox が出ると閉じるまでブロックするため、別スレッドから
+    Excel が所有するモーダルダイアログにだけ WM_COMMAND を送って解除する。
+    mode: ok/enter->OK, cancel->キャンセル, yes->はい, no->いいえ。返り値の .stop() で終了。
+    """
+    import threading
+    try:
+        import win32gui
+        import win32process
+        import win32con
+    except Exception as ex:
+        print(f"[WARNING] ダイアログ監視を開始できません（win32 不足）: {ex}", file=sys.stderr)
+
+        class _Noop:
+            def stop(self):
+                pass
+        return _Noop()
+
+    excel_pid = None
+    try:
+        excel_pid = win32process.GetWindowThreadProcessId(int(xl.Hwnd))[1]
+    except Exception:
+        pass
+
+    mode_l = (mode or 'ok').lower()
+    # 標準ボタンID（Win32 DialogBox の既定値）。決め打ちの「望みのID」。
+    _STD_ID = {'ok': 1, 'enter': 1, 'cancel': 2, 'yes': 6, 'no': 7,
+               'abort': 3, 'retry': 4, 'ignore': 5}
+    # テキストで拾う第2の網（OK専用MsgBoxのID化け対策・日英両対応）
+    _TEXT_HINTS = {
+        'ok':     ('ok', 'はい', '確定', '了解'),
+        'enter':  ('ok', 'はい', '確定', '了解'),
+        'cancel': ('cancel', 'キャンセル', '中止'),
+        'yes':    ('yes', 'はい'),
+        'no':     ('no', 'いいえ'),
+    }
+    want_id = _STD_ID.get(mode_l, 1)
+    hints = _TEXT_HINTS.get(mode_l, ())
+
+    def _dialog_buttons(hwnd):
+        """ダイアログ内の Button コントロールを [(ctrl_id, text)] で返す。"""
+        found = []
+
+        def _child(ch, _):
+            try:
+                if win32gui.GetClassName(ch) == 'Button':
+                    cid = win32gui.GetDlgCtrlID(ch)
+                    txt = win32gui.GetWindowText(ch).replace('&', '').strip()
+                    found.append((cid, txt))
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumChildWindows(hwnd, _child, None)
+        except Exception:
+            pass
+        return found
+
+    def _resolve_button_id(hwnd):
+        """このダイアログで実際に押すべきボタンIDを、実在ボタンから決める。
+
+        OK のみの MsgBox は OK ボタンの ID が 2(IDCANCEL) になる Windows の仕様があり、
+        標準IDを決め打ちで送ると閉じない（フェイブルが実弾で特定）。実在ボタンの
+        ID とテキストを見て決めることで、OK専用MsgBox・Yes/No・InputBox すべてに効かせる。
+        """
+        btns = _dialog_buttons(hwnd)
+        if not btns:
+            return want_id                       # 取れなければ従来の決め打ち
+        ids = [cid for cid, _ in btns]
+        # 1) 望む標準IDが実在すればそれ（通常の OK+キャンセル・Yes/No 等）
+        if want_id in ids:
+            return want_id
+        # 2) テキストで一致するボタン（IDが化けていても文字で拾う）
+        for cid, txt in btns:
+            tl = txt.lower()
+            if any(h in tl for h in hints):
+                return cid
+        # 3) OK系でボタンが1つだけ＝OK専用MsgBox（ID2化け）→ そのボタンを押す
+        if mode_l in ('ok', 'enter') and len(btns) == 1:
+            return btns[0][0]
+        # 4) それでも決まらなければ決め打ちに戻す
+        return want_id
+
+    stop_evt = threading.Event()
+
+    def _loop():
+        while not stop_evt.is_set():
+            targets = []
+
+            def _cb(hwnd, _unused):
+                try:
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return
+                    if win32gui.GetClassName(hwnd) != '#32770':
+                        return
+                    if excel_pid is not None:
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        if pid != excel_pid:
+                            return
+                    targets.append(hwnd)
+                except Exception:
+                    pass
+
+            try:
+                win32gui.EnumWindows(_cb, None)
+            except Exception:
+                pass
+            for hwnd in targets:
+                try:
+                    cid = _resolve_button_id(hwnd)
+                    win32gui.PostMessage(hwnd, win32con.WM_COMMAND, cid, 0)
+                except Exception:
+                    pass
+            stop_evt.wait(0.15)
+
+    th = threading.Thread(target=_loop, daemon=True)
+    th.start()
+
+    class _Watcher:
+        def stop(self):
+            stop_evt.set()
+
+    return _Watcher()
+
+
 def cmd_run_macro(args):
     """Excelマクロを実行する"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -4552,6 +4733,12 @@ def cmd_run_macro(args):
     else:
         print(f"マクロ実行中: {full_macro_path}", file=sys.stderr)
 
+    # ダイアログ自動応答（--auto-dialog ok|cancel|yes|no）
+    _dlg_watcher = None
+    _auto_dialog = getattr(args, 'auto_dialog', None)
+    if _auto_dialog:
+        _dlg_watcher = _start_dialog_watcher(xl, _auto_dialog)
+
     try:
         # マクロ実行
         result = xl.Application.Run(full_macro_path, *run_args)
@@ -4571,6 +4758,8 @@ def cmd_run_macro(args):
             print(f"エラー: マクロの実行に失敗しました: {err_msg}", file=sys.stderr)
         return False
     finally:
+        if _dlg_watcher is not None:
+            _dlg_watcher.stop()
         # 戻さないとユーザーの Excel セッションに DisplayAlerts=False が残り、
         # 以後の手動操作で保存確認などの警告が出なくなる
         try:
@@ -4728,6 +4917,54 @@ def _range_values_2d(rng, use_formula=False):
     return [list(r) if isinstance(r, tuple) else [r] for r in raw]
 
 
+def _merged_areas_in_range(rng, cap=8000):
+    """range 内の結合セル領域を "A3:I8" 形式のアドレス一覧で返す（重複なし）。
+
+    戻り値は (areas, skipped_total)。
+      ・結合が1つも無い範囲は rng.MergeCells が False を返すので即 ([], None)（最速パス）。
+      ・cap を超えるセル数の範囲は走査せず (None, total) を返す（巨大UsedRangeの暴走防止）。
+    MergeArea の矩形は Python 側の seen 集合に算術で畳み、余分な COM 呼び出しを避ける。
+    神エクセルの二重構造（文字はA1・見た目はI列まで結合）を読み解くための素。
+    """
+    try:
+        if rng.MergeCells is False:      # 範囲内に結合が皆無 → 走査不要
+            return [], None
+    except Exception:
+        pass                              # None(混在)や例外は通常走査へ
+    try:
+        total = int(rng.Cells.Count)
+    except Exception:
+        return [], None
+    if total > cap:
+        return None, total
+    ws = rng.Worksheet
+    r0, c0 = rng.Row, rng.Column
+    nr, nc = rng.Rows.Count, rng.Columns.Count
+    seen = set()
+    areas = []
+    for i in range(nr):
+        for j in range(nc):
+            key = (r0 + i, c0 + j)
+            if key in seen:
+                continue
+            try:
+                cell = ws.Cells(r0 + i, c0 + j)
+                if cell.MergeCells:
+                    ma = cell.MergeArea
+                    mr, mc = ma.Row, ma.Column
+                    mrc, mcc = ma.Rows.Count, ma.Columns.Count
+                    areas.append(
+                        f"{_col_letter(mc)}{mr}:{_col_letter(mc + mcc - 1)}{mr + mrc - 1}")
+                    for ii in range(mrc):        # 結合矩形を丸ごと走査済みにする
+                        for jj in range(mcc):
+                            seen.add((mr + ii, mc + jj))
+                else:
+                    seen.add(key)
+            except Exception:
+                seen.add(key)
+    return areas, None
+
+
 def _values_to_grid(rng, use_formula=False, max_col_width=40):
     """Range の値を、列文字＋行番号つきのテキスト格子にする
 
@@ -4808,9 +5045,15 @@ def cmd_read_range(args):
         out = []
         for ws, rng in blocks:
             rows = _range_values_2d(rng, use_formula)
-            out.append({"sheet": ws.Name, "address": rng.Address,
-                        "ref": f"{ws.Name}!{rng.Address}",
-                        "rows": [[_cell_str(v) for v in r] for r in rows]})
+            entry = {"sheet": ws.Name, "address": rng.Address,
+                     "ref": f"{ws.Name}!{rng.Address}",
+                     "rows": [[_cell_str(v) for v in r] for r in rows]}
+            areas, skipped = _merged_areas_in_range(rng)
+            if skipped:
+                entry["merged_skipped_cells"] = skipped   # cap超で未走査
+            elif areas:
+                entry["merged"] = areas
+            out.append(entry)
         print(json.dumps({"success": True, "file": wb.Name, "ranges": out},
                          ensure_ascii=False), file=sys.stdout)
         return True
@@ -4822,6 +5065,13 @@ def cmd_read_range(args):
         print("=" * 60)
         print(_values_to_grid(rng, use_formula, max_col_width=width))
         print("=" * 60)
+        areas, skipped = _merged_areas_in_range(rng)
+        if skipped:
+            print(f"結合セル: 未走査（{skipped}セルはcap超・範囲を絞れば表示）")
+        elif areas:
+            shown = areas[:30]
+            more = f"  …他{len(areas) - 30}件" if len(areas) > 30 else ""
+            print(f"結合セル {len(areas)}件: " + ", ".join(shown) + more)
 
     if tsv_out is not None:
         path = _LAST_VALUES_FILE if tsv_out == '_DEFAULT_' else os.path.abspath(tsv_out)
@@ -4890,6 +5140,14 @@ def cmd_sheet_info(args):
             dims = "(空)"
         vis = '' if sh.Visible == -1 else '  [非表示]'
         print(f"{mark} {sh.Name}: {dims}{vis}")
+        if ur is not None:
+            areas, skipped = _merged_areas_in_range(ur)
+            if skipped:
+                print(f"    結合: 未走査（{skipped}セル・大）")
+            elif areas:
+                shown = areas[:12]
+                more = f"  …他{len(areas) - 12}件" if len(areas) > 12 else ""
+                print(f"    結合 {len(areas)}件: " + ", ".join(shown) + more)
         if preview > 0 and ur is not None:
             try:
                 nrows = min(preview, ur.Rows.Count)
@@ -4899,6 +5157,192 @@ def cmd_sheet_info(args):
             except Exception as e:
                 print(f"    (先頭行を読めませんでした: {e})")
     print("-" * 60)
+    return True
+
+
+def _shape_text(shp):
+    """図形の表示文字を複数方式で拾う。
+
+    Formsコントロール(ボタン等)は TextFrame.Characters().Text、
+    AutoShape等は TextFrame2.TextRange.Text に文字が入る（相手で口が違う）。
+    先に非空を返した方を採用。どちらも取れなければ None。
+    """
+    for getter in (
+        lambda: shp.TextFrame.Characters().Text,
+        lambda: shp.TextFrame2.TextRange.Text,
+    ):
+        try:
+            t = getter()
+            if t:
+                return t
+        except Exception:
+            continue
+    return None
+
+
+def _collect_shapes(shapes, out, in_group=None):
+    """Shapes を平坦なリストに集める。グループ(msoGroup=6)は中のボタンも展開して拾う。
+
+    ファイル一覧等ではボタンがグループにまとめられており、展開しないと
+    中の「抽出開始」「選択抽出」等が丸ごと落ちる（実測で判明）。
+    """
+    for shp in shapes:
+        s = {}
+        try:
+            s["name"] = shp.Name
+        except Exception:
+            pass
+        try:
+            typ = int(shp.Type)
+            s["type"] = typ
+        except Exception:
+            typ = None
+        txt = _shape_text(shp)
+        if txt:
+            s["text"] = txt
+        try:
+            s["l"] = round(float(shp.Left))
+            s["t"] = round(float(shp.Top))
+        except Exception:
+            pass
+        try:
+            oa = shp.OnAction
+            if oa:
+                s["onaction"] = oa.split('!')[-1].strip("'\" ")
+        except Exception:
+            pass
+        if in_group:
+            s["group"] = in_group
+        out.append(s)
+        if typ == 6:                       # msoGroup → 中身を1段展開
+            try:
+                _collect_shapes(shp.GroupItems, out, in_group=s.get("name"))
+            except Exception:
+                pass
+
+
+def cmd_snapshot(args):
+    """アクティブブック(または1シート)を意味構造JSONに畳む＝開いたままブックLMの下ごしらえ。
+
+    セル(疎)＋結合(merged)＋図形/ボタン(text・座標・OnAction)＋テーブル(ListObject)を
+    1ファイルに束ねる。晴美さんのExStruct extract を「開いてるブック相手・その場」で焼き直したもの。
+    表かどうかの"推定"はしない（機械的事実だけ吐き、意味付けは読み手のAIがやる＝この子の設計思想）。
+    """
+    import json
+    target_file, rest = parse_target_and_rest(args.posargs)
+    only_sheet = rest[0] if rest else getattr(args, 'sheet_opt', None)
+    out_path = os.path.abspath(getattr(args, 'out_opt', None) or _LAST_SNAPSHOT_FILE)
+    try:
+        max_rows = int(getattr(args, 'max_rows', None) or 5000)
+    except (TypeError, ValueError):
+        print("エラー: --max-rows は数値で指定してください")
+        return False
+
+    xl, wb = get_workbook(target_file)
+    active = wb.ActiveSheet.Name
+
+    if only_sheet:
+        targets = [sh for sh in wb.Sheets if sh.Name == only_sheet]
+        if not targets:
+            print(f"シート '{only_sheet}' が見つかりません")
+            return False
+    else:
+        targets = list(wb.Sheets)
+
+    sheets = {}
+    for sh in targets:
+        info = {}
+        try:
+            ur = sh.UsedRange
+            nr, nc = ur.Rows.Count, ur.Columns.Count
+            info["dims"] = f"{nr}行 x {nc}列"
+            info["used"] = ur.Address
+        except Exception:
+            ur, nr, nc = None, 0, 0
+            info["dims"] = "(空)"
+        info["visible"] = (sh.Visible == -1)
+
+        # --- セル（疎：空セル・空行は落とす。読み込みも max_rows 行までに絞る）---
+        cells = []
+        if ur is not None and nr > 0:
+            r0, c0 = ur.Row, ur.Column
+            read_rows = min(nr, max_rows)
+            try:
+                sub = sh.Range(ur.Cells(1, 1), ur.Cells(read_rows, nc))
+                raw = sub.Value
+            except Exception:
+                raw = None
+            if raw is None:
+                grid = []
+            elif not isinstance(raw, tuple):
+                grid = [(raw,)]
+            else:
+                grid = [r if isinstance(r, tuple) else (r,) for r in raw]
+            for i, row in enumerate(grid):
+                cmap = {}
+                for j, v in enumerate(row):
+                    if v is None or v == '':
+                        continue
+                    cmap[_col_letter(c0 + j)] = _cell_str(v)
+                if cmap:
+                    cells.append({"r": r0 + i, "c": cmap})
+            if nr > max_rows:
+                info["cells_truncated"] = {"read_rows": max_rows, "total_rows": nr}
+        info["cells"] = cells
+
+        # --- 結合（①の素を流用）---
+        if ur is not None:
+            areas, skipped = _merged_areas_in_range(ur)
+            if skipped:
+                info["merged_skipped_cells"] = skipped
+            elif areas:
+                info["merged"] = areas
+
+        # --- 図形／ボタン（text・座標・実行マクロ。グループは1段展開）---
+        shapes = []
+        try:
+            _collect_shapes(sh.Shapes, shapes)
+        except Exception:
+            pass
+        if shapes:
+            info["shapes"] = shapes
+
+        # --- テーブル（正式な ListObject だけ・推定はしない）---
+        tables = []
+        try:
+            for lo in sh.ListObjects:
+                tables.append({"name": lo.Name, "address": lo.Range.Address})
+        except Exception:
+            pass
+        if tables:
+            info["tables"] = tables
+
+        sheets[sh.Name] = info
+
+    doc = {"success": True, "book": wb.Name, "active_sheet": active, "sheets": sheets}
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+
+    # 端末にはサマリだけ（本体JSONは大きくなり得るのでファイルへ）
+    print(f"スナップショット: {wb.Name}  → {out_path}")
+    print("-" * 60)
+    for name, info in sheets.items():
+        parts = [info.get("dims", "")]
+        parts.append(f"セル{len(info.get('cells', []))}行")
+        if "cells_truncated" in info:
+            parts.append(f"(全{info['cells_truncated']['total_rows']}行→{info['cells_truncated']['read_rows']}打切)")
+        if "merged" in info:
+            parts.append(f"結合{len(info['merged'])}")
+        elif "merged_skipped_cells" in info:
+            parts.append("結合未走査(大)")
+        if "shapes" in info:
+            parts.append(f"図形{len(info['shapes'])}")
+        if "tables" in info:
+            parts.append(f"表{len(info['tables'])}")
+        mark = '*' if name == active else ' '
+        print(f"{mark} {name}: " + "  ".join(p for p in parts if p))
+    print("-" * 60)
+    print("このJSONを read して質問すれば、開いたままブックLMになる。")
     return True
 
 
@@ -4996,6 +5440,7 @@ def _screenshot_cleanup(xl, ws):
 _LAST_VALUES_FILE = os.path.join(SCRIPT_DIR, '_last_values.tsv')   # write-range のグリッド入力
 _LAST_QUERY_FILE  = os.path.join(SCRIPT_DIR, '_last_query.m')       # powerquery add のM式入力
 _LAST_DAX_FILE    = os.path.join(SCRIPT_DIR, '_last_dax.dax')       # datamodel measure add のDAX入力
+_LAST_SNAPSHOT_FILE = os.path.join(SCRIPT_DIR, '_last_snapshot.json')  # snapshot の意味構造JSON出力先
 
 # 配置・罫線の定数 (xl定数の実値)
 _XL_ALIGN_H = {'left': -4131, 'center': -4108, 'right': -4152,
@@ -8047,6 +8492,14 @@ def build_parser():
     p.add_argument("--force", action="store_true", dest="force",
                    help="構文エラー警告・バックアップ失敗を無視して強行")
 
+    # add-module [excel_file] <module_name> [--type std|class|form]
+    p = sub.add_parser("add-module", help="新規モジュールを追加（標準/クラス/フォーム）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--type", dest="type_opt", default="std",
+                   help="モジュール種別 std|class|form（既定 std）")
+    p.add_argument("--force", action="store_true", dest="force",
+                   help="バックアップ失敗時も強行する")
+
     # delete-procedure [excel_file] <macro_name> [--module name] [-y]
     p = sub.add_parser("delete-procedure", help="プロシージャを削除（削除コードを表示して確認）")
     p.add_argument("posargs", nargs="*")
@@ -8143,6 +8596,8 @@ def build_parser():
     p = sub.add_parser("run-macro", help="Excel内の指定されたマクロを実行します")
     p.add_argument("posargs", nargs="+")
     p.add_argument("--json", action="store_true", help="実行結果をJSON形式で出力")
+    p.add_argument("--auto-dialog", dest="auto_dialog", default=None,
+                   help="実行中に出るMsgBox/InputBoxを自動応答 ok|cancel|yes|no（既定は応答しない）")
 
     # replace-module [excel_file] <module_name> <bas_file>
     p = sub.add_parser("replace-module")
@@ -8195,6 +8650,17 @@ def build_parser():
     p.add_argument("posargs", nargs="*")
     p.add_argument("--preview", dest="preview", default=None,
                    help="各シート使用範囲の先頭N行も表示（ブック俯瞰・1接続）")
+
+    # snapshot [excel_file] [sheet] [--out file] [--sheet NAME] [--max-rows N]
+    p = sub.add_parser("snapshot",
+                       help="ブック(または1シート)を意味構造JSONに畳む＝開いたままブックLMの下ごしらえ")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--out", dest="out_opt", default=None,
+                   help="出力JSONパス（省略時は _last_snapshot.json）")
+    p.add_argument("--sheet", dest="sheet_opt", default=None,
+                   help="対象シート名（1シートだけ畳む。posargでも可）")
+    p.add_argument("--max-rows", dest="max_rows", default=None,
+                   help="1シートあたりのセル読み込み行上限（既定5000。超過は打ち切り注記）")
 
     # screenshot [excel_file] [range] [--out file]
     p = sub.add_parser("screenshot")
@@ -8682,6 +9148,7 @@ def _command_table():
         "get":               cmd_get,
         "replace-procedure": cmd_replace_procedure,
         "add-procedure":     cmd_add_procedure,
+        "add-module":        cmd_add_module,
         "delete-procedure":  cmd_delete_procedure,
         "grep":              cmd_grep,
         "code-replace":      cmd_code_replace,
@@ -8703,6 +9170,7 @@ def _command_table():
         "read-range":        cmd_read_range,
         "read-selection":    cmd_read_selection,
         "sheet-info":        cmd_sheet_info,
+        "snapshot":          cmd_snapshot,
         "screenshot":        cmd_screenshot,
         "write-range":       cmd_write_range,
         "clear-range":       cmd_clear_range,
