@@ -72,6 +72,7 @@ import re
 import shutil
 import argparse
 import time
+import datetime
 import unicodedata
 import pythoncom
 import pywintypes
@@ -378,6 +379,18 @@ def get_workbook(target_file_arg=None, load_addins=False, readonly=False):
         xl, wb, was_ro = _wb_cache[key]
         try:
             _ = wb.Name          # 生存確認（閉じられていたら再接続）
+            if key == "__active__":
+                # shell/batch/MCP 等の1接続セッション中にユーザーが Excel 側で
+                # 別ブックをアクティブにした場合、キャッシュした旧ブックのまま
+                # 破壊コマンドが走ると対象取り違えになる。毎回同一性を確認して追従する
+                try:
+                    cur = xl.ActiveWorkbook
+                    if cur is not None and cur.Name != wb.Name:
+                        print(f"対象ブック: {cur.Name}（アクティブブックの切替に追従）")
+                        wb = cur
+                        _wb_cache[key] = (xl, wb, was_ro)
+                except Exception:
+                    pass
             if was_ro and not readonly:
                 print("⚠ このブックは診断用に読み取り専用で開いています。"
                       "編集するには Excel で通常モードで開き直してください。")
@@ -805,6 +818,14 @@ def _check_bas_one(path, fix=False):
         before = len(re.split(r'\r\n|\r|\n', raw_bytes.decode('cp932')))
         after = len(re.split(r'\r\n|\r|\n', fixed_bytes.decode('cp932')))
         if fix:
+            # in-place 書き換えなので、書く前に元バイト列を退避しておく（undo 導線）
+            try:
+                bak = path + f".bak_{time.strftime('%Y%m%d_%H%M%S')}"
+                with open(bak, 'wb') as f:
+                    f.write(raw_bytes)
+                print(f"  退避: {bak}")
+            except Exception as e:
+                print(f"  [WARN] 退避に失敗しました（{e}）。修正は続行します")
             with open(path, 'wb') as f:
                 f.write(fixed_bytes)
             print(f"  [FIXED] 改行二重化を修正しました: {before}行 → {after}行")
@@ -852,7 +873,9 @@ def _check_bas_one(path, fix=False):
 def cmd_check(args):
     """VBAコードの静的解析・診断を行う"""
     target_file, _ = parse_target_and_rest(args.posargs)
-    xl, wb = get_workbook(target_file)
+    # 診断系なので readonly（閉じているブックを通常モードで開くと
+    # Workbook_Open / Auto_Open が発火して副作用が走る）
+    xl, wb = get_workbook(target_file, readonly=True)
     
     is_json = getattr(args, 'json', False)
 
@@ -968,14 +991,20 @@ def cmd_check(args):
                 if "sendkeys" in clean_line.lower():
                     mod_info["warnings"].append(f"プロシージャ '{current_proc_name}' 内で危険な SendKeys が使用されています (行 {idx + 1})")
 
-            # 終了チェック
-            is_end_sub = re.match(r'^end\s+sub\b', clean_line, re.IGNORECASE)
-            is_end_func = re.match(r'^end\s+function\b', clean_line, re.IGNORECASE)
+            # 終了チェック。「Sub x(): End Sub」の1行書きは End が行頭に来ないため、
+            # validate_vba_code と同じく ':' で文に分割してから数える
+            # （文字列内の ':' で誤分割しないよう先に潰す）
+            blanked = re.sub(r'"[^"]*"', '""', clean_line)
+            segs = [s.strip() for s in blanked.split(':')]
+            n_end_sub = sum(1 for s in segs
+                            if re.match(r'^end\s+sub\b', s, re.IGNORECASE))
+            n_end_func = sum(1 for s in segs
+                             if re.match(r'^end\s+function\b', s, re.IGNORECASE))
+            is_end_sub = n_end_sub > 0
+            is_end_func = n_end_func > 0
 
-            if is_end_sub:
-                end_sub += 1
-            elif is_end_func:
-                end_func += 1
+            end_sub += n_end_sub
+            end_func += n_end_func
 
             if current_proc_name and (
                 (current_proc_kind == 'sub' and is_end_sub) or
@@ -1649,13 +1678,17 @@ def cmd_replace_procedure(args):
         return False
     macro_name = m.group(1)
 
-    # new_code の末尾に次のプロシージャの Sub/Function 宣言が混入していたら除去
+    # new_code の末尾に次のプロシージャの Sub/Function 宣言が混入していたら除去。
+    # ただし「Sub B(): 処理: End Sub」のような1行完結のプロシージャは正当なコード
+    # なので対象外（End を伴わない裸の宣言行だけが混入）
     code_lines = new_code.rstrip('\n').split('\n')
     while len(code_lines) > 1:
         last = code_lines[-1].strip()
         if last == '':
             code_lines.pop()
-        elif pattern.match(last) and code_lines[-1].strip() != code_lines[0].strip():
+        elif (pattern.match(last)
+              and not re.search(r'\bEnd\s+(?:Sub|Function)\b', last, re.IGNORECASE)
+              and code_lines[-1].strip() != code_lines[0].strip()):
             code_lines.pop()
         else:
             break
@@ -2016,6 +2049,13 @@ def cmd_add_module(args):
         comp.Name = module_name
     except Exception as e:
         print(f"エラー: モジュール名 '{module_name}' を設定できませんでした: {e}")
+        # 追加済みの既定名（Module1等）のまま残すと、後で保存されたときに
+        # ゴミモジュールがブックに焼き付くため撤去する
+        try:
+            wb.VBProject.VBComponents.Remove(comp)
+        except Exception:
+            print("警告: 追加途中のモジュールを撤去できませんでした"
+                  "（既定名のモジュールが残っていたら手で削除してください）")
         return False
     wb.Save()
     label = {1: '標準モジュール', 2: 'クラスモジュール', 3: 'ユーザーフォーム'}[comp_type]
@@ -2352,20 +2392,26 @@ def cmd_reorder_macro(args):
     xl, wb = get_workbook(None)  # ActiveWorkbook 自動検出
 
     # 対象マクロを含む標準モジュールを特定
-    target_comp = None
+    # （replace-procedure / delete-procedure と同様、同名複数は取り違え防止で停止）
+    matched_comps = []
     for comp in wb.VBProject.VBComponents:
         if comp.Type != 1:  # 標準モジュールのみ対象
             continue
         try:
             comp.CodeModule.ProcStartLine(macro_name, 0)
-            target_comp = comp
-            break
+            matched_comps.append(comp)
         except Exception:
             continue
 
-    if target_comp is None:
+    if not matched_comps:
         print(f"エラー: マクロ '{macro_name}' が標準モジュールに見つかりません")
         sys.exit(2)
+    if len(matched_comps) > 1:
+        names = ', '.join(c.Name for c in matched_comps)
+        print(f"エラー: 同名マクロ '{macro_name}' が複数のモジュールにあります: {names}")
+        print("  対象を特定できないため中止しました（重量操作の取り違え防止）。")
+        sys.exit(2)
+    target_comp = matched_comps[0]
 
     module_name = target_comp.Name
 
@@ -2377,10 +2423,10 @@ def cmd_reorder_macro(args):
 
     header, blocks, trailing = _parse_module_blocks(bas_text)
 
-    # 対象ブロックの index
+    # 対象ブロックの index（VBA の名前は大小無視なので比較も合わせる）
     target_idx = None
     for i, b in enumerate(blocks):
-        if b['name'] == macro_name:
+        if b['name'].lower() == macro_name.lower():
             target_idx = i
             break
     if target_idx is None:
@@ -2441,8 +2487,11 @@ def cmd_reorder_macro(args):
     # 破壊操作（Remove+Import）なので他コマンドと同じくバックアップ必須。
     # 取れなければ停止（--force で強行）
     if make_backup(wb.FullName, f"reorder_{macro_name}") is None and not getattr(args, 'force', False):
+        _remove_export_artifacts(tmp_bas)
         print("エラー: バックアップが取れなかったため中止しました（--force で強行可能）")
         return False
+    # モジュール単位のバックアップ（Import 失敗時の自動復旧素材。replace-module と同型）
+    module_backup = make_module_backup(wb, module_name)
     print(f"並べ替え中: [{module_name}] '{macro_name}' を {direction}")
 
     # replace-module と同じ安定化手順（sleep + PumpWaitingMessages）に揃える
@@ -2464,13 +2513,24 @@ def cmd_reorder_macro(args):
         success = True
     except Exception as ex:
         # Remove 成功後に Import が失敗するとモジュールが消えたままになる。
-        # ディスクは Remove 前の Save 状態なので、保存せず開き直せば戻る旨を必ず案内する
+        # replace-module と同じく、モジュールバックアップからの自動復旧を先に試みる
         if removed:
             print(f"エラー: 並べ替え中に失敗しました（モジュール '{module_name}' が"
                   f"開いているブックから外れた可能性があります）: {ex}", file=sys.stderr)
-            print(f"  復旧: このブックを保存せずに閉じて開き直すか、"
-                  f"バックアップから restore してください。", file=sys.stderr)
-            print(f"  並べ替え後のコードは残してあります: {tmp_bas}", file=sys.stderr)
+            try:
+                if module_backup and os.path.exists(module_backup):
+                    wb.VBProject.VBComponents.Import(module_backup)
+                    print(f"復旧成功: {module_backup} を再インポートしました"
+                          f"（並べ替え前の内容に戻っています）", file=sys.stderr)
+                else:
+                    raise RuntimeError("モジュールバックアップがありません")
+            except Exception as ex2:
+                print(f"復旧失敗: {ex2}", file=sys.stderr)
+                print("  ⚠ このままブックを保存するとモジュールがファイルからも消えます。", file=sys.stderr)
+                print("  対処: ブックを『保存せずに閉じて』開き直せば並べ替え前の状態に戻ります。", file=sys.stderr)
+                if module_backup:
+                    print(f"  または並べ替え前のモジュールを restore: {module_backup}", file=sys.stderr)
+                print(f"  並べ替え後のコードも残してあります（restore に渡せます）: {tmp_bas}", file=sys.stderr)
         else:
             print(f"エラー: 並べ替えに失敗しました: {ex}", file=sys.stderr)
         return False
@@ -3389,7 +3449,10 @@ def _load_checkup_history(book_name):
     try:
         with open(_checkup_history_path(book_name), 'r', encoding='utf-8') as f:
             hist = json.load(f)
-        return hist if isinstance(hist, list) else []
+        if not isinstance(hist, list):
+            return []
+        # 要素の型まで守る（壊れた履歴ファイルで毎回診断が落ちるのを防ぐ）
+        return [h for h in hist if isinstance(h, dict)]
     except (OSError, ValueError):
         return []
 
@@ -3419,7 +3482,10 @@ def _load_checkup_ack(book_name):
     try:
         with open(_checkup_ack_path(book_name), 'r', encoding='utf-8') as f:
             data = json.load(f)
-        return set(data) if isinstance(data, list) else set()
+        if not isinstance(data, list):
+            return set()
+        # 文字列以外が混ざると保存時の sorted() で TypeError になるため除外
+        return set(x for x in data if isinstance(x, str))
     except (OSError, ValueError):
         return set()
 
@@ -3594,6 +3660,11 @@ def cmd_call_graph(args):
                 continue
             used.add(proc)
             used |= callees
+        # 未解決Callしか持たないマクロもノード定義に載せる（辺だけ出すと
+        # Mermaid が無ラベルの自動ノードを作り、肝心の呼び元が図から読めない）
+        for _, _proc, _n, _, _ in unresolved:
+            if _proc and _proc != '(宣言部)':
+                used.add(_proc)
         ml = [f"# {inv['name']} 呼び出し関係図", "",
               f"生成: {time.strftime('%Y-%m-%d %H:%M')}（vba_manager call-graph --mermaid）", "",
               "```mermaid", "flowchart LR"]
@@ -4529,7 +4600,12 @@ def cmd_code_replace(args):
         for i, line in enumerate(cm.Lines(1, n).split('\r\n'), 1):
             if not pat.search(line):
                 continue
-            new_line = pat.sub(repl if use_regex else repl_escaped, line)
+            try:
+                new_line = pat.sub(repl if use_regex else repl_escaped, line)
+            except re.error as e:
+                # 置換文字列側の不正（存在しないグループ参照 \1 等）。計画段階なので無傷
+                print(f"エラー: 置換文字列が不正です: {e}")
+                return False
             if new_line != line:
                 changes.append((i, line, new_line))
         if changes:
@@ -4552,7 +4628,12 @@ def cmd_code_replace(args):
     print("-" * 40)
 
     if not getattr(args, 'yes', False):
-        ans = input(f"{total_lines}行を置換しますか？ (y/N): ")
+        try:
+            ans = input(f"{total_lines}行を置換しますか？ (y/N): ")
+        except EOFError:
+            # パイプ/MCP 等の非対話環境。トレースバックでなく正常なキャンセルにする
+            print("非対話環境のため確認できません。-y を付けて実行してください。")
+            return False
         if ans.strip().lower() not in ('y', 'yes'):
             print("キャンセルされました。")
             return False
@@ -4599,6 +4680,17 @@ def _start_dialog_watcher(xl, mode):
         excel_pid = win32process.GetWindowThreadProcessId(int(xl.Hwnd))[1]
     except Exception:
         pass
+    if excel_pid is None:
+        # PID を特定できないまま監視すると、フィルタが外れて画面上の
+        # 全アプリの #32770 ダイアログにボタンを送ってしまう。
+        # フェイルセーフは「撃たない」側に倒す（自動応答は諦めて警告）
+        print("[WARNING] Excel の PID を特定できないため、ダイアログ自動応答を無効化します"
+              "（ダイアログが出た場合は手動で閉じてください）", file=sys.stderr)
+
+        class _Noop:
+            def stop(self):
+                pass
+        return _Noop()
 
     mode_l = (mode or 'ok').lower()
     # 標準ボタンID（Win32 DialogBox の既定値）。決め打ちの「望みのID」。
@@ -4752,7 +4844,10 @@ def cmd_run_macro(args):
             print(f"[DEBUG] Failed to search macro location: {ex}", file=sys.stderr)
 
         if found_wb:
-            full_macro_path = f"{found_wb}!{macro_name}"
+            # ブック名に空白等があると Application.Run はクォート必須
+            # （cmd_test と同じ流儀。' 自体は Excel 規約どおり '' に重ねる）
+            quoted_wb = found_wb.replace("'", "''")
+            full_macro_path = f"'{quoted_wb}'!{macro_name}"
             print(f"[DEBUG] Macro found in: {found_wb}", file=sys.stderr)
         else:
             print(f"[WARNING] Macro '{macro_name}' not found in open projects. Trying direct run.", file=sys.stderr)
@@ -4923,6 +5018,15 @@ def cmd_test(args):
         harness_comp.CodeModule.AddFromString(harness_code)
     except Exception as ex:
         print(f"エラー: テストハーネスの注入に失敗しました: {ex}", file=sys.stderr)
+        # Add 成功後に Name 代入や AddFromString で失敗すると、既定名（Module1等）の
+        # ゴミモジュールが残る。名前が _HARNESS でないと次回の残骸掃除にも拾われないため
+        # ここで確実に撤去する
+        if harness_comp is not None:
+            try:
+                wb.VBProject.VBComponents.Remove(harness_comp)
+            except Exception:
+                print("警告: 注入途中のモジュールを撤去できませんでした"
+                      "（既定名のモジュールが残っていたら手で削除してください）", file=sys.stderr)
         if _dlg_watcher is not None:
             _dlg_watcher.stop()
         try:
@@ -5031,6 +5135,9 @@ def _resolve_range(xl, wb, spec, sheet_name=None):
 
     if '!' in spec:
         sheet_part, addr = spec.split('!', 1)
+        # Excel の数式バー表記（'月次 集計'!A1）のクォートを剥がす（'' は ' に戻す）
+        if len(sheet_part) >= 2 and sheet_part.startswith("'") and sheet_part.endswith("'"):
+            sheet_part = sheet_part[1:-1].replace("''", "'")
         ws = wb.Sheets(sheet_part)
         if not addr:
             return ws, ws.UsedRange
@@ -5085,6 +5192,13 @@ def _cell_str(v):
         return ''
     if isinstance(v, float) and v.is_integer():
         return str(int(v))
+    if isinstance(v, datetime.datetime):
+        # pywintypes の日時は str() だと "+00:00"（TZ）が付き、TSV 往復の
+        # 書き戻しで日付がテキスト化する。素直な表記に整える
+        # （_coerce_cell がこの表記を日付として復元する＝往復が一致する）
+        if (v.hour, v.minute, v.second) == (0, 0, 0):
+            return v.strftime('%Y/%m/%d')
+        return v.strftime('%Y/%m/%d %H:%M:%S')
     return str(v)
 
 
@@ -5300,6 +5414,7 @@ def cmd_read_range(args):
             f.write('\n'.join(lines) + '\n')
         print(f"TSV書き出し: {path}  ({len(rows)}行 x {max(len(r) for r in rows)}列)")
         print(f"  編集後の書き戻し: py vba_manager.py write-range \"{ws.Name}!{_col_letter(rng.Column)}{rng.Row}\"")
+        print(f"  （\"007\" 等の先頭ゼロを数値化させたくない場合は --raw を付ける）")
     return True
 
 
@@ -5685,6 +5800,18 @@ def _coerce_cell(s):
         return None
     if s.startswith('='):
         return s                      # 数式 (.Value への代入で Excel が数式と解釈)
+    # 日付表記（_cell_str の出力と同じ形）は datetime で書き戻す。
+    # 文字列のまま .Value に入れるとテキスト格納になり、TSV 往復で日付列が壊れる
+    m = re.fullmatch(
+        r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})'
+        r'(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?', s)
+    if m:
+        try:
+            return datetime.datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4) or 0), int(m.group(5) or 0), int(m.group(6) or 0))
+        except ValueError:
+            return s                  # 2026/99/99 のような非実在日付は文字列のまま
     if re.fullmatch(r'-?\d+', s):
         try:
             return int(s)
@@ -5752,6 +5879,14 @@ def cmd_write_range(args):
             return False
         ur = ws.UsedRange
         next_row = ur.Row + ur.Rows.Count if ur is not None else 1
+        # 空シートでも UsedRange は $A$1 を返すため、そのままだと2行目から始まる
+        try:
+            if (ur is not None and ur.Rows.Count == 1 and ur.Columns.Count == 1
+                    and ur.Row == 1 and ur.Column == 1
+                    and ur.Cells(1, 1).Value is None):
+                next_row = 1
+        except Exception:
+            pass
         rng = ws.Range(f"{col_part.upper()}{next_row}")
         print(f"追記位置: {ws.Name}!{rng.Address}（使用範囲の最終行の次）")
     else:
@@ -5909,7 +6044,22 @@ def cmd_format_range(args):
     if getattr(args, 'row_height', None) is not None:
         rng.RowHeight = float(args.row_height); applied.append(f"row-height={args.row_height}")
     if getattr(args, 'merge', False):
-        rng.Merge(); applied.append("merge")
+        # 複数の値を含む範囲の Merge は Excel が確認ダイアログを出し、
+        # CLI が無言で応答待ちブロックする。値の個数を先に数えて、
+        # 消える場合は警告した上で DisplayAlerts を切って実行する（左上の値が残る）
+        n_vals = 0
+        try:
+            n_vals = int(xl.WorksheetFunction.CountA(rng))
+        except Exception:
+            pass
+        if n_vals > 1:
+            print(f"⚠ 範囲に値が{n_vals}個あります。結合により左上以外の値は消えます。")
+        xl.DisplayAlerts = False
+        try:
+            rng.Merge()
+        finally:
+            xl.DisplayAlerts = True
+        applied.append("merge")
     if getattr(args, 'unmerge', False):
         rng.UnMerge(); applied.append("unmerge")
     if getattr(args, 'autofit', False):
@@ -5952,6 +6102,9 @@ def cmd_sheet(args):
             print(f"エラー: --before のシート '{before}' が見つかりません"); return False
         if after and find_sheet(after) is None:
             print(f"エラー: --after のシート '{after}' が見つかりません"); return False
+        # 名前重複は Add 後の rename で例外→既定名シートの残骸になるため先に検証
+        if new_name and find_sheet(new_name) is not None:
+            print(f"エラー: シート '{new_name}' は既に存在します"); return False
         if before:
             sh = wb.Sheets.Add(find_sheet(before))
         elif after:
@@ -6286,6 +6439,7 @@ def cmd_table(args):
                 f.write('\n'.join('\t'.join(_cell_str(v) for v in r) for r in rows) + '\n')
             print(f"TSV書き出し: {path}  ({len(rows)}行)")
             print(f"  編集後の書き戻し: py vba_manager.py write-range \"{sh.Name}!{_col_letter(rng.Column)}{rng.Row}\"")
+            print(f"  （\"007\" 等の先頭ゼロを数値化させたくない場合は --raw を付ける）")
         return True
 
     if action == 'ref':
@@ -6473,6 +6627,13 @@ def cmd_copy_range(args):
         print(f"エラー: コピー元 '{rest[0]}' はシート '{whole}' の使用範囲全域を指します。")
         print(f"  全域が複写先を上書きする危険があるため、範囲を明示するか --whole-sheet を付けてください。")
         return False
+    # コピー先も同じガード。シート名だけ渡すと UsedRange 全域が貼り付け先になり、
+    # コピー元が単一セル等だと全域タイル上書きになる（2026-07-09 再点検で発見）
+    whole_d = _whole_sheet_spec(wb, rest[1])
+    if whole_d is not None and not getattr(args, 'whole_sheet', False):
+        print(f"エラー: コピー先 '{rest[1]}' はシート '{whole_d}' の使用範囲全域を指します。")
+        print(f"  全域がタイル状に上書きされる危険があるため、貼り付け先の左上セルを明示するか --whole-sheet を付けてください。")
+        return False
     ws_s, rng_s = _resolve_range(xl, wb, rest[0], sheet_opt)
     ws_d, rng_d = _resolve_range(xl, wb, rest[1])
     if getattr(args, 'values', False):
@@ -6554,9 +6715,17 @@ def cmd_sort(args):
 def cmd_autofilter(args):
     """オートフィルタ: autofilter [range] [--off]"""
     target_file, rest = parse_target_and_rest(args.posargs)
+    if _reject_extra_args(rest, 1, '使い方: autofilter [range] [--off]'):
+        return False
     xl, wb = get_workbook(target_file)
     if getattr(args, 'off', False):
-        ws = wb.ActiveSheet
+        # 位置引数（範囲/シート名）があればそのシートを解除対象にする。
+        # 黙って ActiveSheet に落とすと、指定したつもりの別シートでなく
+        # アクティブなシートのフィルタ（絞り込み条件ごと）が消える
+        if rest:
+            ws, _ = _resolve_range(xl, wb, rest[0])
+        else:
+            ws = wb.ActiveSheet
         if ws.AutoFilterMode:
             ws.AutoFilterMode = False
             print(f"オートフィルタ解除: {ws.Name}")
@@ -6589,7 +6758,8 @@ def cmd_find(args):
         return False
     needle = rest[0]
     xl, wb = get_workbook(target_file)
-    sheets = list(wb.Sheets) if getattr(args, 'book', False) else [wb.ActiveSheet]
+    # グラフシートには UsedRange が無く例外で検索全体が落ちるため Worksheets 限定
+    sheets = list(wb.Worksheets) if getattr(args, 'book', False) else [wb.ActiveSheet]
     look_in = -4123 if getattr(args, 'formula', False) else -4163  # xlFormulas / xlValues
     look_at = 1 if getattr(args, 'whole', False) else 2            # xlWhole / xlPart
     total = 0
@@ -6954,8 +7124,16 @@ def cmd_cond_format(args):
         print("使い方: cond-format <range> [--gt|--lt|--ge|--le|--eq|--ne 値 | --between v1 v2]")
         print("         [--bg '#RRGGBB'] [--color '#RRGGBB'] [--bold] [--clear]")
         return False
+    spec = rest[0]
+    if _reject_extra_args(rest, 1, '使い方: cond-format [excel_file] <range> [--gt 値 ...|--clear]'):
+        return False
     xl, wb = get_workbook(target_file)
-    ws, rng = _resolve_range(xl, wb, rest[0])
+    whole = _whole_sheet_spec(wb, spec)
+    if whole is not None and not getattr(args, 'whole_sheet', False):
+        print(f"エラー: '{spec}' はシート '{whole}' の使用範囲全域を指します。")
+        print(f"  範囲を明示するか、本当に全域なら --whole-sheet を付けてください。")
+        return False
+    ws, rng = _resolve_range(xl, wb, spec)
 
     if getattr(args, 'clear', False):
         rng.FormatConditions.Delete()
@@ -7017,12 +7195,18 @@ def cmd_hyperlink(args):
             want = list_opt
         elif rest:
             want = rest[0]
-        ws = wb.ActiveSheet
         if want:
+            ws = None
             for sh in wb.Worksheets:
                 if sh.Name == want:
                     ws = sh
                     break
+            if ws is None:
+                # 黙ってアクティブシートに落とすと「指定シートは0件」と誤読される
+                print(f"エラー: シート '{want}' が見つかりません")
+                return False
+        else:
+            ws = wb.ActiveSheet
         cnt = ws.Hyperlinks.Count
         print(f"--- {ws.Name} のハイパーリンク（{cnt}件） ---")
         for i in range(1, cnt + 1):
@@ -7041,6 +7225,13 @@ def cmd_hyperlink(args):
         print("       hyperlink <cell> --remove   # 削除")
         print("       hyperlink --list [シート名]  # シート内の全リンク一覧")
         return False
+    if getattr(args, 'remove', False):
+        # シート名だけの指定は使用範囲全域のリンク一括削除（書式も戻る）になるためガード
+        whole = _whole_sheet_spec(wb, rest[0])
+        if whole is not None and not getattr(args, 'whole_sheet', False):
+            print(f"エラー: '{rest[0]}' はシート '{whole}' の使用範囲全域を指します。")
+            print(f"  セル/範囲を明示するか、全リンクを消すなら --whole-sheet を付けてください。")
+            return False
     ws, rng = _resolve_range(xl, wb, rest[0])
     if getattr(args, 'remove', False):
         rng.Hyperlinks.Delete()
@@ -7075,7 +7266,16 @@ def cmd_validation(args):
     if not rest:
         print("使い方: validation <range> --list 'A,B,C'  /  validation <range> --clear")
         return False
+    if _reject_extra_args(rest, 1, "使い方: validation <range> --list 'A,B,C'  /  validation <range> --clear"):
+        return False
     xl, wb = get_workbook(target_file)
+    # --clear も設定パス（先に既存規則を Delete する）も破壊的なので、
+    # シート名だけの指定＝使用範囲全域は明示なしでは拒否する
+    whole = _whole_sheet_spec(wb, rest[0])
+    if whole is not None and not getattr(args, 'whole_sheet', False):
+        print(f"エラー: '{rest[0]}' はシート '{whole}' の使用範囲全域を指します。")
+        print(f"  範囲を明示するか、本当に全域なら --whole-sheet を付けてください。")
+        return False
     ws, rng = _resolve_range(xl, wb, rest[0])
     if getattr(args, 'clear', False):
         rng.Validation.Delete()
@@ -7121,6 +7321,12 @@ def cmd_comment(args):
         print("使い方: comment <cell> <text>  /  comment <cell> --remove")
         return False
     xl, wb = get_workbook(target_file)
+    # シート名だけの指定は使用範囲の左上（A1とは限らない）に黙って命中するため拒否
+    whole = _whole_sheet_spec(wb, rest[0])
+    if whole is not None:
+        print(f"エラー: '{rest[0]}' はセルではなくシート '{whole}' を指します。"
+              f"セルを明示してください（例: {whole}!A1）")
+        return False
     ws, rng = _resolve_range(xl, wb, rest[0])
     cell = rng.Cells(1, 1)
     if getattr(args, 'remove', False):
@@ -7579,6 +7785,7 @@ def cmd_pivot(args):
         # 出力先の決定: --sheet > --at > 新規シート
         sheet_opt = getattr(args, 'sheet', None)
         at = getattr(args, 'at', None)
+        created_sheet = None      # このコマンドが新規に作ったシート（失敗時の後始末用）
         if sheet_opt:
             dws = None
             for sh in wb.Sheets:
@@ -7587,40 +7794,64 @@ def cmd_pivot(args):
             if dws is None:
                 dws = wb.Sheets.Add(None, wb.Sheets(wb.Sheets.Count))
                 dws.Name = sheet_opt
+                created_sheet = dws
             dest = dws.Range("A3")
         elif at:
             dest = ws_s.Range(at)
         else:
             dws = wb.Sheets.Add(None, wb.Sheets(wb.Sheets.Count))
             dws.Name = _unique_sheet_name(wb, "ピボット")
+            created_sheet = dws
             dest = dws.Range("A3")
 
-        pc = wb.PivotCaches().Create(1, rng)        # xlDatabase=1
-        name = getattr(args, 'name', None)
-        if name:
-            pt = pc.CreatePivotTable(dest, name)
-        else:
-            pt = pc.CreatePivotTable(dest)
-
-        def set_fields(spec, orient):
-            if not spec:
-                return
-            for f in spec.split(','):
-                f = f.strip()
-                if f:
-                    pt.PivotFields(f).Orientation = orient
-
-        set_fields(getattr(args, 'rows', None), 1)   # xlRowField
-        set_fields(getattr(args, 'cols', None), 2)   # xlColumnField
-
+        pt = None
         funcname = (getattr(args, 'func', None) or 'sum').lower()
-        func = _XL_PIVOT_FUNC.get(funcname, -4157)
         values = getattr(args, 'values', None)
-        if values:
-            for f in values.split(','):
-                f = f.strip()
-                if f:
-                    df = pt.AddDataField(pt.PivotFields(f), f"{funcname}/{f}", func)
+        try:
+            pc = wb.PivotCaches().Create(1, rng)        # xlDatabase=1
+            name = getattr(args, 'name', None)
+            if name:
+                pt = pc.CreatePivotTable(dest, name)
+            else:
+                pt = pc.CreatePivotTable(dest)
+
+            def set_fields(spec, orient):
+                if not spec:
+                    return
+                for f in spec.split(','):
+                    f = f.strip()
+                    if f:
+                        pt.PivotFields(f).Orientation = orient
+
+            set_fields(getattr(args, 'rows', None), 1)   # xlRowField
+            set_fields(getattr(args, 'cols', None), 2)   # xlColumnField
+
+            func = _XL_PIVOT_FUNC.get(funcname, -4157)
+            if values:
+                for f in values.split(','):
+                    f = f.strip()
+                    if f:
+                        df = pt.AddDataField(pt.PivotFields(f), f"{funcname}/{f}", func)
+        except Exception as ex:
+            # 存在しないフィールド名等で途中失敗すると、追加した新規シートと
+            # 空ピボットが残骸として残り、再実行のたび「ピボット2/3…」と増殖する。
+            # このコマンドが作ったものだけ片づける（既存シートは消さない）
+            print(f"エラー: ピボット作成に失敗しました: {ex}")
+            print("  --rows/--cols/--values のフィールド名がデータ範囲の見出しと一致しているか確認してください。")
+            try:
+                if created_sheet is not None:
+                    xl.DisplayAlerts = False
+                    try:
+                        created_sheet.Delete()
+                    finally:
+                        xl.DisplayAlerts = True
+                    print(f"  作成途中のシートは片づけました。")
+                elif pt is not None:
+                    pt.TableRange2.Clear()
+                    print(f"  作成途中の空ピボットは片づけました。")
+            except Exception:
+                pass
+            return False
 
         print(f"ピボット作成: [{pt.Parent.Name}] {pt.Name}  ソース={ws_s.Name}!{rng.Address}")
         print(f"  行={getattr(args,'rows',None) or '-'}  列={getattr(args,'cols',None) or '-'}  "
@@ -7982,9 +8213,8 @@ def cmd_slicer(args):
             print(f"エラー: ピボット/テーブル '{src_name}' が見つかりません")
             return False
 
-        sc = wb.SlicerCaches.Add2(src, field)
-
-        # 配置先シートと座標
+        # 配置先の座標を先に解決する（Add2 の後に --at が不正で例外になると、
+        # スライサー本体のない SlicerCache だけが孤児としてブックに残るため）
         at = getattr(args, 'at', None)
         dws = sh
         if at:
@@ -7992,6 +8222,8 @@ def cmd_slicer(args):
             top, left = anchor.Top, anchor.Left
         else:
             top, left = 10.0, 400.0
+
+        sc = wb.SlicerCaches.Add2(src, field)
         sl = sc.Slicers.Add(SlicerDestination=dws, Caption=field,
                             Top=top, Left=left, Width=144.0, Height=180.0)
         # Slicers.Add の Name 引数は効かないことがあるので作成後に明示セット
@@ -8878,6 +9110,8 @@ def build_parser():
     # reorder-macro <macro_name> <up|down>
     p = sub.add_parser("reorder-macro")
     p.add_argument("posargs", nargs="+")
+    p.add_argument("--force", action="store_true",
+                   help="バックアップが取れなくても実行する（未保存の新規ブック等）")
 
     # --- 目コマンド ---
     # read-range [excel_file] [range ...] [--formula] [--tsv [f]] [--width N] [--json]
@@ -9084,16 +9318,22 @@ def build_parser():
     p.add_argument("--bg"); p.add_argument("--color")
     p.add_argument("--bold", action="store_true")
     p.add_argument("--clear", action="store_true", help="条件付き書式を全削除")
+    p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
+                   help="シート全域（シート名だけの指定）を明示的に許可する")
     p = sub.add_parser("hyperlink")    # hyperlink <cell> <url> [--text t] / --remove / --list
     p.add_argument("posargs", nargs="*")
     p.add_argument("--text", help="表示文字")
     p.add_argument("--remove", action="store_true", help="ハイパーリンク削除")
     p.add_argument("--list", dest="list_links", nargs="?", const="__ACTIVE__", default=None,
                    help="シート内の全ハイパーリンクを一覧（--list シート名 で対象指定）")
+    p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
+                   help="--remove でシート全域（シート名だけの指定）を明示的に許可する")
     p = sub.add_parser("validation")   # validation <range> --list 'A,B,C' / --clear
     p.add_argument("posargs", nargs="*")
     p.add_argument("--list", help="ドロップダウン候補（カンマ区切り）")
     p.add_argument("--clear", action="store_true", help="入力規則を削除")
+    p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
+                   help="シート全域（シート名だけの指定）を明示的に許可する")
     p = sub.add_parser("freeze")       # freeze <cell> / freeze off
     p.add_argument("posargs", nargs="*")
     p = sub.add_parser("comment")      # comment <cell> <text> / --remove
@@ -9263,6 +9503,9 @@ def cmd_batch(args):
             lex = shlex.shlex(line, posix=True)
             lex.whitespace_split = True
             lex.escape = ''
+            # shlex 既定のコメント文字 '#' を無効化。行頭 # は上で処理済みで、
+            # 行中の # を生かすと「テスト#1」「--bg #FF0000」の # 以降が黙って消える
+            lex.commenters = ''
             tokens = list(lex)
         except ValueError as e:
             print(f"[batch:{lineno}] 引数の解析に失敗: {e}")
@@ -9285,7 +9528,7 @@ def cmd_batch(args):
                 continue
             print("[batch] 停止（--keep-going で続行可）")
             return False
-        if not sub_args.command or sub_args.command == 'batch':
+        if not sub_args.command or sub_args.command in ('batch', 'shell'):
             print(f"[batch:{lineno}] このコマンドは batch 内で実行できません")
             if keep_going:
                 continue
@@ -9368,6 +9611,7 @@ def cmd_shell(args):
             lex = shlex.shlex(line, posix=True)
             lex.whitespace_split = True
             lex.escape = ''                      # Windows パスの \ をエスケープ扱いしない
+            lex.commenters = ''                  # 行中の # をコメント扱いしない（#FF0000 等が消える）
             tokens = list(lex)
         except ValueError as e:
             print(f"引数の解析に失敗: {e}")
