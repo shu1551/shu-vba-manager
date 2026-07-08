@@ -4768,6 +4768,190 @@ def cmd_run_macro(args):
             pass
 
 
+def _com_error_text(e):
+    """COM例外からVBAエラーの説明文を取り出す（取れなければ str(e)）"""
+    try:
+        info = getattr(e, 'excepinfo', None)
+        if info and len(info) > 2 and info[2]:
+            return str(info[2]).strip()
+    except Exception:
+        pass
+    return str(e)
+
+
+def cmd_test(args):
+    """VBAテストランナー: test [excel_file] [絞り込み] [--module 名] [--auto-dialog ok] [--json]
+
+    名前が「テスト」または「test」で始まる**引数なしの公開 Sub** を、
+    開いたままのブックの中で1本ずつ実行し、成功/失敗を一覧で返す。
+    テスト側の作法はただ一つ「失敗は Err.Raise で知らせる」
+    （assert は VBA の  If 実際 <> 期待 Then Err.Raise 5, , "説明"  で書く）。
+    補助モジュール不要＝テストも単体で他ブックに移植できる自立ユニット。
+    実行はエラー捕捉ハーネス（一時モジュールを注入→Run→撤去）経由。
+    テスト内の実行時エラーは VBA 側の On Error が受けるので、
+    「Microsoft Visual Basic 実行時エラー」ダイアログは出ない。
+    xlflow のテスト基盤とエラー割り込みの発想だけ移植し、ビルドせず相乗りのまま回す。
+    全部成功なら終了コード0、1本でも失敗なら1（自動化ゲートにそのまま使える）。
+    """
+    import time as _time
+    target_file, rest = parse_target_and_rest(args.posargs)
+    keyword = rest[0] if rest else None
+    if _reject_extra_args(rest, 1 if keyword else 0,
+                          '使い方: test [excel_file] [絞り込み] [--module 名] [--auto-dialog ok] [--json]'):
+        return False
+
+    xl, wb = get_workbook(target_file)
+
+    # 引数なしの公開 Sub だけを対象にする（Private/Friend/Function/引数つきは対象外）
+    sub_pattern = re.compile(
+        r'^\s*(?:Public\s+)?(?:Static\s+)?Sub\s+([^\s\(\)]+)\s*\(\s*\)',
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    module_filter = getattr(args, 'module', None)
+    tests = []          # (モジュール名, Sub名)
+    scanned_modules = 0
+    try:
+        for comp in wb.VBProject.VBComponents:
+            if comp.Type != 1:          # 標準モジュールのみ（Runで呼べる場所）
+                continue
+            if module_filter and comp.Name.lower() != module_filter.lower():
+                continue
+            scanned_modules += 1
+            cm = comp.CodeModule
+            if cm.CountOfLines == 0:
+                continue
+            code = cm.Lines(1, cm.CountOfLines)
+            for m in sub_pattern.finditer(code):
+                name = m.group(1)
+                if not (name.startswith('テスト') or name.lower().startswith('test')):
+                    continue
+                if keyword and keyword.lower() not in name.lower():
+                    continue
+                tests.append((comp.Name, name))
+    except Exception as ex:
+        print(f"エラー: VBAプロジェクトの走査に失敗しました: {ex}", file=sys.stderr)
+        return False
+
+    if not tests:
+        where = f"モジュール '{module_filter}'" if module_filter else f"標準モジュール {scanned_modules} 本"
+        print(f"テストが見つかりません（{where} を走査）。")
+        print("  名前が「テスト」または「test」で始まる引数なしの Sub がテストとして拾われます。")
+        print("  例: Sub テスト加算()  /  失敗は  Err.Raise 5, , \"期待3 実際=\" & 結果  で知らせる。")
+        return False
+
+    print(f"テスト実行: {wb.Name}  （{len(tests)}本）")
+    print("-" * 60)
+
+    # ダイアログ自動応答（テスト中の MsgBox で止まらないように）
+    _dlg_watcher = None
+    _auto_dialog = getattr(args, 'auto_dialog', None)
+    if _auto_dialog:
+        _dlg_watcher = _start_dialog_watcher(xl, _auto_dialog)
+
+    try:
+        xl.DisplayAlerts = False
+    except Exception:
+        pass
+
+    # エラー捕捉ハーネスを一時モジュールとして注入する。
+    # 直接 Application.Run すると、テスト内の実行時エラー（Err.Raise 含む）は
+    # COM例外にならず「Microsoft Visual Basic 実行時エラー」ダイアログで停止する
+    # （実弾で確認済み・618秒ハングの正体）。さらに「VBA側で Application.Run を
+    # 経由して呼ぶ」形も、Run の先のエラーが呼び元の On Error に届かず同じ結果に
+    # なった（231秒・実測）。だからテストごとに**直接呼び出す**ラッパー関数を
+    # 機械生成して注入する＝通常の呼び出しスタックなので On Error が確実に効き、
+    # ダイアログは一切出ない。注入→Run→撤去の3ステップ、ブックは保存しない。
+    _HARNESS = "VbaManagerTestHarness"
+    lines = []
+    for i, (mod_name, sub_name) in enumerate(tests, 1):
+        lines += [
+            f"Function VMT_{i}() As String",
+            "    On Error GoTo eh",
+            f"    {mod_name}.{sub_name}",
+            f"    VMT_{i} = \"OK\"",
+            "    Exit Function",
+            "eh:",
+            f"    VMT_{i} = \"ERR|\" & Err.Number & \"|\" & Err.Description",
+            "End Function",
+            "",
+        ]
+    harness_code = "\r\n".join(lines) + "\r\n"
+    harness_comp = None
+    try:
+        # 前回の残骸があれば先に撤去
+        for c in wb.VBProject.VBComponents:
+            if c.Name == _HARNESS:
+                wb.VBProject.VBComponents.Remove(c)
+                break
+        harness_comp = wb.VBProject.VBComponents.Add(1)
+        harness_comp.Name = _HARNESS
+        harness_comp.CodeModule.AddFromString(harness_code)
+    except Exception as ex:
+        print(f"エラー: テストハーネスの注入に失敗しました: {ex}", file=sys.stderr)
+        if _dlg_watcher is not None:
+            _dlg_watcher.stop()
+        try:
+            xl.DisplayAlerts = True
+        except Exception:
+            pass
+        return False
+
+    results = []
+    try:
+        for i, (mod_name, sub_name) in enumerate(tests, 1):
+            t0 = _time.time()
+            try:
+                ret = xl.Application.Run(f"'{wb.Name}'!{_HARNESS}.VMT_{i}")
+                sec = _time.time() - t0
+                ret = str(ret) if ret is not None else ""
+                if ret == "OK":
+                    results.append({"module": mod_name, "name": sub_name,
+                                    "ok": True, "seconds": round(sec, 2), "error": None})
+                    print(f"○ {sub_name}  [{mod_name}]  ({sec:.2f}秒)")
+                else:
+                    parts = ret.split("|", 2)
+                    err = (f"実行時エラー {parts[1]}: {parts[2]}"
+                           if len(parts) == 3 else (ret or "不明なエラー"))
+                    results.append({"module": mod_name, "name": sub_name,
+                                    "ok": False, "seconds": round(sec, 2), "error": err})
+                    print(f"✗ {sub_name}  [{mod_name}]  ({sec:.2f}秒)")
+                    print(f"    {err}")
+            except Exception as e:
+                sec = _time.time() - t0
+                err = _com_error_text(e)
+                results.append({"module": mod_name, "name": sub_name,
+                                "ok": False, "seconds": round(sec, 2), "error": err})
+                print(f"✗ {sub_name}  [{mod_name}]  ({sec:.2f}秒)")
+                print(f"    {err}")
+    finally:
+        if harness_comp is not None:
+            try:
+                wb.VBProject.VBComponents.Remove(harness_comp)
+            except Exception:
+                print("警告: テストハーネスの撤去に失敗しました（モジュール "
+                      f"'{_HARNESS}' が残っていたら手で削除してください）", file=sys.stderr)
+        if _dlg_watcher is not None:
+            _dlg_watcher.stop()
+        # 戻さないとユーザーの Excel セッションに DisplayAlerts=False が残る
+        try:
+            xl.DisplayAlerts = True
+        except Exception:
+            pass
+
+    ok_count = sum(1 for r in results if r["ok"])
+    print("-" * 60)
+    print(f"結果: {ok_count}/{len(results)} 成功" + ("" if ok_count == len(results) else f"  （失敗 {len(results) - ok_count}）"))
+
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"success": ok_count == len(results), "book": wb.Name,
+                          "total": len(results), "passed": ok_count,
+                          "tests": results}, ensure_ascii=False), file=sys.stdout)
+
+    return ok_count == len(results)
+
+
 # ================================================================
 # 「目」コマンド (シート状態の読み取り)
 # ================================================================
@@ -8599,6 +8783,15 @@ def build_parser():
     p.add_argument("--auto-dialog", dest="auto_dialog", default=None,
                    help="実行中に出るMsgBox/InputBoxを自動応答 ok|cancel|yes|no（既定は応答しない）")
 
+    # test [excel_file] [絞り込み] [--module 名] [--auto-dialog ok] [--json]
+    p = sub.add_parser("test", aliases=["テスト"],
+                       help="テストSub（名前が「テスト」/test で始まる引数なしSub）を一括実行して成否一覧")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--module", dest="module", default=None, help="対象モジュールを限定")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式でも出力")
+    p.add_argument("--auto-dialog", dest="auto_dialog", default=None,
+                   help="テスト中に出るMsgBox等を自動応答 ok|cancel|yes|no")
+
     # replace-module [excel_file] <module_name> <bas_file>
     p = sub.add_parser("replace-module")
     p.add_argument("posargs", nargs="+")
@@ -9156,6 +9349,8 @@ def _command_table():
         "call-graph":        cmd_call_graph,
         "checkup":           cmd_checkup,
         "健康診断":            cmd_checkup,
+        "test":              cmd_test,
+        "テスト":              cmd_test,
         "impact":            cmd_impact,
         "影響範囲":            cmd_impact,
         "replace-module":    cmd_replace_module,
