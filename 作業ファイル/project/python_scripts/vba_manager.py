@@ -89,6 +89,12 @@ XL_EXTS     = ('.xlsm', '.xlam', '.xlsx', '.xls', '.xlsb')
 # ユーティリティ
 # ================================================================
 
+# このツールが自動起動した Excel インスタンスの記録。
+# batch/shell で「未起動の別ファイル」を複数触ると DispatchEx が複数走るため、
+# スカラー1個だと最後の1台しか始末できずゾンビが残る（2026-07-09 点検で発見）。
+# 起動した全台を積んで、cleanup_excel で全部閉じる。
+_created_instances = []          # [{"xl": <COM>, "pid": int|None}, ...]
+# 後方互換の別名（コード内の他参照・デバッグ表示用に「最後の1台」を指す）
 _created_xl = None
 _created_xl_pid = None
 
@@ -149,62 +155,67 @@ def parse_target_and_rest(posargs):
 
 
 def cleanup_excel():
-    """新規起動されたExcelインスタンスがあれば終了し、COMを初期化解除する"""
-    global _created_xl, _created_xl_pid
+    """新規起動されたExcelインスタンスがあれば（複数でも）全て終了し、COMを初期化解除する"""
+    global _created_instances, _created_xl, _created_xl_pid
     import gc
     import os
     import signal
     # 自動起動したインスタンスが無ければ何もしない回なので、DEBUG も出さない
     # （全コマンドの末尾に毎回2行のノイズが出ていた）
-    if _created_xl is not None or _created_xl_pid is not None:
-        print(f"[DEBUG] cleanup_excel called. _created_xl is: {_created_xl}, PID is: {_created_xl_pid}")
+    if _created_instances:
+        print(f"[DEBUG] cleanup_excel called. instances: {len(_created_instances)}")
 
     # Python側のCOM参照を解放するためにGCを強制実行
     gc.collect()
-    
-    if _created_xl is not None:
-        try:
-            print("[DEBUG] Closing open workbooks...")
+
+    for inst in _created_instances:
+        xl = inst.get("xl")
+        pid = inst.get("pid")
+        if xl is not None:
             try:
-                # 切断エラーを回避しつつ、逆順にブックを閉じる
-                wbs = _created_xl.Workbooks
-                for i in range(wbs.Count, 0, -1):
-                    try:
-                        wb = wbs.Item(i)
-                        name = wb.Name
+                print("[DEBUG] Closing open workbooks...")
+                try:
+                    # 切断エラーを回避しつつ、逆順にブックを閉じる
+                    wbs = xl.Workbooks
+                    for i in range(wbs.Count, 0, -1):
                         try:
-                            if not wb.Saved:
-                                # 自動起動経路では閉じる＝未保存変更の破棄。無言だと
-                                # 「書いたつもりが消えていた」になるため明示する
-                                print(f"⚠ 未保存の変更を破棄して閉じます: {name}")
-                                print("  （保存したい場合は同じ batch 内で save を実行するか、"
-                                      "Excel を先に起動してから作業してください）")
-                        except Exception:
-                            pass
-                        wb.Close(SaveChanges=False)
-                        print(f"[DEBUG] Workbook closed: {name}")
-                    except Exception as ex:
-                        print(f"[DEBUG] Failed to close wb {i}: {ex}")
+                            wb = wbs.Item(i)
+                            name = wb.Name
+                            try:
+                                if not wb.Saved:
+                                    # 自動起動経路では閉じる＝未保存変更の破棄。無言だと
+                                    # 「書いたつもりが消えていた」になるため明示する
+                                    print(f"⚠ 未保存の変更を破棄して閉じます: {name}")
+                                    print("  （保存したい場合は同じ batch 内で save を実行するか、"
+                                          "Excel を先に起動してから作業してください）")
+                            except Exception:
+                                pass
+                            wb.Close(SaveChanges=False)
+                            print(f"[DEBUG] Workbook closed: {name}")
+                        except Exception as ex:
+                            print(f"[DEBUG] Failed to close wb {i}: {ex}")
+                except Exception as ex:
+                    print(f"[DEBUG] Failed to access Workbooks: {ex}")
+
+                print("[DEBUG] Calling xl.Quit()...")
+                xl.Quit()
+                print("[DEBUG] xl.Quit() completed.")
             except Exception as ex:
-                print(f"[DEBUG] Failed to access Workbooks: {ex}")
-            
-            print("[DEBUG] Calling xl.Quit()...")
-            _created_xl.Quit()
-            print("[DEBUG] xl.Quit() completed.")
-        except Exception as ex:
-            print(f"[DEBUG] Error during Excel cleanup: {ex}")
-        _created_xl = None
-    
-    # 新規起動したPIDが存在する場合は強制クリーンアップ
-    if _created_xl_pid is not None:
-        try:
-            print(f"[DEBUG] Force-killing Excel process (PID: {_created_xl_pid})...")
-            os.kill(_created_xl_pid, signal.SIGTERM)
-            print("[DEBUG] Excel process force-killed successfully.")
-        except Exception as ex:
-            print(f"[DEBUG] Excel process force-kill failed or already exited: {ex}")
-        _created_xl_pid = None
-        
+                print(f"[DEBUG] Error during Excel cleanup: {ex}")
+
+        # 新規起動したPIDが存在する場合は強制クリーンアップ
+        if pid is not None:
+            try:
+                print(f"[DEBUG] Force-killing Excel process (PID: {pid})...")
+                os.kill(pid, signal.SIGTERM)
+                print("[DEBUG] Excel process force-killed successfully.")
+            except Exception as ex:
+                print(f"[DEBUG] Excel process force-kill failed or already exited: {ex}")
+
+    _created_instances = []
+    _created_xl = None
+    _created_xl_pid = None
+
     # 最後の解放
     gc.collect()
     try:
@@ -478,6 +489,8 @@ def _get_workbook_uncached(target_file_arg=None, load_addins=False, readonly=Fal
     except Exception as ex:
         _created_xl_pid = None
         print(f"[DEBUG] Failed to detect Excel PID: {ex}")
+    # 起動した全台を記録（batch/shell で複数起動しても cleanup で全部閉じるため）
+    _created_instances.append({"xl": xl, "pid": _created_xl_pid})
     xl.Visible = "--visible" in sys.argv or "-v" in sys.argv
 
     if load_addins:
@@ -2425,25 +2438,46 @@ def cmd_reorder_macro(args):
     with open(tmp_bas, 'wb') as f:
         f.write(new_text.encode('cp932'))
 
-    make_backup(wb.FullName, f"reorder_{macro_name}")
+    # 破壊操作（Remove+Import）なので他コマンドと同じくバックアップ必須。
+    # 取れなければ停止（--force で強行）
+    if make_backup(wb.FullName, f"reorder_{macro_name}") is None and not getattr(args, 'force', False):
+        print("エラー: バックアップが取れなかったため中止しました（--force で強行可能）")
+        return False
     print(f"並べ替え中: [{module_name}] '{macro_name}' を {direction}")
 
     # replace-module と同じ安定化手順（sleep + PumpWaitingMessages）に揃える
     xl.DisplayAlerts = False
+    removed = False
+    success = False
     try:
         wb.Save()
         time.sleep(0.5)
         pythoncom.PumpWaitingMessages()
         wb.VBProject.VBComponents.Remove(target_comp)
+        removed = True
         time.sleep(1.5)
         pythoncom.PumpWaitingMessages()
         wb.VBProject.VBComponents.Import(tmp_bas)
         time.sleep(1.5)
         pythoncom.PumpWaitingMessages()
         wb.Save()
+        success = True
+    except Exception as ex:
+        # Remove 成功後に Import が失敗するとモジュールが消えたままになる。
+        # ディスクは Remove 前の Save 状態なので、保存せず開き直せば戻る旨を必ず案内する
+        if removed:
+            print(f"エラー: 並べ替え中に失敗しました（モジュール '{module_name}' が"
+                  f"開いているブックから外れた可能性があります）: {ex}", file=sys.stderr)
+            print(f"  復旧: このブックを保存せずに閉じて開き直すか、"
+                  f"バックアップから restore してください。", file=sys.stderr)
+            print(f"  並べ替え後のコードは残してあります: {tmp_bas}", file=sys.stderr)
+        else:
+            print(f"エラー: 並べ替えに失敗しました: {ex}", file=sys.stderr)
+        return False
     finally:
         xl.DisplayAlerts = True
-        if os.path.exists(tmp_bas):
+        # 「Remove 済みで Import 失敗」のときだけ復旧用に残し、それ以外は掃除する
+        if not (removed and not success) and os.path.exists(tmp_bas):
             _remove_export_artifacts(tmp_bas)
 
     print(f"完了: [{module_name}] '{macro_name}' を {direction}に移動")
@@ -5827,8 +5861,17 @@ def cmd_format_range(args):
         print("  --col-width N --row-height N --merge --unmerge --autofit")
         return False
     spec = rest[0]
+    if _reject_extra_args(rest, 1, '使い方: format-range [excel_file] <range> [オプション...]'):
+        return False
     xl, wb = get_workbook(target_file)
-    ws, rng = _resolve_range(xl, wb, spec, getattr(args, 'sheet_opt', None))
+    sheet_opt = getattr(args, 'sheet_opt', None)
+    whole = _whole_sheet_spec(wb, spec, sheet_opt)
+    if whole is not None and not getattr(args, 'whole_sheet', False):
+        print(f"エラー: '{spec}' はシート '{whole}' の使用範囲全域を指します。")
+        print(f"  全域が同じ書式で塗られ、--merge 併用なら全域結合で値が消える危険があります。")
+        print(f"  範囲を明示するか、本当に全域なら --whole-sheet を付けてください。")
+        return False
+    ws, rng = _resolve_range(xl, wb, spec, sheet_opt)
     applied = []
 
     if getattr(args, 'font', None):
@@ -6421,13 +6464,27 @@ def cmd_copy_range(args):
     if len(rest) < 2:
         print("使い方: copy-range <src> <dst> [--values]")
         return False
+    if _reject_extra_args(rest, 2, '使い方: copy-range <src> <dst> [--values]'):
+        return False
     xl, wb = get_workbook(target_file)
-    ws_s, rng_s = _resolve_range(xl, wb, rest[0])
+    sheet_opt = getattr(args, 'sheet_opt', None)
+    whole = _whole_sheet_spec(wb, rest[0], sheet_opt)
+    if whole is not None and not getattr(args, 'whole_sheet', False):
+        print(f"エラー: コピー元 '{rest[0]}' はシート '{whole}' の使用範囲全域を指します。")
+        print(f"  全域が複写先を上書きする危険があるため、範囲を明示するか --whole-sheet を付けてください。")
+        return False
+    ws_s, rng_s = _resolve_range(xl, wb, rest[0], sheet_opt)
     ws_d, rng_d = _resolve_range(xl, wb, rest[1])
     if getattr(args, 'values', False):
-        rng_s.Copy()
-        rng_d.PasteSpecial(-4163)          # xlPasteValues
-        xl.CutCopyMode = False
+        try:
+            rng_s.Copy()
+            rng_d.PasteSpecial(-4163)          # xlPasteValues
+        finally:
+            # 失敗しても Excel にコピーの点線（CutCopyMode）を残さない
+            try:
+                xl.CutCopyMode = False
+            except Exception:
+                pass
         print(f"コピー(値のみ): {ws_s.Name}!{rng_s.Address} → {ws_d.Name}!{rng_d.Address}")
     else:
         rng_s.Copy(rng_d)
@@ -6512,7 +6569,11 @@ def cmd_autofilter(args):
     if ws.AutoFilterMode:
         print(f"既にオートフィルタが設定されています: {ws.Name}")
     else:
-        rng.AutoFilter()
+        # win32com の遅延バインディングでは引数なし rng.AutoFilter() が
+        # 「AutoFilter メソッドが失敗しました」で落ちる（全省略可能引数を省くとCOMが弾く）。
+        # Field:=1 だけ渡すと Criteria なし＝どの列も絞り込まずに範囲全体へフィルタUIを付ける
+        # ＝引数なしと同じ「オートフィルタON」になる（実弾で確認済み）。
+        rng.AutoFilter(1)
         print(f"オートフィルタ設定: {ws.Name}!{rng.Address}")
         print("（保存はしていません）")
     return True
@@ -8909,6 +8970,8 @@ def build_parser():
     p.add_argument("--unlock", action="store_true", help="セルのロック解除（保護中も編集可に）")
     p.add_argument("--sheet", dest="sheet_opt", default=None,
                    help="対象シート名（rangeと分離指定）")
+    p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
+                   help="シート名だけの指定（使用範囲全域）を許可する")
 
     # sheet [excel_file] <add|delete|rename|copy|activate|show|hide> ...
     p = sub.add_parser("sheet")
@@ -8944,6 +9007,10 @@ def build_parser():
     p = sub.add_parser("copy-range")   # copy-range <src> <dst> [--values]
     p.add_argument("posargs", nargs="*")
     p.add_argument("--values", action="store_true", help="値のみ貼り付け")
+    p.add_argument("--sheet", dest="sheet_opt", default=None,
+                   help="コピー元シート名（srcと分離指定）")
+    p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
+                   help="コピー元にシート名だけ（使用範囲全域）を許可する")
     p = sub.add_parser("fill")         # fill <range> [--right]
     p.add_argument("posargs", nargs="*")
     p.add_argument("--right", action="store_true", help="右方向にフィル（既定は下）")
