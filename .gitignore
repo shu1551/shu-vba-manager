@@ -19,6 +19,11 @@ backups/
 _wheel_dump/
 *.backup_*
 *.bak
+*.bak_*
+
+# checkup（健康診断）の出力・カルテ履歴（実行のたびに再生成される）
+_last_checkup.md
+作業ファイル/project/python_scripts/_checkup_history/
 
 # =============================================================================
 # 旧版 VBA バックアップ（ホイールフック等の廃止コード含む）
