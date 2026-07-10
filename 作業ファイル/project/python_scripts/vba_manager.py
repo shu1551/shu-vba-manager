@@ -6127,6 +6127,7 @@ def cmd_wiring(args):
     VBA に触れないブック（保護/VBOM未信頼）でも配線一覧だけは出す（実在確認のみ縮退）。
     別ブック修飾（'秀.xlam'!マクロ 等）の配線は名簿の外＝実在確認せず「外部ブック先」として
     別枠で表示し、壊れた配線には数えない（このブックの名簿で×を付けると誤検出になる）。
+    終了コード: テキスト表示は壊れた配線ありで 1（lint 型）。--json は常に 0（broken が判定を運ぶ）。
     """
     import json
     target_file, _ = parse_target_and_rest(args.posargs)
@@ -6188,7 +6189,9 @@ def cmd_wiring(args):
                           "wires": rows, "broken": len(broken),
                           "external": len(external)},
                          ensure_ascii=False))
-        return not broken
+        # JSON では broken フィールドが判定を運ぶ。ここで exit 1 にすると
+        # success:true の JSON に MCP が「失敗しました」を付けて食い違う
+        return True
 
     def label(r):
         t = f"「{str(r['text'])[:30]}」" if r['text'] else ""
