@@ -440,3 +440,84 @@ def test_validate_vba_code_single_line_sub():
     assert vm.validate_vba_code('Sub y()\n    s = "a:b"\nEnd Sub\n') is True
     # 本当に対応が取れていないものは引き続き検出する
     assert vm.validate_vba_code('Sub z()\n', force=False) is False
+
+
+# ================================================================
+# 2026-07-10 総点検の回帰テスト
+# ================================================================
+
+def test_parse_module_blocks_one_liner_and_property():
+    # 1行完結 Sub（＋随伴Attribute）が次のプロシージャを巻き込まないこと
+    bas = ('Attribute VB_Name = "M"\r\n'
+           'Sub S1(): Call Main: End Sub\r\n'
+           'Attribute S1.VB_ProcData.VB_Invoke_Func = "q\\n14"\r\n'
+           'Sub Main()\r\n'
+           'End Sub\r\n'
+           'Property Get V() As Long\r\n'
+           '    V = 1\r\n'
+           'End Property\r\n'
+           'Sub Last()\r\n'
+           'End Sub\r\n')
+    header, blocks, trailing = vm._parse_module_blocks(bas)
+    assert [b['name'] for b in blocks] == ['S1', 'Main', 'V', 'Last']
+    assert [b['kind'] for b in blocks] == ['sub', 'sub', 'property get', 'sub']
+    assert any('VB_Invoke_Func' in ln for ln in blocks[0]['lines'])
+    assert vm._write_module(header, blocks, trailing) == bas
+
+
+def test_analyze_calls_run_module_qualified_resolves():
+    # Application.Run "モジュール名.マクロ名" が未解決（C判定）に落ちないこと
+    inv = {'modules': [
+        _mod('M1', 1, 'Sub A()\r\n    Application.Run "M2.B"\r\nEnd Sub\r\n',
+             [{'name': 'A', 'lines': 3}]),
+        _mod('M2', 1, 'Sub B()\r\nEnd Sub\r\n', [{'name': 'B', 'lines': 2}]),
+    ], 'onaction': []}
+    res = vm._analyze_calls(inv)
+    assert not res['unresolved'], res['unresolved']
+    assert 'B' in res['edges'][('M1', 'A')]
+
+
+def test_analyze_calls_onaction_module_qualified_resolves():
+    # OnAction の「モジュール名.マクロ名」形式も孤立扱いしないこと
+    inv = {'modules': [_mod('M1', 1, 'Sub C()\r\nEnd Sub\r\n',
+                            [{'name': 'C', 'lines': 2}])],
+           'onaction': [('メニュー', '四角形 1', 'M1.C')]}
+    res = vm._analyze_calls(inv)
+    assert res['onaction'] == {'C': ['メニュー/四角形 1']}
+    assert not res['orphans']
+
+
+def test_layout_button_bar_fits_content_width():
+    # 幅の違うボタン（OK/キャンセル）でもバーが左にあふれないこと
+    rows = [fl.button_bar(fl.ok("btnOK", "OK"), fl.cancel("btnCancel", "キャンセル"))]
+    pl, cw, ch = fl.compute_layout(rows)
+    assert min(l for e, l, t, w, h in pl) >= fl.STYLE['pad']
+    assert max(l + w for e, l, t, w, h in pl) <= fl.STYLE['pad'] + cw + 0.01
+
+
+def test_frame_autoname_deterministic():
+    # hash() 乱数化で再buildのたび frame 名が変わらないこと
+    a = fl.frame("設定", fl.row(fl.lbl("A"), fl.txt("t1")))
+    b = fl.frame("設定", fl.row(fl.lbl("B"), fl.txt("t2")))
+    c = fl.frame("別枠", fl.row(fl.lbl("C"), fl.txt("t3")))
+    assert a['name'] == b['name']
+    assert a['name'] != c['name']
+
+
+def test_multipage_frame_children_present_in_layout():
+    # page 内 frame の子が配置計画に含まれること（build 消失バグの回帰）
+    rows = [fl.multipage("mp",
+                         fl.page("基本", fl.frame("G", fl.row(fl.lbl("N"), fl.txt("t")))),
+                         fl.page("詳細", fl.row(fl.lbl("M"), fl.txt("u"))))]
+    pl, cw, ch = fl.compute_layout(rows)
+    mp_e = next(e for e, *_ in pl if e['kind'] == 'multipage')
+    frames = [ce for ce, *_ in mp_e['pages_layout'][0]['children'] if ce['kind'] == 'frame']
+    assert frames and len(frames[0]['children']) == 2
+
+
+def test_trailing_spacer_counts_fully():
+    # 末尾 spacer が gap_y ぶん目減りしないこと（中間の spacer と同じ意味論）
+    base = [fl.row(fl.lbl("X"), fl.txt("tX"))]
+    _, _, h_a = fl.compute_layout(base)
+    _, _, h_b = fl.compute_layout(base + [fl.spacer(24)])
+    assert abs((h_b - h_a) - (fl.STYLE['gap_y'] + 24)) < 0.01

@@ -32,6 +32,7 @@ LAST_PROC = os.path.join(SCRIPT_DIR, "_last_proc.vba")
 BLOCKED = {"shell", "batch"}  # 対話・標準入力前提のコマンドは MCP では使えない
 
 _jobs = queue.Queue()
+_worker_lock = threading.Lock()
 
 
 def _tokenize(line):
@@ -55,12 +56,16 @@ def _run_line(parser, table, line, buf):
     return table[sub_args.command](sub_args)
 
 
-def _worker():
+def _worker(jobs):
     pythoncom.CoInitialize()
     parser = vba_manager.build_parser()
     table = vba_manager._command_table()
     while True:
-        line, box, done = _jobs.get()
+        item = jobs.get()
+        if item is None:
+            # 世代交代の停止合図（タイムアウト後に復帰した旧ワーカーはここで退場）
+            break
+        line, box, done = item
         buf = io.StringIO()
         old_stdin = sys.stdin
         ok = False
@@ -83,11 +88,37 @@ def _worker():
             done.set()
 
 
+def _restart_worker():
+    """タイムアウトで詰まったワーカーを見捨てて新しい世代に交代する。
+
+    ワーカーは1本のキュー直列なので、詰まったジョブを放置すると以後の
+    全ツール呼び出しがタイムアウトになる（サーバー再起動まで回復不能）。
+    旧キューには停止合図を置き、旧ワーカーが後で復帰しても新ジョブを食わせない。
+    新ワーカーは別スレッド＝別 STA なので、旧スレッドの COM 参照は使えない。
+    接続キャッシュを捨てて新規接続からやり直す。
+    """
+    global _jobs
+    with _worker_lock:
+        old = _jobs
+        _jobs = queue.Queue()
+        old.put(None)
+        try:
+            vba_manager._wb_cache.clear()
+        except Exception:
+            pass
+        threading.Thread(target=_worker, args=(_jobs,), daemon=True).start()
+
+
 def _run(line, timeout=600):
     box, done = {}, threading.Event()
-    _jobs.put((line, box, done))
+    jobs = _jobs
+    jobs.put((line, box, done))
     if not done.wait(timeout):
-        return False, f"タイムアウト（{timeout}秒）: {line}"
+        _restart_worker()
+        return False, (f"タイムアウト（{timeout}秒）: {line}\n"
+                       "ワーカーを再起動しました。次の呼び出しから復旧します"
+                       "（実行中だったコマンドは Excel 側で続いている可能性があります。"
+                       "モーダルダイアログが開いていないか確認してください）")
     return box.get("ok", False), (box.get("out") or "").strip()
 
 
@@ -176,6 +207,6 @@ def _shutdown():
 
 
 if __name__ == "__main__":
-    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_worker, args=(_jobs,), daemon=True).start()
     atexit.register(_shutdown)
     mcp.run()

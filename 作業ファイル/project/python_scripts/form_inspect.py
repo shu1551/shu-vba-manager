@@ -546,6 +546,25 @@ def _blocks_of(items, max_right, indent):
     return blocks
 
 
+def _frame_block(fr, ok_items, indent):
+    """Frame コントロールを frame(...) 宣言ブロックに展開する。
+
+    トップレベルの frame と page 内の frame の両方から使う共通経路。
+    （page 内の frame を展開し忘れると、中の子コントロールが宣言の
+    どこにも現れず黙って消える）
+    """
+    children = [c for c in ok_items if c["parent"] == fr["name"]]
+    cap = (fr.get("caption") or "").replace('"', '\\"')
+    fl = [f'{indent}frame("{cap}",']
+    c_inputs = [c for c in children
+                if (c.get("type") or "").startswith(("TextBox", "ComboBox", "ListBox"))]
+    c_right = max((c["left"] + c["width"] for c in c_inputs), default=0)
+    for _, _, lines_ in _blocks_of(children, c_right, indent + "    "):
+        fl.extend(lines_)
+    fl.append(f"{indent}),")
+    return (fr["top"], fr["top"] + fr["height"], fl)
+
+
 def to_layout_code(form_name, info, controls):
     """既存フォームを form_layout の宣言コード（たたき台）に逆変換する。
 
@@ -568,26 +587,27 @@ def to_layout_code(form_name, info, controls):
     # ブロック間の縦ギャップから spacer を推定する（フレームの高さも正しく反映される）
     blocks = _blocks_of(top_items, max_right, "    ") if top_items else []
     for fr in frames:
-        children = [c for c in ok_items if c["parent"] == fr["name"]]
-        cap = (fr.get("caption") or "").replace('"', '\\"')
-        fl = [f'    frame("{cap}",']
-        c_inputs = [c for c in children
-                    if (c.get("type") or "").startswith(("TextBox", "ComboBox", "ListBox"))]
-        c_right = max((c["left"] + c["width"] for c in c_inputs), default=0)
-        for _, _, lines_ in _blocks_of(children, c_right, "        "):
-            fl.extend(lines_)
-        fl.append("    ),")
-        blocks.append((fr["top"], fr["top"] + fr["height"], fl))
+        blocks.append(_frame_block(fr, ok_items, "    "))
     for mp in mpages:
         ml = [f'    multipage("{mp["name"]}",']
         for pg in mp.get("pages", []):
             children = [c for c in ok_items if c["parent"] == pg["name"]]
+            # page 直下の frame は宣言として展開する（form_layout は page 内
+            # frame を正式サポートしており、展開しないと子が黙って消える）
+            pg_frames = [c for c in children
+                         if (c.get("type") or "").startswith("Frame")]
+            plain = [c for c in children
+                     if not (c.get("type") or "").startswith("Frame")]
             cap = (pg.get("caption") or pg["name"]).replace('"', '\\"')
             ml.append(f'        page("{cap}",')
-            c_inputs = [c for c in children
+            c_inputs = [c for c in plain
                         if (c.get("type") or "").startswith(("TextBox", "ComboBox", "ListBox"))]
             c_right = max((c["left"] + c["width"] for c in c_inputs), default=0)
-            for _, _, lines_ in _blocks_of(children, c_right, "            "):
+            pblocks = _blocks_of(plain, c_right, "            ") if plain else []
+            for fr in pg_frames:
+                pblocks.append(_frame_block(fr, ok_items, "            "))
+            pblocks.sort(key=lambda b: b[0])
+            for _, _, lines_ in pblocks:
                 ml.extend(lines_)
             ml.append("        ),")
         ml.append("    ),")
@@ -707,6 +727,16 @@ def render_form_png(xl, wb, form_name, out_path, echo=print, overlay=None,
         pass
 
     vbp = wb.VBProject
+    # 撮影対象の特定用に Caption を控える。クラス名だけの FindWindow だと、
+    # ユーザーが別フォームをモードレス表示中に「別の窓」を撮ってしまう
+    form_caption = None
+    try:
+        for c in vbp.VBComponents:
+            if c.Name.lower() == str(form_name).lower():
+                form_caption = str(c.Properties("Caption").Value)
+                break
+    except Exception:
+        pass
     mod = vbp.VBComponents.Add(1)  # vbext_ct_StdModule
     code = (
         "Sub tmpFormInspectShow()\r\n"
@@ -726,7 +756,24 @@ def render_form_png(xl, wb, form_name, out_path, echo=print, overlay=None,
         xl.Run(pre + "tmpFormInspectShow")
         shown = True
         time.sleep(0.5)
-        hwnd = win32gui.FindWindow("ThunderDFrame", None)
+
+        def _find_form_hwnd():
+            hits = []
+            def _cb(h, _):
+                try:
+                    if (win32gui.GetClassName(h) == "ThunderDFrame"
+                            and win32gui.IsWindowVisible(h)):
+                        hits.append(h)
+                except Exception:
+                    pass
+            win32gui.EnumWindows(_cb, None)
+            if form_caption:
+                for h in hits:
+                    if win32gui.GetWindowText(h) == form_caption:
+                        return h
+            return hits[0] if hits else 0
+
+        hwnd = _find_form_hwnd()
         if not hwnd:
             echo("フォームウィンドウ (ThunderDFrame) が見つかりません。")
             return None

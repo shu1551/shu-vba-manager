@@ -141,11 +141,20 @@ def cmd_scale(args):
         sys.exit("倍率は正の数で指定してください。")
     xl, wb, comp = connect_form(args.form)
     k = args.factor
-    for prop in ("Width", "Height"):
+    # フォームの Width/Height は枠・タイトルバー（クローム）込み。クロームまで
+    # 倍率を掛けると、縮小時に内寸が「コントロール座標×k」より狭くなって
+    # 右端・下端が見切れる。内寸にだけ倍率を掛け、クロームは実寸のまま保つ
+    try:
+        chrome_w = float(comp.Properties("Width").Value) - float(comp.Designer.InsideWidth)
+        chrome_h = float(comp.Properties("Height").Value) - float(comp.Designer.InsideHeight)
+    except Exception:
+        chrome_w, chrome_h = 11.0, 29.0   # 取得できない場合の実測既定値
+    for prop, chrome in (("Width", chrome_w), ("Height", chrome_h)):
         p = comp.Properties(prop)
         old = float(p.Value)
-        p.Value = old * k
-        print(f"フォーム {prop}: {_fmt(old)} -> {_fmt(old * k)}")
+        new = chrome + (old - chrome) * k
+        p.Value = new
+        print(f"フォーム {prop}: {_fmt(old)} -> {_fmt(new)}")
     n_geo = 0
     n_font = 0
     for ct in comp.Designer.Controls:
@@ -405,8 +414,17 @@ def cmd_copy_form(args):
         for i, ln in enumerate(lines[:20]):
             if b"OleObjectBlob" in ln:
                 lines[i] = ln.replace(exp_base + b".frx", new_b + b".frx")
-            elif b"VB_Name" in ln or ln.strip().startswith(b"Begin "):
+            elif b"VB_Name" in ln:
                 lines[i] = ln.replace(old_name, new_b)
+            elif ln.strip().startswith(b"Begin "):
+                # Begin {GUID} フォーム名 — 末尾のフォーム名トークンだけ書き換える。
+                # 全体 replace だと旧名が16進文字だけの短い名前（"C" 等）のとき
+                # GUID 側まで置換されてヘッダーが壊れる
+                head, sep, tail = ln.rpartition(b" ")
+                if sep and tail == old_name:
+                    lines[i] = head + b" " + new_b
+                else:
+                    lines[i] = ln.replace(old_name, new_b)
         with open(new_frm, "wb") as f:
             f.write(b"\r\n".join(lines))
         if os.path.exists(exp_frx):

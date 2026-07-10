@@ -70,6 +70,7 @@ import sys
 import os
 import re
 import shutil
+import zlib
 import argparse
 import time
 import datetime
@@ -540,8 +541,17 @@ def make_backup(wb_fullname, label):
     os.makedirs(BACKUP_DIR, exist_ok=True)
     ext = os.path.splitext(wb_fullname)[1] or '.xlsm'
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    prefix = os.path.basename(wb_fullname) + f".backup_before_{label}_"
+    # フォルダ違いの同名ブックが同じ系列に混ざると、世代の間引きが
+    # もう一方のブックのバックアップを消してしまう。フォルダの短いタグで系列を分ける
+    dirtag = format(zlib.crc32(os.path.dirname(os.path.abspath(wb_fullname))
+                               .lower().encode('utf-8')) & 0xffff, '04x')
+    prefix = os.path.basename(wb_fullname) + f".backup_before_{label}_{dirtag}_"
     backup_path = os.path.join(BACKUP_DIR, prefix + stamp + ext)
+    # 同一秒内の連続バックアップ（batch での連続置換等）を黙って上書きしない
+    seq = 1
+    while os.path.exists(backup_path):
+        seq += 1
+        backup_path = os.path.join(BACKUP_DIR, f"{prefix}{stamp}_{seq}{ext}")
     try:
         shutil.copy2(wb_fullname, backup_path)
         print(f"バックアップ作成: backups/{os.path.basename(backup_path)}")
@@ -958,7 +968,10 @@ def cmd_check(args):
         current_proc_kind = None  # 'sub' or 'function'
 
         for idx, line in enumerate(lines):
-            clean_line = line.split("'")[0].strip()
+            # 文字列リテラルを潰してからコメントを落とす。先に ' で切ると
+            # 文字列内のアポストロフィ（"Don't" 等）で行が切断され、
+            # 同じ行の End Sub を見失って正常コードが閉じ忘れ ERROR になる
+            clean_line = re.sub(r'"[^"]*"', '""', line).split("'")[0].strip()
             if clean_line.lower().startswith("rem "):
                 continue
 
@@ -1039,7 +1052,8 @@ def cmd_check(args):
         # 未使用変数のカウントスキャン
         if local_variables:
             for idx, line in enumerate(lines):
-                clean_line = line.split("'")[0]
+                # 上と同じ理由で、文字列を潰してからコメントを落とす
+                clean_line = re.sub(r'"[^"]*"', '""', line).split("'")[0]
                 for var_name, decl_idx in local_variables:
                     if idx == decl_idx:
                         continue
@@ -1130,27 +1144,90 @@ def cmd_diag(args):
 def cmd_list_open(args):
     """現在開いているExcelファイルを一覧表示"""
     as_json = getattr(args, 'json', False)
+    books = []
+    seen = set()
+
+    def _add(wb):
+        try:
+            full = wb.FullName
+            name = wb.Name
+        except Exception:
+            return
+        if full.lower() in seen:
+            return
+        seen.add(full.lower())
+        books.append({"name": name, "fullname": full})
+
+    # ROT 全走査: GetActiveObject は ROT 先頭の1インスタンスしか返さず、
+    # 非表示ゾンビ(ブック0個)を掴んで「ブックなし」と誤報することがある。
+    # 点呼コマンドこそ全インスタンスの全ブックを数える必要がある
+    for wb in _running_excel_workbooks():
+        _add(wb)
+    excel_running = bool(books)
+    # 未保存ブック(Book1等)はパスを持たず ROT に載らないことがあるため、
+    # GetActiveObject 側の列挙でも補完する
     try:
         xl = _get_active_excel()
+        excel_running = True
+        for wb in xl.Workbooks:
+            _add(wb)
     except Exception:
-        if as_json:
-            import json
-            print(json.dumps({"success": True, "excel_running": False, "workbooks": []},
-                             ensure_ascii=False), file=sys.stdout)
-            return True
-        print('Excelは起動していません')
-        return
-    books = []
-    for wb in xl.Workbooks:
-        books.append({"name": wb.Name, "fullname": wb.FullName})
-        if not as_json:
-            print(wb.FullName)
+        pass
+
     if as_json:
         import json
-        print(json.dumps({"success": True, "excel_running": True, "workbooks": books},
-                         ensure_ascii=False), file=sys.stdout)
+        print(json.dumps({"success": True, "excel_running": excel_running,
+                          "workbooks": books}, ensure_ascii=False), file=sys.stdout)
+        return True
+    if not excel_running:
+        print('Excelは起動していません')
+        return
+    if not books:
+        print('（開いているブックはありません）')
+        return True
+    for b in books:
+        print(b["fullname"])
     return True
 
+
+
+def _select_addin_project(all_projects, sel):
+    """--addin の対象アドインを選ぶ。sel は True（無指定）または名前の一部。
+
+    特定のアドイン名を優先するハードコードはしない（汎用原則）。
+    複数ロード時は名前指定を促す。見つからなければ None（メッセージ出力済み）。
+    """
+    found = []
+    for p in all_projects:
+        try:
+            fname = os.path.basename(p.Filename).lower()
+            if fname.endswith(('.xlam', '.xla')):
+                found.append(p)
+        except Exception:
+            continue
+    if not found:
+        print("エラー: アドインブック (.xlam / .xla) がロードされていません。", file=sys.stderr)
+        return None
+    if isinstance(sel, str):
+        hits = [p for p in found
+                if sel.lower() in os.path.basename(p.Filename).lower()]
+        if not hits:
+            names = ", ".join(os.path.basename(p.Filename) for p in found)
+            print(f"エラー: '{sel}' に一致するアドインがありません。ロード中: {names}",
+                  file=sys.stderr)
+            return None
+        if len(hits) > 1:
+            names = ", ".join(os.path.basename(p.Filename) for p in hits)
+            print(f"エラー: '{sel}' に複数一致します: {names}", file=sys.stderr)
+            return None
+        return hits[0]
+    if len(found) > 1:
+        names = ", ".join(os.path.basename(p.Filename) for p in found)
+        print("エラー: 複数のアドインがロードされています。"
+              "--addin 名前 で対象を指定してください。", file=sys.stderr)
+        print(f"  ロード中: {names}", file=sys.stderr)
+        return None
+    return found[0]
 
 
 def cmd_list(args):
@@ -1194,25 +1271,9 @@ def cmd_list(args):
             return False
         target_projects.append(found)
     elif getattr(args, 'addin', False):
-        found_addins = []
-        for p in all_projects:
-            try:
-                fname = os.path.basename(p.Filename).lower()
-                if fname.endswith(('.xlam', '.xla')):
-                    found_addins.append(p)
-            except Exception:
-                continue
-        if not found_addins:
-            print("エラー: アドインブック (.xlam / .xla) がロードされていません。", file=sys.stderr)
+        target_addin = _select_addin_project(all_projects, args.addin)
+        if target_addin is None:
             return False
-        target_addin = found_addins[0]
-        for p in found_addins:
-            try:
-                if "秀" in os.path.basename(p.Filename):
-                    target_addin = p
-                    break
-            except Exception:
-                continue
         target_projects.append(target_addin)
     else:
         found = None
@@ -1385,25 +1446,9 @@ def cmd_list_modules(args):
             return False
         target_projects.append(found)
     elif getattr(args, 'addin', False):
-        found_addins = []
-        for p in all_projects:
-            try:
-                fname = os.path.basename(p.Filename).lower()
-                if fname.endswith(('.xlam', '.xla')):
-                    found_addins.append(p)
-            except Exception:
-                continue
-        if not found_addins:
-            print("エラー: アドインブック (.xlam / .xla) がロードされていません。", file=sys.stderr)
+        target_addin = _select_addin_project(all_projects, args.addin)
+        if target_addin is None:
             return False
-        target_addin = found_addins[0]
-        for p in found_addins:
-            try:
-                if "秀" in os.path.basename(p.Filename):
-                    target_addin = p
-                    break
-            except Exception:
-                continue
         target_projects.append(target_addin)
     else:
         found = None
@@ -1551,11 +1596,16 @@ def _extract_proc(wb, module_name, macro_name):
         while lines and lines[0].strip() == '':
             lines.pop(0)
         # 末尾の空行と、紛れ込んだ次プロシージャの宣言行を除去
-        while lines:
+        # （「Sub B(): 処理: End Sub」のような1行完結プロシージャは正当な本体なので
+        #   対象外。cmd_replace_procedure の混入除去と同じ条件に揃える）
+        while len(lines) > 1:
             last = lines[-1].strip()
-            if last == '' or re.match(
-                r'^(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?(?:Sub|Function)\s+',
-                last, re.IGNORECASE):
+            if last == '':
+                lines.pop()
+            elif (re.match(
+                    r'^(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?(?:Sub|Function)\s+',
+                    last, re.IGNORECASE)
+                  and not re.search(r'\bEnd\s+(?:Sub|Function)\b', last, re.IGNORECASE)):
                 lines.pop()
             else:
                 break
@@ -1832,6 +1882,13 @@ def cmd_replace_procedure(args):
                 while check < len(bas_lines) and bas_lines[check].strip().startswith('Attribute '):
                     attr_block.append(bas_lines[check])
                     check += 1
+                # 「Sub X(): 処理: End Sub」の1行完結は宣言行自身で閉じている。
+                # 次の End Sub まで探すと後続プロシージャを巻き込んで消すため、
+                # ここで終端を確定する（随伴 Attribute 行までが置換対象）
+                no_str = re.sub(r'"[^"]*"', '""', line)
+                if re.search(r'\bEnd\s+(?:Sub|Function)\b', no_str, re.IGNORECASE):
+                    proc_end_idx = check - 1
+                    break
             elif sub_line_idx is not None and end_pattern.match(line):
                 proc_end_idx = idx
                 break
@@ -2316,11 +2373,11 @@ def _parse_module_blocks(bas_text):
     """
     sub_pattern = re.compile(
         r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
-        r'(?P<kind>Sub|Function)\s+(?P<name>[^\s\(]+)',
+        r'(?P<kind>Sub|Function|Property\s+(?:Get|Let|Set))\s+(?P<name>[^\s\(]+)',
         re.IGNORECASE
     )
     # 末尾コメント（End Sub 'xxx）を許容（cmd_replace_procedure の end_pattern と同じ理由）
-    end_pattern = re.compile(r"^\s*End\s+(?:Sub|Function)\s*(?:'.*)?$", re.IGNORECASE)
+    end_pattern = re.compile(r"^\s*End\s+(?:Sub|Function|Property)\s*(?:'.*)?$", re.IGNORECASE)
 
     lines = bas_text.split('\r\n')
     n = len(lines)
@@ -2342,14 +2399,23 @@ def _parse_module_blocks(bas_text):
     while i < n:
         m = sub_pattern.match(lines[i])
         if m:
-            j = i + 1
-            while j < n and not end_pattern.match(lines[j]):
-                j += 1
-            if j >= n:
-                break
+            # 「Sub X(): 処理: End Sub」の1行完結は宣言行自身で閉じている。
+            # 次の End 行まで探すと後続プロシージャを同一ブロックに巻き込むため、
+            # その行（＋随伴 Attribute 行）でブロックを閉じる
+            no_str = re.sub(r'"[^"]*"', '""', lines[i])
+            if re.search(r'\bEnd\s+(?:Sub|Function|Property)\b', no_str, re.IGNORECASE):
+                j = i
+                while j + 1 < n and lines[j + 1].strip().startswith('Attribute '):
+                    j += 1
+            else:
+                j = i + 1
+                while j < n and not end_pattern.match(lines[j]):
+                    j += 1
+                if j >= n:
+                    break
             blocks.append({
                 'name':  m.group('name'),
-                'kind':  m.group('kind').lower(),
+                'kind':  ' '.join(m.group('kind').split()).lower(),
                 'lines': lines[cur_start:j + 1],
             })
             cur_start = j + 1
@@ -2555,10 +2621,15 @@ def cmd_export_module(args):
 
     xl, wb = get_workbook(target_file)
 
+    # export-all と同じ Type 別拡張子を使う。フォームを .bas で書き出すと、
+    # replace-module の「.frm なのに .frx が無い」ガードをすり抜けてしまう
+    ext_map = {1: '.bas', 2: '.cls', 3: '.frm', 100: '.cls'}
+
     for comp in wb.VBProject.VBComponents:
         if comp.Name.lower() == module_name.lower():
             # 表記ゆれ（大小文字）でファイル名が実モジュール名とズレないよう comp.Name を使う
-            out_path = os.path.join(SCRIPT_DIR, f"{comp.Name}.bas")
+            ext = ext_map.get(int(comp.Type), '.bas')
+            out_path = os.path.join(SCRIPT_DIR, f"{comp.Name}{ext}")
             if os.path.exists(out_path):
                 print(f"（既存の {os.path.basename(out_path)} を上書きします）")
             comp.Export(out_path)
@@ -2983,7 +3054,11 @@ def _collect_book_inventory(xl, wb, include_vba=True):
                 raw = m.group(2).replace('\\n', '\n').replace('\\r', '\r')
                 key = raw.split('\n')[0].split('\r')[0]
                 if key:
-                    shortcuts[m.group(1)] = f"Ctrl+{key}"
+                    # VB_Invoke_Func のキーが大文字なら Ctrl+Shift+キー の割当
+                    if key.isalpha() and key == key.upper():
+                        shortcuts[m.group(1)] = f"Ctrl+Shift+{key}"
+                    else:
+                        shortcuts[m.group(1)] = f"Ctrl+{key}"
         except Exception:
             pass
         finally:
@@ -3232,7 +3307,9 @@ def _analyze_calls(inv):
     if known:
         names_alt = '|'.join(sorted((re.escape(v[0]) for v in known.values()),
                                     key=len, reverse=True))
-        bare_pat = re.compile(r'(?<![\w.])(' + names_alt + r')(?![\w])')
+        # VBA の識別子は大文字小文字を区別しないため IGNORECASE で照合し、
+        # マッチ後に known で正式名へ正規化する
+        bare_pat = re.compile(r'(?<![\w.])(' + names_alt + r')(?![\w])', re.IGNORECASE)
     else:
         bare_pat = None
 
@@ -3251,6 +3328,10 @@ def _analyze_calls(inv):
                 continue
             # 文字列リテラルを潰してからコメントを落とす（' の誤爆防止）
             line = re.sub(r'"[^"]*"', '""', raw).split("'")[0]
+            # Rem コメント行の Call/Run を生きた呼び出し扱いしない
+            low = line.strip().lower()
+            if low == 'rem' or low.startswith('rem '):
+                continue
             caller = (m['name'], cur or '(宣言部)')
 
             for cm_ in call_pat.finditer(line):
@@ -3275,6 +3356,10 @@ def _analyze_calls(inv):
                 ran_static = True
                 name = rm_.group(1)
                 hit = known.get(name.lower())
+                if hit is None and '.' in name:
+                    # Run "モジュール名.マクロ名" のモジュール修飾は
+                    # Call 側の修飾呼びと同じく末尾名で解決を試みる
+                    hit = known.get(name.rsplit('.', 1)[-1].lower())
                 if hit:
                     edges.setdefault(caller, set()).add(hit[0])
                 else:
@@ -3284,8 +3369,9 @@ def _analyze_calls(inv):
                 dynamic_runs.append((m['name'], cur or '(宣言部)', i, raw.strip()[:60]))
             if bare_pat:
                 for bm in bare_pat.finditer(line):
-                    name = bm.group(1)
-                    if cur and name == cur:
+                    hit = known.get(bm.group(1).lower())
+                    name = hit[0] if hit else bm.group(1)   # 正式名へ正規化
+                    if cur and name.lower() == cur.lower():
                         continue          # 自分自身の再帰は流れの把握には不要
                     edges.setdefault(caller, set()).add(name)
 
@@ -3293,6 +3379,10 @@ def _analyze_calls(inv):
     onaction = {}
     for sheet, shp, macro in inv.get('onaction', ()):
         hit = known.get(macro.lower())
+        if hit is None and '.' in macro:
+            # 「モジュール名.マクロ名」形式の登録（同名マクロがあると Excel が
+            # 自動でこの形式にする）も末尾名で解決する
+            hit = known.get(macro.rsplit('.', 1)[-1].lower())
         if hit:
             onaction.setdefault(hit[0], []).append(f"{sheet}/{shp}")
 
@@ -3508,8 +3598,13 @@ def _checkup_diff(prev, cur):
     pk, ck = set(prev.get('keys', [])), set(cur.get('keys', []))
     d = {'prev_time': prev.get('time'),
          'new': sorted(ck - pk), 'resolved': sorted(pk - ck)}
-    pp = {m: set(v) for m, v in (prev.get('procs') or {}).items()}
-    cp = {m: set(v) for m, v in (cur.get('procs') or {}).items()}
+    # 履歴 JSON は外部データ。procs の値が list 以外に汚損していても診断ごと
+    # 落とさない（キー欠損への耐性と同じ方針で型汚損にも耐える）
+    def _safe(d):
+        return {m: set(v) for m, v in (d.get('procs') or {}).items()
+                if isinstance(v, (list, tuple, set))}
+    pp = _safe(prev)
+    cp = _safe(cur)
     added, removed = [], []
     for m in sorted(cp):
         for p in sorted(cp[m] - pp.get(m, set())):
@@ -3822,11 +3917,15 @@ def _checkup_one(xl, wb, note=None, ack_all=False):
         form_findings = None      # form_inspect.py が無い構成（マクロ管理のみ）
 
     # --- バックアップ状況 ---
+    # 部分一致（base in name）だと「家計」が「家計簿2026」のバックアップまで
+    # 数えてしまう。make_backup / make_module_backup の命名規則に揃えて数える
     base = os.path.splitext(inv['name'])[0]
+    book_prefix = inv['name'] + ".backup_before_"   # ブック丸ごと
+    mod_prefix = base + "_"                         # モジュール単位 (.bas)
     bk_count, bk_latest = 0, None
     if os.path.isdir(BACKUP_DIR):
         for name in os.listdir(BACKUP_DIR):
-            if base in name:
+            if name.startswith(book_prefix) or name.startswith(mod_prefix):
                 bk_count += 1
                 t = os.path.getmtime(os.path.join(BACKUP_DIR, name))
                 if bk_latest is None or t > bk_latest:
@@ -4607,6 +4706,13 @@ def cmd_code_replace(args):
                 print(f"エラー: 置換文字列が不正です: {e}")
                 return False
             if new_line != line:
+                # ReplaceLine は行単位。置換結果に改行が入ると1行が複数行になり、
+                # 同一モジュール内の後続の行番号が全部ずれて無関係な行を上書きする
+                if '\r' in new_line or '\n' in new_line:
+                    print("エラー: 置換結果に改行が含まれるため中止しました。")
+                    print(f"  [{comp.Name}] {i}行目: {new_line.splitlines()[0]} …")
+                    print("  （code-replace は行単位置換です。複数行への展開は replace-procedure を使ってください）")
+                    return False
                 changes.append((i, line, new_line))
         if changes:
             plans.append((comp, changes))
@@ -4822,7 +4928,7 @@ def cmd_run_macro(args):
             pattern = re.compile(
                 r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
                 r'(?:Sub|Function)\s+' + re.escape(macro_name) + r'\b',
-                re.IGNORECASE
+                re.IGNORECASE | re.MULTILINE
             )
             for p in xl.VBE.VBProjects:
                 for comp in p.VBComponents:
@@ -4833,10 +4939,11 @@ def cmd_run_macro(args):
                             try:
                                 if p.Filename:
                                     found_wb = os.path.basename(p.Filename)
-                                    break
                             except Exception:
+                                # 未保存ブックは Filename が取れない。プロジェクト名
+                                # ("VBAProject") で修飾しても Run は解決しないため、
+                                # 修飾なしの直接実行に任せる
                                 pass
-                            found_wb = p.Name
                             break
                 if found_wb:
                     break
@@ -5036,11 +5143,13 @@ def cmd_test(args):
         return False
 
     results = []
+    # ブック名の ' は Excel 規約どおり '' に重ねる（cmd_run_macro と同じ流儀）
+    quoted_wb = wb.Name.replace("'", "''")
     try:
         for i, (mod_name, sub_name) in enumerate(tests, 1):
             t0 = _time.time()
             try:
-                ret = xl.Application.Run(f"'{wb.Name}'!{_HARNESS}.VMT_{i}")
+                ret = xl.Application.Run(f"'{quoted_wb}'!{_HARNESS}.VMT_{i}")
                 sec = _time.time() - t0
                 ret = str(ret) if ret is not None else ""
                 if ret == "OK":
@@ -5409,6 +5518,19 @@ def cmd_read_range(args):
         path = _LAST_VALUES_FILE if tsv_out == '_DEFAULT_' else os.path.abspath(tsv_out)
         ws, rng = blocks[0]
         rows = _range_values_2d(rng, use_formula)
+        # セル内改行(Alt+Enter)・タブは TSV の行/列区切りと衝突し、
+        # そのまま write-range で書き戻すと格子がずれて無警告のデータ破壊になる。
+        # 値は変えず、該当セルを名指しで警告する
+        dirty = []
+        for ri, r in enumerate(rows):
+            for ci, v in enumerate(r):
+                if isinstance(v, str) and ('\n' in v or '\r' in v or '\t' in v):
+                    dirty.append(f"{_col_letter(rng.Column + ci)}{rng.Row + ri}")
+        if dirty:
+            shown = ", ".join(dirty[:8]) + ("" if len(dirty) <= 8 else f" …他{len(dirty) - 8}件")
+            print(f"⚠ 警告: セル内に改行/タブを含むセルが {len(dirty)}件あります: {shown}")
+            print("  このTSVをそのまま write-range で書き戻すと行・列がずれます。")
+            print("  該当セルは手で編集するか、write-range の対象から外してください。")
         lines = ['\t'.join(_cell_str(v) for v in r) for r in rows]
         with open(path, 'w', encoding='utf-8-sig', newline='') as f:
             f.write('\n'.join(lines) + '\n')
@@ -5817,6 +5939,11 @@ def _coerce_cell(s):
             return int(s)
         except ValueError:
             return s
+    # Python の float() は "1_000" や前後空白も受理してしまい、
+    # "2026_07" のようなテキストIDが黙って数値化される。桁区切り表記や
+    # 空白付きは文字列のまま扱う
+    if '_' in s or s != s.strip():
+        return s
     try:
         f = float(s)
     except ValueError:
@@ -6487,7 +6614,7 @@ def cmd_name(args):
         nm_name = rest[1]
         ws, rng = _resolve_range(xl, wb, rest[2])
         # rng.Address は既定で絶対参照 ($A$2)。pywin32 ではプロパティなので引数なしで使う
-        refers = "='" + ws.Name + "'!" + rng.Address
+        refers = "='" + ws.Name.replace("'", "''") + "'!" + rng.Address
         wb.Names.Add(nm_name, refers)
         print(f"名前付き範囲を追加: {nm_name} → {refers}")
         print("（保存はしていません）")
@@ -6696,6 +6823,10 @@ def cmd_sort(args):
         return False
     ws, rng = _resolve_range(xl, wb, rest[0], sheet_opt)
     keycol = getattr(args, 'key', None)
+    if keycol and not keycol.isalpha():
+        # _col_num は英字以外も黙って数値化してしまい、"A1" が K列扱いになる
+        print(f"エラー: --key は列文字（A〜XFD）で指定してください: '{keycol}'")
+        return False
     key_idx = _col_num(keycol) if keycol else rng.Column
     keycell = ws.Cells(rng.Row, key_idx)
     order = 2 if getattr(args, 'desc', False) else 1       # xlDescending=2 / xlAscending=1
@@ -6705,7 +6836,11 @@ def cmd_sort(args):
         header = 2                                          # xlNo
     else:
         header = 0                                          # xlGuess
-    rng.Sort(Key1=keycell, Order1=order, Header=header)
+    # Orientation / MatchCase は Excel が「前回の並べ替え設定」をシートに保存して
+    # 引き継ぐ仕様。未指定だと手動の列単位ソート等が引き継がれ、行方向のつもりが
+    # 列方向に並べ替わる事故になるため必ず明示する（xlTopToBottom=1）
+    rng.Sort(Key1=keycell, Order1=order, Header=header,
+             Orientation=1, MatchCase=False)
     print(f"並べ替え: {ws.Name}!{rng.Address}  キー列={keycol or _col_letter(rng.Column)}  "
           f"{'降順' if order == 2 else '昇順'}")
     print("（保存はしていません）")
@@ -6765,7 +6900,12 @@ def cmd_find(args):
     total = 0
     max_hits = getattr(args, 'max_hits', None) or 200
     for ws in sheets:
-        rng = ws.UsedRange
+        try:
+            rng = ws.UsedRange
+        except Exception:
+            # アクティブがグラフシート等だと UsedRange 自体が例外になる
+            print(f"（'{ws.Name}' はワークシートではないためスキップ）")
+            continue
         try:
             cell = rng.Find(What=needle, LookIn=look_in, LookAt=look_at, MatchCase=False)
         except Exception:
@@ -6792,22 +6932,35 @@ def cmd_find(args):
 
 
 def cmd_find_replace(args):
-    """一括置換: find-replace <検索> <置換> [range] [--whole]"""
+    """一括置換: find-replace <検索> <置換> [range] [--whole] [--wildcard]"""
     target_file, rest = parse_target_and_rest(args.posargs)
     if len(rest) < 2:
-        print("使い方: find-replace <検索> <置換> [range] [--whole]")
+        print("使い方: find-replace <検索> <置換> [range] [--whole] [--wildcard]")
         return False
     needle, repl = rest[0], rest[1]
     spec = rest[2] if len(rest) >= 3 else None
-    if _reject_extra_args(rest, 3, '使い方: find-replace <検索> <置換> [range] [--whole] [--match-case]'):
+    if _reject_extra_args(rest, 3, '使い方: find-replace <検索> <置換> [range] [--whole] [--match-case] [--wildcard]'):
         return False
+    # Excel の Find/Replace は * ? を常にワイルドカード解釈する。
+    # 素通しすると `find-replace "*" "×"` が全非空セルの丸ごと置換になるため、
+    # 既定は ~ エスケープで文字どおりに扱い、--wildcard で明示オプトインする
+    if not getattr(args, 'wildcard', False):
+        escaped = re.sub(r'([~*?])', r'~\1', needle)
+        if escaped != needle:
+            print("（* ? ~ は文字どおりに置換します。パターンとして使うなら --wildcard）")
+        needle = escaped
     xl, wb = get_workbook(target_file)
     sheet_opt = getattr(args, 'sheet_opt', None)
     if spec or sheet_opt:
         ws, rng = _resolve_range(xl, wb, spec, sheet_opt)
     else:
         ws = wb.ActiveSheet
-        rng = ws.UsedRange
+        try:
+            rng = ws.UsedRange
+        except Exception:
+            print(f"エラー: アクティブシート '{ws.Name}' は置換できる"
+                  "ワークシートではありません（グラフシート等）。")
+            return False
     look_at = 1 if getattr(args, 'whole', False) else 2
     match_case = getattr(args, 'match_case', False)
     # Range.Replace は置換件数を返さないため、置換前にヒットセル数を数える
@@ -6881,15 +7034,35 @@ def cmd_save_as(args):
         return False
 
     xl, wb = get_workbook(target_file)
+    try:
+        old_full = wb.FullName
+    except Exception:
+        old_full = None
     src_ext = os.path.splitext(wb.Name)[1].lower()
     if src_ext in ('.xlsm', '.xlsb', '.xls') and ext == '.xlsx':
         # DisplayAlerts=False で Excel の警告が出ないため、こちらで明示する
         print("⚠ 注意: マクロ付きブックを .xlsx で保存するため、VBAマクロは保存されません。")
+    if ext in ('.csv', '.txt'):
+        try:
+            n_sheets = wb.Sheets.Count
+        except Exception:
+            n_sheets = 1
+        if n_sheets > 1:
+            # これも DisplayAlerts=False で Excel 側の警告が抑止されるため明示する
+            print(f"⚠ 注意: {ext} はアクティブシート1枚しか保存されません"
+                  f"（このブックは {n_sheets} シート）。")
     xl.DisplayAlerts = False
     try:
         wb.SaveAs(out, FileFormat=fmt)
     finally:
         xl.DisplayAlerts = True
+    # batch/shell/MCP の1接続セッションでは接続キャッシュが旧パスキーのまま残り、
+    # 旧名を指定した後続コマンドが改名後のブックに当たる（対象取り違え）。
+    # SaveAs 成功時にキャッシュのキーを新パスへ付け替える
+    if old_full:
+        old_key = old_full.lower()
+        if old_key != out.lower() and old_key in _wb_cache:
+            _wb_cache[out.lower()] = _wb_cache.pop(old_key)
     print(f"別名保存しました: {out}")
     print("  （以後、開いているブックの保存先はこの新パスになります）")
     return True
@@ -7789,12 +7962,23 @@ def cmd_pivot(args):
         if sheet_opt:
             dws = None
             for sh in wb.Sheets:
-                if sh.Name == sheet_opt:
+                # Excel のシート名重複判定は大文字小文字を区別しない
+                if sh.Name.lower() == sheet_opt.lower():
                     dws = sh; break
             if dws is None:
                 dws = wb.Sheets.Add(None, wb.Sheets(wb.Sheets.Count))
-                dws.Name = sheet_opt
                 created_sheet = dws
+                try:
+                    dws.Name = sheet_opt
+                except Exception as ex:
+                    # 禁止文字(/ 等)・31文字超で失敗すると無名シートが残骸になる
+                    print(f"エラー: シート名 '{sheet_opt}' を設定できません: {ex}")
+                    xl.DisplayAlerts = False
+                    try:
+                        dws.Delete()
+                    finally:
+                        xl.DisplayAlerts = True
+                    return False
             dest = dws.Range("A3")
         elif at:
             dest = ws_s.Range(at)
@@ -7960,6 +8144,9 @@ def cmd_pivot_field(args):
 
     if action == 'set-name':
         newname = rest[3] if len(rest) >= 4 else None
+        if not newname:
+            print("使い方: pivot-field set-name <pivot> <field> <新しい表示名>")
+            return False
         p = pf(field)
         if p is None:
             print(f"エラー: フィールド '{field}' が見つかりません。"); return False
@@ -7968,6 +8155,9 @@ def cmd_pivot_field(args):
 
     if action == 'set-format':
         code = rest[3] if len(rest) >= 4 else None
+        if not code:
+            print('使い方: pivot-field set-format <pivot> <field> <書式コード（例: "#,##0"）>')
+            return False
         for i in range(1, pt.DataFields.Count + 1):
             d = pt.DataFields.Item(i)
             if d.Name == field or d.SourceName == field:
@@ -8088,7 +8278,21 @@ def cmd_pivot_calc(args):
             return True
         if sub == 'delete':
             cf_name = rest[3] if len(rest) >= 4 else None
-            pt.PivotFields(cf_name).Delete()
+            if not cf_name:
+                print("使い方: pivot-calc calc-field delete <pivot> <計算フィールド名>")
+                return False
+            try:
+                pt.PivotFields(cf_name).Delete()
+            except Exception:
+                names = []
+                try:
+                    cfs = pt.CalculatedFields()
+                    names = [cfs.Item(i).Name for i in range(1, cfs.Count + 1)]
+                except Exception:
+                    pass
+                print(f"エラー: 計算フィールド '{cf_name}' を削除できません。")
+                print("  存在する計算フィールド: " + (", ".join(names) or "(なし)"))
+                return False
             print(f"計算フィールド削除: {pname}[{cf_name}]"); print("（保存はしていません）"); return True
         print("使い方: pivot-calc calc-field <create|list|delete> <pivot> ...")
         return False
@@ -8472,13 +8676,26 @@ def cmd_powerquery(args):
             # 出力先シート（--sheet 省略時はアクティブシート）
             sheet_name = getattr(args, 'sheet', None)
             ws = None
+            created_ws = None
             if sheet_name:
                 for i in range(1, wb.Worksheets.Count + 1):
-                    if wb.Worksheets.Item(i).Name == sheet_name:
+                    # Excel のシート名重複判定は大文字小文字を区別しない
+                    if wb.Worksheets.Item(i).Name.lower() == sheet_name.lower():
                         ws = wb.Worksheets.Item(i); break
                 if ws is None:
                     ws = wb.Worksheets.Add()
-                    ws.Name = sheet_name
+                    created_ws = ws
+                    try:
+                        ws.Name = sheet_name
+                    except Exception as ex:
+                        # 禁止文字(/ 等)・31文字超で失敗すると無名シートが残骸になる
+                        print(f"エラー: シート名 '{sheet_name}' を設定できません: {ex}")
+                        xl.DisplayAlerts = False
+                        try:
+                            ws.Delete()
+                        finally:
+                            xl.DisplayAlerts = True
+                        return False
             else:
                 ws = wb.ActiveSheet
             at = getattr(args, 'at', None) or 'A1'
@@ -8494,7 +8711,37 @@ def cmd_powerquery(args):
             qt.RefreshOnFileOpen = False
             qt.BackgroundQuery = False
             qt.AdjustColumnWidth = True
-            qt.Refresh(False)                  # BackgroundQuery:=False
+            try:
+                qt.Refresh(False)              # BackgroundQuery:=False
+            except Exception as ex:
+                # M式の実行時エラー等で失敗すると、追加済みの ListObject と
+                # 自動生成の接続が孤児として残り、再実行のたび「テーブル1/2…」と
+                # 増殖する。このコマンドが作ったものだけ片づける
+                print(f"エラー: クエリの読み込みに失敗しました: {ex}")
+                print("  M式の実行時エラーの可能性があります（powerquery get で確認）。")
+                try:
+                    wbconn = qt.WorkbookConnection
+                except Exception:
+                    wbconn = None
+                try:
+                    lo.Delete()
+                except Exception:
+                    pass
+                try:
+                    if wbconn is not None:
+                        wbconn.Delete()
+                except Exception:
+                    pass
+                if created_ws is not None:
+                    xl.DisplayAlerts = False
+                    try:
+                        created_ws.Delete()
+                    except Exception:
+                        pass
+                    finally:
+                        xl.DisplayAlerts = True
+                print("  追加途中のテーブル・接続は片づけました。")
+                return False
             try:
                 lo.Name = name
             except Exception:
@@ -8666,7 +8913,9 @@ def cmd_datamodel(args):
         model = wb.Model
     except Exception:
         print("このブックはデータモデルに対応していません。")
-        return True
+        # list 系は「無い」を正常報告でよいが、追加/削除の要求は実行されて
+        # いないので失敗として返す（batch やスクリプト連携で握りつぶさない）
+        return action in ('list', 'tables', 'measures', 'relations')
 
     # --- リレーションシップの作成・削除 ---
     #   datamodel relation add    <FKテーブル> <FK列> <PKテーブル> <PK列>
@@ -8931,7 +9180,8 @@ def build_parser():
     p.add_argument("--module", dest="module_opt", default=None, help="対象モジュールを限定")
     p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
     p.add_argument("--personal", action="store_true", help="個人用マクロブック (PERSONAL.XLSB) を対象にする")
-    p.add_argument("--addin", action="store_true", help="アドインブック (秀.xlam 等) を対象にする")
+    p.add_argument("--addin", nargs="?", const=True, default=False,
+                   help="アドインブック (.xlam/.xla) を対象にする。複数ロード時は名前(一部可)を指定")
     p.add_argument("--all", action="store_true", help="開いているすべてのブック・アドインを対象にする")
 
     # list-modules [excel_file]
@@ -8939,7 +9189,8 @@ def build_parser():
     p.add_argument("posargs", nargs="*")
     p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
     p.add_argument("--personal", action="store_true", help="個人用マクロブック (PERSONAL.XLSB) を対象にする")
-    p.add_argument("--addin", action="store_true", help="アドインブック (秀.xlam 等) を対象にする")
+    p.add_argument("--addin", nargs="?", const=True, default=False,
+                   help="アドインブック (.xlam/.xla) を対象にする。複数ロード時は名前(一部可)を指定")
     p.add_argument("--all", action="store_true", help="開いているすべてのブック・アドインを対象にする")
 
     # get [excel_file] <macro_name> [...]
@@ -9279,6 +9530,8 @@ def build_parser():
     p.add_argument("--whole", action="store_true", help="完全一致のみ置換")
     p.add_argument("--match-case", dest="match_case", action="store_true",
                    help="大文字小文字を区別する（既定は区別しない）")
+    p.add_argument("--wildcard", action="store_true",
+                   help="検索文字列の * ? をワイルドカードとして扱う（既定は文字どおり）")
     p.add_argument("--sheet", dest="sheet_opt", default=None,
                    help="対象シート名（rangeと分離指定）")
 
@@ -9485,8 +9738,13 @@ def cmd_batch(args):
         if not path or not os.path.exists(path):
             print(f"エラー: コマンドファイルが見つかりません: {src}")
             return False
-        with open(path, 'r', encoding='utf-8-sig') as f:
-            text = f.read()
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            # メモ帳等で CP932 (Shift-JIS) 保存されたコマンドファイルも受け付ける
+            with open(path, 'r', encoding='cp932') as f:
+                text = f.read()
 
     parser = build_parser()
     table = _command_table()
@@ -9515,7 +9773,11 @@ def cmd_batch(args):
             return False
         try:
             sub_args, unknown = parser.parse_known_args(tokens)
-        except SystemExit:
+        except SystemExit as e:
+            if e.code in (0, None):
+                # 行内の -h/--help はヘルプ表示済み。エラーではない
+                ok_n += 1
+                continue
             print(f"[batch:{lineno}] 引数エラー")
             if keep_going:
                 continue
@@ -9537,7 +9799,8 @@ def cmd_batch(args):
             res = table[sub_args.command](sub_args)
         except SystemExit as e:
             # reorder-macro 等は sys.exit で終了コードを返すため、ここで吸収する
-            res = (e.code == 0)
+            # （code=None の素の sys.exit() は正常終了。shell 側の判定と揃える）
+            res = (e.code in (0, None))
         except Exception as e:
             print(f"[batch:{lineno}] エラー: {e}")
             res = False
