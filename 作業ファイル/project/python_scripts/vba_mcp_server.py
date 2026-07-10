@@ -40,6 +40,7 @@ def _tokenize(line):
     lex = shlex.shlex(line, posix=True)
     lex.whitespace_split = True
     lex.escape = ''  # Windows パスの \ をエスケープ扱いしない（shell と同じ）
+    lex.commenters = ''  # 行中の # をコメント扱いしない（#FF0000 等が消える。shell/batch と同じ）
     return list(lex)
 
 
@@ -66,11 +67,18 @@ def _worker(jobs):
             # 世代交代の停止合図（タイムアウト後に復帰した旧ワーカーはここで退場）
             break
         line, box, done = item
+        with _worker_lock:
+            if box.get("cancelled"):
+                # 実行前にタイムアウト済みのジョブ。「タイムアウトしました」と報告済みなのに
+                # 後から副作用だけ走る、を防ぐためここで捨てる
+                continue
+            box["started"] = True
         buf = io.StringIO()
         old_stdin = sys.stdin
+        fake_stdin = io.StringIO("")
         ok = False
         try:
-            sys.stdin = io.StringIO("")
+            sys.stdin = fake_stdin
             with redirect_stdout(buf), redirect_stderr(buf):
                 if line == "__cleanup__":
                     vba_manager.cleanup_excel()
@@ -79,10 +87,17 @@ def _worker(jobs):
                     ok = _run_line(parser, table, line, buf) is not False
         except SystemExit as e:
             ok = e.code in (0, None)
+        except EOFError:
+            buf.write("\nエラー: 確認プロンプト待ちになりました（MCP では応答できません）。"
+                      "確認付きコマンドは -y を付けて再実行してください")
         except Exception as e:
             buf.write(f"\nエラー: {e}")
         finally:
-            sys.stdin = old_stdin
+            # 世代交代後に旧ワーカーが復帰した場合、新世代が据えた stdin を
+            # 本物の stdin（JSON-RPC の通信線）に戻してしまわないよう、
+            # 自分が据えたものが残っているときだけ復元する
+            if sys.stdin is fake_stdin:
+                sys.stdin = old_stdin
             box["ok"] = ok
             box["out"] = buf.getvalue()
             done.set()
@@ -111,9 +126,21 @@ def _restart_worker():
 
 def _run(line, timeout=600):
     box, done = {}, threading.Event()
-    jobs = _jobs
-    jobs.put((line, box, done))
+    with _worker_lock:
+        # _restart_worker と排他にする。参照と put の間に世代交代が挟まると、
+        # ジョブが停止済みの旧キューに落ちて誰にも実行されない
+        _jobs.put((line, box, done))
     if not done.wait(timeout):
+        with _worker_lock:
+            started = box.get("started", False)
+            if not started:
+                box["cancelled"] = True   # ワーカーは実行前にこれを見て捨てる
+        if not started:
+            # 前のジョブが長引いて未着手のままタイムアウト。ワーカー自体は健全なので
+            # 世代交代せず、このジョブだけ取り下げる
+            return False, (f"タイムアウト（{timeout}秒）: {line}\n"
+                           "前のコマンドが長引いているため、このコマンドは未実行のまま"
+                           "取り下げました。しばらくしてから再実行してください")
         _restart_worker()
         return False, (f"タイムアウト（{timeout}秒）: {line}\n"
                        "ワーカーを再起動しました。次の呼び出しから復旧します"
@@ -165,12 +192,9 @@ def get_procedure(name: str, module: str = "") -> str:
     ok, out = _run(cmd)
     if not ok:
         return (out + "\n（取得に失敗しました）").strip()
-    try:
-        with open(LAST_PROC, 'r', encoding='utf-8') as f:
-            code = f.read()
-    except OSError:
-        return out
-    return out + "\n----- コード -----\n" + code
+    # get の出力に保存先とコード全文が含まれる（_last_proc.vba と同一内容）ので
+    # ファイルを読み直して二重に返さない
+    return out
 
 
 @mcp.tool()
@@ -200,7 +224,8 @@ def _shutdown():
     # ツールが自動起動した Excel があれば畳む（ユーザーの Excel には触れない）
     try:
         box, done = {}, threading.Event()
-        _jobs.put(("__cleanup__", box, done))
+        with _worker_lock:
+            _jobs.put(("__cleanup__", box, done))
         done.wait(10)
     except Exception:
         pass
