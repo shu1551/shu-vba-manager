@@ -731,6 +731,103 @@ def make_module_backup(wb, module_name):
     return None
 
 
+class ModuleNameCollisionError(Exception):
+    """Remove+Import の名前衝突で、モジュールを期待名で取り込めなかったことを示す。
+
+    Import 自体は成功しており、置換後のコードは actual_name（連番付き別名）側に
+    存在している。呼び出し側はバックアップの再 Import で「復旧」してはいけない
+    （同じ VB_Name の .bas を重ねると連番モジュールがさらに増えるだけ）。
+    """
+    def __init__(self, expected_name, actual_name, message):
+        super().__init__(message)
+        self.expected_name = expected_name
+        self.actual_name = actual_name
+
+
+def _find_component(wb, name):
+    """VBComponent を名前（大小無視）で探す。無ければ None"""
+    for c in wb.VBProject.VBComponents:
+        if c.Name.lower() == name.lower():
+            return c
+    return None
+
+
+def _wait_component_gone(wb, name, timeout=15.0, interval=0.25):
+    """Remove 発行後、同名コンポーネントが VBProject から実際に消えるまで待つ。
+
+    VBE の Remove は、対象モジュールのプロシージャが実行中（メニューや
+    ショートカット経由の呼び出し中）などの場合に遅延完了する。消える前に
+    Import すると名前衝突で「shu0051」のような連番付き別名で取り込まれる
+    （2026-07-11 深夜の shu005 消滅事故の直接原因）。
+    戻り値: 消えたら True / timeout まで残っていたら False
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        pythoncom.PumpWaitingMessages()
+        if _find_component(wb, name) is None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _import_module_verified(wb, import_path, expected_name,
+                            ghost_timeout=15.0, rename_timeout=20.0, settle=1.5):
+    """Import ＋ 取り込み実名の検証。Remove+Import 系3経路の共用ガード。
+
+    2026-07-11 深夜の実害: replace-procedure（Attribute経路）で shu005 を置換した際、
+    Remove の遅延完了中に Import が走って名前衝突し「shu0051」として取り込まれた。
+    ツールは成功と報告し、shu005 の消滅は翌日まで発覚しなかった。
+    同じ事故を二度と起こさないため、ここで
+      (1) Import 前: expected_name の残骸が消えたことを確認（遅延 Remove 対策）。
+          timeout しても Import 自体は行う（見送ると遅延 Remove だけが後から完了して
+          モジュールが完全消滅するため、衝突覚悟で取り込んで (3) で回復する）。
+      (2) Import 後: 返ってきた VBComponent の実名を expected_name と照合。
+      (3) 不一致（連番付き別名等）なら旧名の消滅を待って改名で自動回復。
+          回復できなければ ModuleNameCollisionError（黙って成功と報告しない）。
+    成功時は Import 済みコンポーネントを返す（Save は呼び出し側の責務）。
+    """
+    if not _wait_component_gone(wb, expected_name, timeout=ghost_timeout):
+        print(f"⚠ 旧 '{expected_name}' の Remove がまだ完了していません"
+              f"（同モジュールのコードが実行中の可能性）。実名検証つきで Import を続行します。")
+    imported = wb.VBProject.VBComponents.Import(import_path)
+    if settle:
+        time.sleep(settle)
+    pythoncom.PumpWaitingMessages()
+    actual = imported.Name
+    if actual.lower() == expected_name.lower():
+        return imported
+    # 名前衝突を検出（例: shu005 → shu0051）。旧名が空くのを待って改名で回復する
+    print(f"⚠ 名前衝突を検出: '{expected_name}' が '{actual}' として取り込まれました。"
+          f"旧モジュールの消滅を待って改名で回復します...")
+    if not _wait_component_gone(wb, expected_name, timeout=rename_timeout):
+        raise ModuleNameCollisionError(
+            expected_name, actual,
+            f"旧 '{expected_name}' が残ったままのため '{actual}' を改名できません")
+    try:
+        imported.Name = expected_name
+    except Exception as ex:
+        raise ModuleNameCollisionError(
+            expected_name, actual, f"'{actual}' → '{expected_name}' の改名に失敗: {ex}")
+    if imported.Name.lower() != expected_name.lower():
+        raise ModuleNameCollisionError(
+            expected_name, actual, f"改名後の実名が '{imported.Name}' のままです")
+    print(f"回復成功: '{actual}' → '{expected_name}' に改名しました。")
+    return imported
+
+
+def _print_collision_guidance(ex, module_name, module_backup, err=False):
+    """名前衝突が自動回復できなかったときの案内（3経路共通・黙って成功にしない）"""
+    out = sys.stderr if err else sys.stdout
+    print(f"エラー: 名前衝突からの自動回復に失敗しました: {ex}", file=out)
+    print(f"  ⚠ 置換後のコードは別名モジュール '{ex.actual_name}' として存在しています。", file=out)
+    print(f"  ⚠ バックアップの再 Import はしないでください（VB_Name 衝突で連番モジュールが増えます）。", file=out)
+    print(f"  対処: 旧 '{module_name}' が消えているのを確認してから、VBE のプロパティウィンドウで", file=out)
+    print(f"        '{ex.actual_name}' の (オブジェクト名) を '{module_name}' に改名してください。", file=out)
+    if module_backup:
+        print(f"  置換前の内容のバックアップ: {module_backup}", file=out)
+
+
 # ================================================================
 # コマンド実装
 # ================================================================
@@ -1952,10 +2049,13 @@ def cmd_replace_procedure(args):
             removed = True
             time.sleep(1.5)
             pythoncom.PumpWaitingMessages()
-            wb.VBProject.VBComponents.Import(tmp_bas)
-            time.sleep(1.5)
-            pythoncom.PumpWaitingMessages()
+            # 実名検証つき Import（Remove 遅延完了→名前衝突→shu0051 化事故のガード）
+            _import_module_verified(wb, tmp_bas, module_name)
             wb.Save()
+        except ModuleNameCollisionError as ex:
+            # コードは連番付き別名側に生きている。バックアップ再 Import は三重化するので禁止
+            _print_collision_guidance(ex, module_name, module_backup)
+            return False
         except Exception as ex:
             print(f"エラー: 置換中に失敗しました: {ex}")
             if removed:
@@ -1964,10 +2064,14 @@ def cmd_replace_procedure(args):
                 print(f"⚠ モジュール '{module_name}' は Remove 済みです。バックアップから復旧を試みます...")
                 try:
                     if module_backup and os.path.exists(module_backup):
-                        wb.VBProject.VBComponents.Import(module_backup)
+                        _import_module_verified(wb, module_backup, module_name)
                         print(f"復旧成功: {module_backup} を再インポートしました（置換前の内容に戻っています）")
                     else:
                         raise RuntimeError("モジュールバックアップがありません")
+                except ModuleNameCollisionError as ex2:
+                    print(f"復旧の再 Import で名前衝突: {ex2}")
+                    print(f"  置換前の内容は別名モジュール '{ex2.actual_name}' 側にあります。")
+                    print(f"  旧 '{module_name}' が消えているのを確認してから '{ex2.actual_name}' を改名してください。")
                 except Exception as ex2:
                     print(f"復旧失敗: {ex2}")
                     print("  ⚠ このままブックを保存するとモジュールがファイルからも消えます。")
@@ -1979,6 +2083,7 @@ def cmd_replace_procedure(args):
             xl.DisplayAlerts = True
             if os.path.exists(tmp_bas):
                 _remove_export_artifacts(tmp_bas)
+        # ここまで来たら Import 済み・実名検証済み（黙って成功と報告しない、の実装）
         print(f"置換完了: [{module_name}] '{macro_name}' → 保存しました (Attribute保持)")
         return True
 
@@ -2327,10 +2432,13 @@ def cmd_replace_module(args):
                 removed = True
                 time.sleep(1.5)
                 pythoncom.PumpWaitingMessages()
-                wb.VBProject.VBComponents.Import(import_path)
-                time.sleep(1.5)
-                pythoncom.PumpWaitingMessages()
+                # 実名検証つき Import（Remove 遅延完了→名前衝突→shu0051 化事故のガード）
+                _import_module_verified(wb, import_path, module_name)
                 wb.Save()
+            except ModuleNameCollisionError as ex:
+                # コードは連番付き別名側に生きている。バックアップ再 Import は三重化するので禁止
+                _print_collision_guidance(ex, module_name, module_backup)
+                return False
             except Exception as ex:
                 print(f"エラー: 置換中に失敗しました: {ex}")
                 if removed:
@@ -2339,10 +2447,14 @@ def cmd_replace_module(args):
                     print(f"⚠ モジュール '{module_name}' は Remove 済みです。バックアップから復旧を試みます...")
                     try:
                         if module_backup and os.path.exists(module_backup):
-                            wb.VBProject.VBComponents.Import(module_backup)
+                            _import_module_verified(wb, module_backup, module_name)
                             print(f"復旧成功: {module_backup} を再インポートしました（置換前の内容に戻っています）")
                         else:
                             raise RuntimeError("モジュールバックアップがありません")
+                    except ModuleNameCollisionError as ex2:
+                        print(f"復旧の再 Import で名前衝突: {ex2}")
+                        print(f"  置換前の内容は別名モジュール '{ex2.actual_name}' 側にあります。")
+                        print(f"  旧 '{module_name}' が消えているのを確認してから '{ex2.actual_name}' を改名してください。")
                     except Exception as ex2:
                         print(f"復旧失敗: {ex2}")
                         print("  ⚠ このままブックを保存するとモジュールがファイルからも消えます。")
@@ -2572,11 +2684,14 @@ def cmd_reorder_macro(args):
         removed = True
         time.sleep(1.5)
         pythoncom.PumpWaitingMessages()
-        wb.VBProject.VBComponents.Import(tmp_bas)
-        time.sleep(1.5)
-        pythoncom.PumpWaitingMessages()
+        # 実名検証つき Import（Remove 遅延完了→名前衝突→shu0051 化事故のガード）
+        _import_module_verified(wb, tmp_bas, module_name)
         wb.Save()
         success = True
+    except ModuleNameCollisionError as ex:
+        # コードは連番付き別名側に生きている。バックアップ再 Import は三重化するので禁止
+        _print_collision_guidance(ex, module_name, module_backup, err=True)
+        return False
     except Exception as ex:
         # Remove 成功後に Import が失敗するとモジュールが消えたままになる。
         # replace-module と同じく、モジュールバックアップからの自動復旧を先に試みる
@@ -2585,11 +2700,16 @@ def cmd_reorder_macro(args):
                   f"開いているブックから外れた可能性があります）: {ex}", file=sys.stderr)
             try:
                 if module_backup and os.path.exists(module_backup):
-                    wb.VBProject.VBComponents.Import(module_backup)
+                    _import_module_verified(wb, module_backup, module_name)
                     print(f"復旧成功: {module_backup} を再インポートしました"
                           f"（並べ替え前の内容に戻っています）", file=sys.stderr)
                 else:
                     raise RuntimeError("モジュールバックアップがありません")
+            except ModuleNameCollisionError as ex2:
+                print(f"復旧の再 Import で名前衝突: {ex2}", file=sys.stderr)
+                print(f"  並べ替え前の内容は別名モジュール '{ex2.actual_name}' 側にあります。", file=sys.stderr)
+                print(f"  旧 '{module_name}' が消えているのを確認してから"
+                      f" '{ex2.actual_name}' を改名してください。", file=sys.stderr)
             except Exception as ex2:
                 print(f"復旧失敗: {ex2}", file=sys.stderr)
                 print("  ⚠ このままブックを保存するとモジュールがファイルからも消えます。", file=sys.stderr)
@@ -5799,6 +5919,286 @@ def cmd_snapshot(args):
     print("-" * 60)
     print("このJSONを read して質問すれば、開いたままブックLMになる。")
     return True
+
+
+def cmd_snapshot_diff(args):
+    """2つの snapshot JSON を機械的に比較: snapshot-diff <before.json> [after.json]
+
+    checkup を前後に挟む型の「シート側」版＝マクロや手作業が実際に何を変えたかを
+    セル・結合・図形・テーブル単位の事実で示す（COM 不要の純粋処理）。
+    after 省略時は _last_snapshot.json（直近の snapshot）と比較する。
+    評価はしない＝差分という事実だけ並べ、意味付けは読み手がやる（snapshot と同じ思想）。
+    """
+    import json
+    if not args.posargs:
+        print("使い方: snapshot-diff <before.json> [after.json]")
+        print("  after 省略時は _last_snapshot.json（直近の snapshot）と比較します")
+        return False
+    old_path = os.path.abspath(args.posargs[0])
+    new_path = (os.path.abspath(args.posargs[1]) if len(args.posargs) >= 2
+                else _LAST_SNAPSHOT_FILE)
+    try:
+        max_show = int(getattr(args, 'max_opt', None) or 20)
+    except (TypeError, ValueError):
+        print("エラー: --max は数値で指定してください")
+        return False
+
+    docs = []
+    for path in (old_path, new_path):
+        if not os.path.exists(path):
+            print(f"エラー: ファイルがありません: {path}")
+            return False
+        try:
+            # utf-8-sig: PowerShell の Out-File 等が付ける BOM も受け入れる（BOM無しも可）
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                d = json.load(f)
+        except Exception as e:
+            print(f"エラー: JSON を読めません: {path} ({e})")
+            return False
+        if not isinstance(d, dict) or 'sheets' not in d:
+            print(f"エラー: snapshot 形式ではありません（'sheets' がない）: {path}")
+            return False
+        docs.append(d)
+    old, new = docs
+
+    def clip(v, n=40):
+        s = str(v).replace('\r', ' ').replace('\n', ' ')
+        return s if len(s) <= n else s[:n] + '…'
+
+    def cell_map(info):
+        out = {}
+        for row in info.get('cells', ()):
+            for col, v in row.get('c', {}).items():
+                out[(row['r'], col)] = v
+        return out
+
+    def addr(key):
+        return f"{key[1]}{key[0]}"
+
+    def cell_order(key):
+        return (key[0], len(key[1]), key[1])   # 行→列文字（桁→辞書順）で安定表示
+
+    def show(label, items, fmt):
+        print(f"  {label}: {len(items)}件")
+        for it in items[:max_show]:
+            print(f"    {fmt(it)}")
+        if len(items) > max_show:
+            print(f"    … 他 {len(items) - max_show}件（--max で表示数変更可）")
+
+    print("===== スナップショット差分 =====")
+    print(f"  旧: {old.get('book', '?')}  ({old_path})")
+    print(f"  新: {new.get('book', '?')}  ({new_path})")
+    if old.get('book') != new.get('book'):
+        print("  ※ ブック名が異なります（別ブック同士の比較）")
+
+    old_sheets, new_sheets = old['sheets'], new['sheets']
+    diff_sheets = 0
+
+    for name in [n for n in old_sheets if n not in new_sheets]:
+        diff_sheets += 1
+        print(f"\n- シート削除: {name}")
+    for name in [n for n in new_sheets if n not in old_sheets]:
+        diff_sheets += 1
+        info = new_sheets[name]
+        print(f"\n+ シート追加: {name}  ({info.get('dims', '?')})")
+
+    for name in [n for n in old_sheets if n in new_sheets]:
+        oi, ni = old_sheets[name], new_sheets[name]
+
+        oc, nc_ = cell_map(oi), cell_map(ni)
+        added = sorted([k for k in nc_ if k not in oc], key=cell_order)
+        removed = sorted([k for k in oc if k not in nc_], key=cell_order)
+        changed = sorted([k for k in oc if k in nc_ and oc[k] != nc_[k]],
+                         key=cell_order)
+
+        om = set(oi.get('merged') or [])
+        nm = set(ni.get('merged') or [])
+        m_add, m_del = sorted(nm - om), sorted(om - nm)
+
+        def shape_map(info):
+            out, dup = {}, set()
+            for s in info.get('shapes', ()):
+                nm2 = s.get('name', '(無名)')
+                if nm2 in out:
+                    dup.add(nm2)          # Excel は図形名の重複を許す＝黙って落とさず注記する
+                out.setdefault(nm2, s)
+            return out, dup
+        os_, odup = shape_map(oi)
+        ns_, ndup = shape_map(ni)
+        shape_dup = odup | ndup
+        s_add = sorted([n2 for n2 in ns_ if n2 not in os_])
+        s_del = sorted([n2 for n2 in os_ if n2 not in ns_])
+        s_chg = []
+        for n2 in sorted(set(os_) & set(ns_)):
+            a, b = os_[n2], ns_[n2]
+            fields = []
+            if a.get('text') != b.get('text'):
+                fields.append(f"文字 '{clip(a.get('text'))}'→'{clip(b.get('text'))}'")
+            if a.get('onaction') != b.get('onaction'):
+                fields.append(f"OnAction {a.get('onaction')}→{b.get('onaction')}")
+            if (a.get('l'), a.get('t')) != (b.get('l'), b.get('t')):
+                fields.append(f"位置 ({a.get('l')},{a.get('t')})→({b.get('l')},{b.get('t')})")
+            if fields:
+                s_chg.append((n2, fields))
+
+        def table_map(info):
+            return {t['name']: t.get('address') for t in info.get('tables', ())}
+        ot, nt = table_map(oi), table_map(ni)
+        t_add = sorted([n2 for n2 in nt if n2 not in ot])
+        t_del = sorted([n2 for n2 in ot if n2 not in nt])
+        t_chg = sorted([n2 for n2 in ot if n2 in nt and ot[n2] != nt[n2]])
+
+        has_diff = any((added, removed, changed, m_add, m_del,
+                        s_add, s_del, s_chg, t_add, t_del, t_chg,
+                        oi.get('dims') != ni.get('dims')))
+        if not has_diff:
+            continue
+        diff_sheets += 1
+        print(f"\n* シート: {name}")
+        if oi.get('dims') != ni.get('dims'):
+            print(f"  使用範囲: {oi.get('dims')} → {ni.get('dims')}")
+        trunc = oi.get('cells_truncated') or ni.get('cells_truncated')
+        if trunc:
+            print(f"  ※ セルは {trunc['read_rows']}行で打ち切られた snapshot ＝比較もその範囲まで")
+        if oi.get('merged_skipped_cells') or ni.get('merged_skipped_cells'):
+            print("  ※ 結合セル未走査の snapshot（範囲が大）＝結合の差分は比較できていない")
+        if shape_dup:
+            print(f"  ※ 同名の図形が複数: {', '.join(sorted(shape_dup))}"
+                  "（名前単位の比較のため2つ目以降は対象外）")
+        if changed:
+            show("セル変更", changed,
+                 lambda k: f"{addr(k)}: '{clip(oc[k])}' → '{clip(nc_[k])}'")
+        if added:
+            show("セル追加", added, lambda k: f"{addr(k)}: '{clip(nc_[k])}'")
+        if removed:
+            show("セル削除", removed, lambda k: f"{addr(k)}: '{clip(oc[k])}'")
+        if m_add:
+            show("結合追加", m_add, lambda a: a)
+        if m_del:
+            show("結合解除", m_del, lambda a: a)
+        if s_add:
+            show("図形追加", s_add,
+                 lambda n2: n2 + (f"「{clip(ns_[n2].get('text'))}」" if ns_[n2].get('text') else ""))
+        if s_del:
+            show("図形削除", s_del,
+                 lambda n2: n2 + (f"「{clip(os_[n2].get('text'))}」" if os_[n2].get('text') else ""))
+        if s_chg:
+            show("図形変更", s_chg, lambda it: f"{it[0]}: " + " / ".join(it[1]))
+        if t_add:
+            show("テーブル追加", t_add, lambda n2: f"{n2} ({nt[n2]})")
+        if t_del:
+            show("テーブル削除", t_del, lambda n2: f"{n2} ({ot[n2]})")
+        if t_chg:
+            show("テーブル範囲変更", t_chg, lambda n2: f"{n2}: {ot[n2]} → {nt[n2]}")
+
+    print("\n" + "-" * 60)
+    if diff_sheets:
+        print(f"差分あり: シート{diff_sheets}枚に変更")
+    else:
+        print("差分なし（2つのスナップショットは一致）")
+    return True
+
+
+def cmd_wiring(args):
+    """ボタン⇔マクロの配線図: wiring [excel_file] [--json]
+
+    シート上の図形/ボタンに登録された OnAction を全部拾い（グループは1段展開）、
+    ブック内のマクロ名簿と突き合わせる。行き先のないボタン＝壊れた配線の検出器。
+    call-graph（孤立マクロ）・docs（マクロ→ボタン逆引き）と対になる「ボタン側から見た地図」。
+    VBA に触れないブック（保護/VBOM未信頼）でも配線一覧だけは出す（実在確認のみ縮退）。
+    """
+    import json
+    target_file, _ = parse_target_and_rest(args.posargs)
+    xl, wb = get_workbook(target_file, readonly=True)   # 診断は読むだけ
+
+    # マクロ名簿（Sub/Function 名 → 正式名）
+    known = {}
+    vba_error = None
+    proc_pat = re.compile(
+        r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
+        r'(?:Sub|Function)\s+([^\s\(\)]+)',
+        re.IGNORECASE | re.MULTILINE)
+    try:
+        for comp in wb.VBProject.VBComponents:
+            if int(comp.Type) not in (1, 2, 3, 100):
+                continue
+            cm = comp.CodeModule
+            n = cm.CountOfLines
+            code = cm.Lines(1, n) if n else ""
+            for m in proc_pat.finditer(code):
+                known.setdefault(m.group(1).lower(), m.group(1))
+    except Exception as e:
+        vba_error = e
+
+    rows = []
+    for sh in wb.Worksheets:
+        shapes = []
+        try:
+            _collect_shapes(sh.Shapes, shapes)
+        except Exception:
+            continue
+        for s in shapes:
+            macro = s.get('onaction')
+            if not macro:
+                continue
+            resolved = None
+            if vba_error is None:
+                hit = known.get(macro.lower())
+                if hit is None and '.' in macro:
+                    # 「モジュール名.マクロ名」形式（同名マクロがあると Excel が
+                    # 自動でこの形式にする）は末尾名で解決する
+                    hit = known.get(macro.rsplit('.', 1)[-1].lower())
+                resolved = hit is not None
+            rows.append({'sheet': sh.Name, 'shape': s.get('name', '(図形)'),
+                         'text': s.get('text'), 'group': s.get('group'),
+                         'macro': macro, 'resolved': resolved})
+
+    broken = [r for r in rows if r['resolved'] is False]
+
+    if getattr(args, 'json', False):
+        print(json.dumps({"success": True, "book": wb.Name,
+                          "vba_readable": vba_error is None,
+                          "wires": rows, "broken": len(broken)},
+                         ensure_ascii=False))
+        return not broken
+
+    def label(r):
+        t = f"「{str(r['text'])[:30]}」" if r['text'] else ""
+        g = f"（グループ {r['group']} 内）" if r['group'] else ""
+        return f"{r['shape']}{t}{g}"
+
+    print(f"===== ボタン⇔マクロ配線図: {wb.Name} =====")
+    if vba_error is not None:
+        print("※ VBA プロジェクトに触れないため実在確認は未実施（配線の一覧のみ）")
+        print(f"   詳細: {vba_error}")
+    if not rows:
+        print("OnAction が登録された図形/ボタンはありません")
+        return True
+
+    cur = None
+    for r in rows:
+        if r['sheet'] != cur:
+            cur = r['sheet']
+            print(f"\nシート: {cur}")
+        if r['resolved'] is True:
+            mark = "○"
+        elif r['resolved'] is False:
+            mark = "×（存在しない）"
+        else:
+            mark = "（未確認）"
+        print(f"  {label(r)} → {r['macro']}  {mark}")
+
+    print("\n" + "-" * 60)
+    if vba_error is None:
+        print(f"配線 {len(rows)}本 / 実在 {len(rows) - len(broken)} / 行き先なし {len(broken)}")
+        if broken:
+            print("\n⚠ 行き先のないボタン（OnAction 先のマクロが見つからない）:")
+            for r in broken:
+                print(f"  {r['sheet']} / {label(r)} → {r['macro']}")
+    else:
+        print(f"配線 {len(rows)}本（実在確認なし）")
+    print("参考: マクロ側から見た地図は call-graph（孤立検出）/ docs（マクロ→ボタン逆引き）")
+    return not broken
 
 
 def cmd_screenshot(args):
@@ -9401,6 +9801,20 @@ def build_parser():
     p.add_argument("--max-rows", dest="max_rows", default=None,
                    help="1シートあたりのセル読み込み行上限（既定5000。超過は打ち切り注記）")
 
+    # snapshot-diff <before.json> [after.json] [--max N]
+    p = sub.add_parser("snapshot-diff",
+                       help="2つのsnapshot JSONを比較＝前後差分の検分（COM不要）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--max", dest="max_opt", default=None,
+                   help="1分類あたりの表示件数上限（既定20。超過は件数のみ表示）")
+
+    # wiring [excel_file] [--json]
+    p = sub.add_parser("wiring", aliases=["配線図"],
+                       help="ボタン⇔マクロの配線図（OnAction一覧＋行き先のないボタン検出）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--json", action="store_true",
+                   help="JSON形式で出力（機械処理用）")
+
     # screenshot [excel_file] [range] [--out file]
     p = sub.add_parser("screenshot")
     p.add_argument("posargs", nargs="*")
@@ -9940,6 +10354,9 @@ def _command_table():
         "read-selection":    cmd_read_selection,
         "sheet-info":        cmd_sheet_info,
         "snapshot":          cmd_snapshot,
+        "snapshot-diff":     cmd_snapshot_diff,
+        "wiring":            cmd_wiring,
+        "配線図":              cmd_wiring,
         "screenshot":        cmd_screenshot,
         "write-range":       cmd_write_range,
         "clear-range":       cmd_clear_range,

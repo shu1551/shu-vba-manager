@@ -515,6 +515,98 @@ def test_multipage_frame_children_present_in_layout():
     assert frames and len(frames[0]['children']) == 2
 
 
+# ================================================================
+# vba_manager: Remove+Import の名前衝突ガード（2026-07-11 shu005→shu0051 事故の回帰）
+# フェイク VBE で「Remove 遅延完了中の Import は連番付き別名になる」挙動を模す。
+# 実 Excel での正常系は E2E（実機テスト）で担保。
+# ================================================================
+
+class _FakeComp:
+    def __init__(self, name):
+        self.Name = name
+
+
+class _FakeVBComponents:
+    """VBE の Import 挙動を模す: 同名が既に居ると連番付き別名で取り込まれる。
+
+    ghost_clears_after_iters: 列挙がその回数を超えたらゴースト（遅延 Remove 中の
+    旧モジュール）を消す。None なら永遠に残る（回復不能ケース）。
+    """
+    def __init__(self, names, base_name, ghost=None, ghost_clears_after_iters=None):
+        self.comps = [_FakeComp(n) for n in names]
+        self._base = base_name
+        self._ghost = ghost
+        self._clear_after = ghost_clears_after_iters
+        self._iters = 0
+
+    def __iter__(self):
+        self._iters += 1
+        if (self._ghost is not None and self._clear_after is not None
+                and self._iters > self._clear_after):
+            self.comps = [c for c in self.comps if c.Name != self._ghost]
+            self._ghost = None
+        return iter(list(self.comps))
+
+    def Import(self, path):
+        name = self._base
+        if any(c.Name.lower() == name.lower() for c in self.comps):
+            name = name + "1"          # VBE の連番リネーム
+        c = _FakeComp(name)
+        self.comps.append(c)
+        return c
+
+
+class _FakeWB:
+    def __init__(self, components):
+        self.VBProject = type("VBP", (), {"VBComponents": components})()
+
+
+def test_import_verified_normal_returns_expected_name():
+    comps = _FakeVBComponents(["OtherMod"], "TestMod")
+    wb = _FakeWB(comps)
+    got = vm._import_module_verified(wb, "x.bas", "TestMod",
+                                     ghost_timeout=0.05, rename_timeout=0.05, settle=0)
+    assert got.Name == "TestMod"
+    assert [c.Name for c in comps.comps] == ["OtherMod", "TestMod"]
+
+
+def test_import_verified_waits_for_ghost_and_avoids_collision():
+    # 遅延 Remove 中のゴーストが待機中に消える → 衝突せず期待名で取り込まれる
+    comps = _FakeVBComponents(["TestMod"], "TestMod",
+                              ghost="TestMod", ghost_clears_after_iters=2)
+    wb = _FakeWB(comps)
+    got = vm._import_module_verified(wb, "x.bas", "TestMod",
+                                     ghost_timeout=3.0, rename_timeout=0.05, settle=0)
+    assert got.Name == "TestMod"
+    assert [c.Name for c in comps.comps] == ["TestMod"]
+
+
+def test_import_verified_collision_recovers_by_rename():
+    # ゴーストが Import 後まで残る → TestMod1 で衝突 → 消滅を待って改名回復
+    comps = _FakeVBComponents(["TestMod"], "TestMod",
+                              ghost="TestMod", ghost_clears_after_iters=2)
+    wb = _FakeWB(comps)
+    got = vm._import_module_verified(wb, "x.bas", "TestMod",
+                                     ghost_timeout=0.01, rename_timeout=3.0, settle=0)
+    assert got.Name == "TestMod"
+    assert [c.Name for c in comps.comps] == ["TestMod"]
+
+
+def test_import_verified_unrecoverable_raises_not_silent_success():
+    # ゴーストが消えない → 黙って成功にせず ModuleNameCollisionError
+    comps = _FakeVBComponents(["TestMod"], "TestMod", ghost="TestMod")
+    wb = _FakeWB(comps)
+    try:
+        vm._import_module_verified(wb, "x.bas", "TestMod",
+                                   ghost_timeout=0.01, rename_timeout=0.05, settle=0)
+        assert False, "ModuleNameCollisionError が飛ぶべき"
+    except vm.ModuleNameCollisionError as ex:
+        assert ex.expected_name == "TestMod"
+        assert ex.actual_name == "TestMod1"
+    # 衝突した別名側にコードが残っている（バックアップ再Importさせないための前提）
+    assert any(c.Name == "TestMod1" for c in comps.comps)
+
+
 def test_trailing_spacer_counts_fully():
     # 末尾 spacer が gap_y ぶん目減りしないこと（中間の spacer と同じ意味論）
     base = [fl.row(fl.lbl("X"), fl.txt("tX"))]

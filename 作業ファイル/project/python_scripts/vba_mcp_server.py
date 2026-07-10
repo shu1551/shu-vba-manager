@@ -6,6 +6,8 @@
 get_workbook の接続キャッシュを持ち続けるため、CLI の「1コマンド毎の COM 再接続」
 が消える。いわば shell/batch の常駐版。接続の鮮度（ブックが閉じられた等）は
 get_workbook 側の生存確認＋自動再接続に任せる。
+ただし握りっぱなしにはしない: アイドル IDLE_RELEASE_SECS 秒で COM 参照を解放する
+（常駐が参照を握ったままだと、ユーザーが×で閉じた Excel がゾンビ化するため）。
 
 制約:
 - stdout は JSON-RPC の通信線なので、コマンドの print は全て捕捉してツール結果で返す
@@ -13,6 +15,7 @@ get_workbook 側の生存確認＋自動再接続に任せる。
 - input() 待ちで固まらないよう実行中は stdin を空にする（確認系は -y を付けて呼ぶ）
 """
 import atexit
+import gc
 import io
 import os
 import queue
@@ -31,8 +34,33 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 LAST_PROC = os.path.join(SCRIPT_DIR, "_last_proc.vba")
 BLOCKED = {"shell", "batch"}  # 対話・標準入力前提のコマンドは MCP では使えない
 
+# アイドルでこの秒数コマンドが来なければ Excel への COM 参照を解放する。
+# 常駐が Application/Workbook 参照を握ったままだと、ユーザーが Excel を×で
+# 閉じてもプロセスが数十秒死なずゾンビ化し、その隙にブックを開くと死にかけ
+# プロセスに合流して XLSTART(PERSONAL.XLSB) を読まない実害がある
+# （2026-07-10 対照実験: COM未接触/使い捨てスクリプトは×閉じ2.6秒で消滅、
+# 常駐ワーカー接続時のみ25秒超のゾンビ化）。解放後の次コマンドは get_workbook
+# が再接続するだけなので、連続コマンド中の速度は落ちない。
+IDLE_RELEASE_SECS = 5
+
 _jobs = queue.Queue()
 _worker_lock = threading.Lock()
+
+
+def _release_com_refs():
+    """接続キャッシュの Excel COM 参照を手放す（COM を作ったワーカースレッド上で呼ぶ）。
+
+    対象は get_workbook の接続キャッシュだけ。ツールが自動起動した Excel
+    （_created_instances）は終了時の後始末に参照が要るため触らない。
+    「ユーザーの Excel に参照を残さない」が目的のすべて。
+    """
+    try:
+        if not vba_manager._wb_cache:
+            return
+        vba_manager._wb_cache.clear()
+        gc.collect()  # 参照サイクルに残った COM ラッパも確実に Release させる
+    except Exception:
+        pass
 
 
 def _tokenize(line):
@@ -62,7 +90,14 @@ def _worker(jobs):
     parser = vba_manager.build_parser()
     table = vba_manager._command_table()
     while True:
-        item = jobs.get()
+        try:
+            item = jobs.get(timeout=IDLE_RELEASE_SECS)
+        except queue.Empty:
+            # アイドル: 連続コマンド中は保持していた COM 参照をここで手放す。
+            # 世代交代後に復帰した旧ワーカーは新世代のキャッシュに触らない
+            if jobs is _jobs:
+                _release_com_refs()
+            continue
         if item is None:
             # 世代交代の停止合図（タイムアウト後に復帰した旧ワーカーはここで退場）
             break
