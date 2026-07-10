@@ -607,6 +607,79 @@ def test_import_verified_unrecoverable_raises_not_silent_success():
     assert any(c.Name == "TestMod1" for c in comps.comps)
 
 
+# ================================================================
+# _collect_shapes: OnAction のブック修飾を落とさない（wiring の外部ブック判定の素）
+# ================================================================
+
+class _FakeShape:
+    def __init__(self, name, onaction):
+        self.Name = name
+        self.Type = 1
+        self.OnAction = onaction
+        self.Left = 1.0
+        self.Top = 2.0
+
+
+def test_collect_shapes_keeps_onaction_book_qualifier():
+    out = []
+    vm._collect_shapes([_FakeShape("B1", "'秀 テスト.xlam'!Macro1"),
+                        _FakeShape("B2", "Macro2"),
+                        _FakeShape("B3", "ファイル一覧.xlsm!全検索開始")], out)
+    assert out[0]["onaction"] == "Macro1"
+    assert out[0]["onaction_book"] == "秀 テスト.xlam"
+    assert out[1]["onaction"] == "Macro2"
+    assert "onaction_book" not in out[1]
+    assert out[2]["onaction"] == "全検索開始"
+    assert out[2]["onaction_book"] == "ファイル一覧.xlsm"
+
+
+# ================================================================
+# snapshot-diff: 結合未走査の snapshot に疑似差分（結合追加/解除）を出さない
+# ================================================================
+
+def _write_snap(path, sheets):
+    import json
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({"success": True, "book": "T.xlsm", "sheets": sheets},
+                  f, ensure_ascii=False)
+
+
+def _diff_args(old_path, new_path):
+    import argparse
+    return argparse.Namespace(posargs=[str(old_path), str(new_path)], max_opt=None)
+
+
+def test_snapshot_diff_merged_unscanned_suppresses_pseudo_diff(tmp_path, capsys):
+    # 旧=結合未走査 / 新=結合あり。セル差分でシートは表示されるが、
+    # 「結合追加」の疑似差分は出さず、比較していない旨を注記する
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    _write_snap(p1, {"S": {"dims": "1行 x 1列",
+                           "cells": [{"r": 1, "c": {"A": "x"}}],
+                           "merged_skipped_cells": 99999}})
+    _write_snap(p2, {"S": {"dims": "1行 x 1列",
+                           "cells": [{"r": 1, "c": {"A": "y"}}],
+                           "merged": ["$A$5:$B$5"]}})
+    assert vm.cmd_snapshot_diff(_diff_args(p1, p2)) is True
+    out = capsys.readouterr().out
+    assert "結合追加" not in out
+    assert "結合の差分は比較していない" in out
+    assert "セル変更: 1件" in out
+
+
+def test_snapshot_diff_merged_unscanned_note_survives_hidden_sheet(tmp_path, capsys):
+    # 結合以外に差分がなくシート自体が非表示でも、「比較できていない」事実は落とさない
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    _write_snap(p1, {"S": {"dims": "1行 x 1列", "cells": [],
+                           "merged_skipped_cells": 99999}})
+    _write_snap(p2, {"S": {"dims": "1行 x 1列", "cells": [],
+                           "merged": ["$A$1:$B$1"]}})
+    assert vm.cmd_snapshot_diff(_diff_args(p1, p2)) is True
+    out = capsys.readouterr().out
+    assert "結合の差分を比較できていません" in out
+    assert "S" in out.split("比較できていません:")[-1]
+    assert "差分なし" in out
+
+
 def test_trailing_spacer_counts_fully():
     # 末尾 spacer が gap_y ぶん目減りしないこと（中間の spacer と同じ意味論）
     base = [fl.row(fl.lbl("X"), fl.txt("tX"))]

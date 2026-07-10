@@ -5784,6 +5784,12 @@ def _collect_shapes(shapes, out, in_group=None):
             oa = shp.OnAction
             if oa:
                 s["onaction"] = oa.split('!')[-1].strip("'\" ")
+                if '!' in oa:
+                    # 「'ブック名'!マクロ名」のブック修飾。剥がして捨てると
+                    # アドイン先の配線を wiring が「存在しない」と誤判定する
+                    book = oa.rsplit('!', 1)[0].strip("'\" ")
+                    if book:
+                        s["onaction_book"] = book
         except Exception:
             pass
         if in_group:
@@ -5993,6 +5999,7 @@ def cmd_snapshot_diff(args):
 
     old_sheets, new_sheets = old['sheets'], new['sheets']
     diff_sheets = 0
+    merged_note_hidden = []   # 結合未走査で比較できず、かつ他に差分がなく非表示のシート
 
     for name in [n for n in old_sheets if n not in new_sheets]:
         diff_sheets += 1
@@ -6011,9 +6018,15 @@ def cmd_snapshot_diff(args):
         changed = sorted([k for k in oc if k in nc_ and oc[k] != nc_[k]],
                          key=cell_order)
 
-        om = set(oi.get('merged') or [])
-        nm = set(ni.get('merged') or [])
-        m_add, m_del = sorted(nm - om), sorted(om - nm)
+        merged_unscanned = bool(oi.get('merged_skipped_cells')
+                                or ni.get('merged_skipped_cells'))
+        if merged_unscanned:
+            # 片側でも結合未走査なら差分は出せない（空 vs 実データの疑似差分を出さない）
+            m_add, m_del = [], []
+        else:
+            om = set(oi.get('merged') or [])
+            nm = set(ni.get('merged') or [])
+            m_add, m_del = sorted(nm - om), sorted(om - nm)
 
         def shape_map(info):
             out, dup = {}, set()
@@ -6052,6 +6065,9 @@ def cmd_snapshot_diff(args):
                         s_add, s_del, s_chg, t_add, t_del, t_chg,
                         oi.get('dims') != ni.get('dims')))
         if not has_diff:
+            if merged_unscanned:
+                # シート自体を表示しない場合も、比較できなかった事実は落とさない
+                merged_note_hidden.append(name)
             continue
         diff_sheets += 1
         print(f"\n* シート: {name}")
@@ -6060,8 +6076,8 @@ def cmd_snapshot_diff(args):
         trunc = oi.get('cells_truncated') or ni.get('cells_truncated')
         if trunc:
             print(f"  ※ セルは {trunc['read_rows']}行で打ち切られた snapshot ＝比較もその範囲まで")
-        if oi.get('merged_skipped_cells') or ni.get('merged_skipped_cells'):
-            print("  ※ 結合セル未走査の snapshot（範囲が大）＝結合の差分は比較できていない")
+        if merged_unscanned:
+            print("  ※ 結合セル未走査の snapshot（範囲が大）＝結合の差分は比較していない")
         if shape_dup:
             print(f"  ※ 同名の図形が複数: {', '.join(sorted(shape_dup))}"
                   "（名前単位の比較のため2つ目以降は対象外）")
@@ -6091,6 +6107,9 @@ def cmd_snapshot_diff(args):
         if t_chg:
             show("テーブル範囲変更", t_chg, lambda n2: f"{n2}: {ot[n2]} → {nt[n2]}")
 
+    if merged_note_hidden:
+        print(f"\n※ 結合セル未走査の snapshot のため、次のシートは結合の差分を比較できていません: "
+              f"{', '.join(merged_note_hidden)}")
     print("\n" + "-" * 60)
     if diff_sheets:
         print(f"差分あり: シート{diff_sheets}枚に変更")
@@ -6106,6 +6125,8 @@ def cmd_wiring(args):
     ブック内のマクロ名簿と突き合わせる。行き先のないボタン＝壊れた配線の検出器。
     call-graph（孤立マクロ）・docs（マクロ→ボタン逆引き）と対になる「ボタン側から見た地図」。
     VBA に触れないブック（保護/VBOM未信頼）でも配線一覧だけは出す（実在確認のみ縮退）。
+    別ブック修飾（'秀.xlam'!マクロ 等）の配線は名簿の外＝実在確認せず「外部ブック先」として
+    別枠で表示し、壊れた配線には数えない（このブックの名簿で×を付けると誤検出になる）。
     """
     import json
     target_file, _ = parse_target_and_rest(args.posargs)
@@ -6141,8 +6162,13 @@ def cmd_wiring(args):
             macro = s.get('onaction')
             if not macro:
                 continue
+            # ブック修飾つき配線。自ブック名なら普通に照合、他ブック(アドイン等)なら
+            # このブックの名簿では実在確認できない＝外部ブック先として別枠にする
+            book = s.get('onaction_book')
+            if book and book.lower() == wb.Name.lower():
+                book = None
             resolved = None
-            if vba_error is None:
+            if book is None and vba_error is None:
                 hit = known.get(macro.lower())
                 if hit is None and '.' in macro:
                     # 「モジュール名.マクロ名」形式（同名マクロがあると Excel が
@@ -6151,14 +6177,16 @@ def cmd_wiring(args):
                 resolved = hit is not None
             rows.append({'sheet': sh.Name, 'shape': s.get('name', '(図形)'),
                          'text': s.get('text'), 'group': s.get('group'),
-                         'macro': macro, 'resolved': resolved})
+                         'macro': macro, 'book': book, 'resolved': resolved})
 
     broken = [r for r in rows if r['resolved'] is False]
+    external = [r for r in rows if r['book']]
 
     if getattr(args, 'json', False):
         print(json.dumps({"success": True, "book": wb.Name,
                           "vba_readable": vba_error is None,
-                          "wires": rows, "broken": len(broken)},
+                          "wires": rows, "broken": len(broken),
+                          "external": len(external)},
                          ensure_ascii=False))
         return not broken
 
@@ -6180,17 +6208,27 @@ def cmd_wiring(args):
         if r['sheet'] != cur:
             cur = r['sheet']
             print(f"\nシート: {cur}")
-        if r['resolved'] is True:
+        if r['book']:
+            mark = "（外部ブック先・このブックの名簿では確認できない）"
+            dest = f"{r['book']}!{r['macro']}"
+        elif r['resolved'] is True:
             mark = "○"
+            dest = r['macro']
         elif r['resolved'] is False:
             mark = "×（存在しない）"
+            dest = r['macro']
         else:
             mark = "（未確認）"
-        print(f"  {label(r)} → {r['macro']}  {mark}")
+            dest = r['macro']
+        print(f"  {label(r)} → {dest}  {mark}")
 
     print("\n" + "-" * 60)
     if vba_error is None:
-        print(f"配線 {len(rows)}本 / 実在 {len(rows) - len(broken)} / 行き先なし {len(broken)}")
+        line = (f"配線 {len(rows)}本 / 実在 {len(rows) - len(broken) - len(external)}"
+                f" / 行き先なし {len(broken)}")
+        if external:
+            line += f" / 外部ブック先 {len(external)}（確認対象外）"
+        print(line)
         if broken:
             print("\n⚠ 行き先のないボタン（OnAction 先のマクロが見つからない）:")
             for r in broken:
