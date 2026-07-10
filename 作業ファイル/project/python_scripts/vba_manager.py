@@ -4881,12 +4881,18 @@ def cmd_code_replace(args):
     return True
 
 
-def _start_dialog_watcher(xl, mode):
-    """run-macro 実行中に出る MsgBox/InputBox(#32770) を自動応答する監視スレッド。
+def _start_dialog_watcher(xl, mode=None):
+    """マクロ発火中に出る MsgBox/InputBox(#32770) を検出して自動解除する監視スレッド。
 
-    xl.Application.Run は MsgBox が出ると閉じるまでブロックするため、別スレッドから
-    Excel が所有するモーダルダイアログにだけ WM_COMMAND を送って解除する。
-    mode: ok/enter->OK, cancel->キャンセル, yes->はい, no->いいえ。返り値の .stop() で終了。
+    xl.Application.Run（や書き込みで走るイベントマクロ）は MsgBox が出ると閉じるまで
+    ブロックし、別スレッドから閉じない限りコマンドが無言でハングする（2026-07-11 実害:
+    write-range→Worksheet_Change→エラーMsgBox で操作が固まり、人が手で閉じるまで戻らず、
+    改修が異常に長引いた）。そこで Excel が所有するモーダルダイアログにだけ WM_COMMAND を
+    送って解除する。
+    mode=None（既定・安全解除）: キャンセル→唯一ボタンの順で「閉じられるボタン」を押す。
+      破壊的操作を確定させない方向に倒し、検出した事実と本文を .count / .last_text で残す。
+    mode 明示: ok/enter->OK, cancel->キャンセル, yes->はい, no->いいえ。
+    返り値の .stop() で終了。.count=解除した回数 / .last_text=最後に見た本文。
     """
     import threading
     try:
@@ -4918,10 +4924,10 @@ def _start_dialog_watcher(xl, mode):
                 pass
         return _Noop()
 
-    mode_l = (mode or 'ok').lower()
+    mode_l = (mode or 'safe').lower()
     # 標準ボタンID（Win32 DialogBox の既定値）。決め打ちの「望みのID」。
     _STD_ID = {'ok': 1, 'enter': 1, 'cancel': 2, 'yes': 6, 'no': 7,
-               'abort': 3, 'retry': 4, 'ignore': 5}
+               'abort': 3, 'retry': 4, 'ignore': 5, 'safe': 2}
     # テキストで拾う第2の網（OK専用MsgBoxのID化け対策・日英両対応）
     _TEXT_HINTS = {
         'ok':     ('ok', 'はい', '確定', '了解'),
@@ -4953,6 +4959,26 @@ def _start_dialog_watcher(xl, mode):
             pass
         return found
 
+    def _dialog_text(hwnd):
+        """ダイアログ本文（Static コントロールの文字）を採取して報告に使う。"""
+        parts = []
+
+        def _child(ch, _):
+            try:
+                if win32gui.GetClassName(ch) == 'Static':
+                    t = win32gui.GetWindowText(ch).strip()
+                    if t and t not in parts:
+                        parts.append(t)
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumChildWindows(hwnd, _child, None)
+        except Exception:
+            pass
+        return ' / '.join(parts)
+
     def _resolve_button_id(hwnd):
         """このダイアログで実際に押すべきボタンIDを、実在ボタンから決める。
 
@@ -4964,6 +4990,15 @@ def _start_dialog_watcher(xl, mode):
         if not btns:
             return want_id                       # 取れなければ従来の決め打ち
         ids = [cid for cid, _ in btns]
+        # 安全解除モード（既定）: 破壊確定を避けつつ「閉じられるボタン」を必ず1つ選ぶ
+        if mode_l == 'safe':
+            if 2 in ids:                         # キャンセル(IDCANCEL) があれば最優先
+                return 2
+            for cid, txt in btns:                # 文字でキャンセル/いいえ系
+                tl = txt.lower()
+                if any(h in tl for h in ('cancel', 'キャンセル', '中止', 'いいえ', 'no')):
+                    return cid
+            return btns[0][0]                    # OK専用等はその1つで閉じる
         # 1) 望む標準IDが実在すればそれ（通常の OK+キャンセル・Yes/No 等）
         if want_id in ids:
             return want_id
@@ -4979,6 +5014,8 @@ def _start_dialog_watcher(xl, mode):
         return want_id
 
     stop_evt = threading.Event()
+    state = {'count': 0, 'last': ''}       # 解除した回数と最後に見た本文
+    handled = set()                        # 同じダイアログを二重に数えない
 
     def _loop():
         while not stop_evt.is_set():
@@ -5002,10 +5039,18 @@ def _start_dialog_watcher(xl, mode):
                 win32gui.EnumWindows(_cb, None)
             except Exception:
                 pass
+            handled.intersection_update(targets)   # 消えた hwnd は忘れる
             for hwnd in targets:
+                if hwnd in handled:                # 既に解除送信済みなら二重送信しない
+                    continue
                 try:
+                    txt = _dialog_text(hwnd)
                     cid = _resolve_button_id(hwnd)
                     win32gui.PostMessage(hwnd, win32con.WM_COMMAND, cid, 0)
+                    handled.add(hwnd)
+                    state['count'] += 1
+                    if txt:
+                        state['last'] = txt
                 except Exception:
                     pass
             stop_evt.wait(0.15)
@@ -5017,7 +5062,29 @@ def _start_dialog_watcher(xl, mode):
         def stop(self):
             stop_evt.set()
 
+        @property
+        def count(self):
+            return state['count']
+
+        @property
+        def last_text(self):
+            return state['last']
+
     return _Watcher()
+
+
+def _dialog_watcher_note(watcher, mode):
+    """ダイアログを自動解除したときの人向けの注記（無ければ空文字）。
+
+    「黙って握りつぶした」にしないための報告。何が出て、どう閉じたかを一行で残す。
+    """
+    if watcher is None or not getattr(watcher, 'count', 0):
+        return ""
+    how = "指定ボタンで応答" if mode else "安全側（キャンセル優先）で自動解除"
+    body = watcher.last_text or "(本文なし)"
+    n = watcher.count
+    return (f"⚠ 実行中にダイアログを{n}件検出し、{how}しました。"
+            f"マクロがメッセージを出しています → 内容: {body}")
 
 
 def cmd_run_macro(args):
@@ -5089,21 +5156,27 @@ def cmd_run_macro(args):
     else:
         print(f"マクロ実行中: {full_macro_path}", file=sys.stderr)
 
-    # ダイアログ自動応答（--auto-dialog ok|cancel|yes|no）
-    _dlg_watcher = None
+    # ダイアログ対策は既定で常設。--auto-dialog 明示時はそのボタンで応答、
+    # 省略時は安全解除（キャンセル優先）で「無言ハング」を必ず断ち切る。
     _auto_dialog = getattr(args, 'auto_dialog', None)
-    if _auto_dialog:
-        _dlg_watcher = _start_dialog_watcher(xl, _auto_dialog)
+    _dlg_watcher = _start_dialog_watcher(xl, _auto_dialog)
 
     try:
         # マクロ実行
         result = xl.Application.Run(full_macro_path, *run_args)
 
+        _dlg_note = _dialog_watcher_note(_dlg_watcher, _auto_dialog)
         if getattr(args, 'json', False):
             import json
-            print(json.dumps({"success": True, "macro": full_macro_path, "result": str(result)}, ensure_ascii=False), file=sys.stdout)
+            out = {"success": True, "macro": full_macro_path, "result": str(result)}
+            if _dlg_watcher.count:
+                out["dialogs_dismissed"] = _dlg_watcher.count
+                out["dialog_text"] = _dlg_watcher.last_text
+            print(json.dumps(out, ensure_ascii=False), file=sys.stdout)
         else:
             print(f"マクロ実行成功。戻り値: {result}")
+            if _dlg_note:
+                print(_dlg_note, file=sys.stderr)
         return True
     except Exception as e:
         err_msg = str(e)
@@ -6469,55 +6542,65 @@ def cmd_write_range(args):
 
     raw = getattr(args, 'raw', False)
 
-    if inline_value is not None:
-        # インライン単一値: 範囲全体に同じ値 (数式可)
-        if raw:
-            rng.NumberFormat = "@"   # 文字列として保持（"007" 等の先頭ゼロを守る）
-            rng.Value = inline_value
-        else:
-            rng.Value = _coerce_cell(inline_value)
-        print(f"書き込み: {ws.Name}!{rng.Address} ← {inline_value}")
-    else:
-        path = (smart_path_resolve(tsv_opt) if tsv_opt else _LAST_VALUES_FILE)
-        if not path or not os.path.exists(path):
-            print(f"エラー: TSVが見つかりません: {tsv_opt or _LAST_VALUES_FILE}")
-            print("  単一値ならインラインで: write-range A1 \"値\"")
-            return False
-        grid = _read_tsv_grid(path, raw=raw)
-        if not grid:
-            print("エラー: TSVが空です")
-            return False
-        nrows = len(grid)
-        lens = {len(r) for r in grid}
-        top = ws.Cells(rng.Row, rng.Column)
-        if nrows == 1 and len(grid[0]) == 1:
+    # 書き込みは Worksheet_Change 等のイベントマクロを同期発火させる。そのマクロが
+    # MsgBox を出すと rng.Value 代入がそこでブロックし、閉じるまでコマンドが無言で
+    # ハングする（2026-07-11 実害）。安全解除の監視を書き込みの間だけ常設する。
+    _dlg_watcher = _start_dialog_watcher(xl)
+    try:
+        if inline_value is not None:
+            # インライン単一値: 範囲全体に同じ値 (数式可)
             if raw:
-                top.NumberFormat = "@"
-            top.Value = grid[0][0]
-            print(f"書き込み: {ws.Name}!{top.Address} ← {grid[0][0]}")
-        elif len(lens) == 1:
-            ncols = len(grid[0])
-            target = ws.Range(top, ws.Cells(rng.Row + nrows - 1,
-                                            rng.Column + ncols - 1))
-            if raw:
-                target.NumberFormat = "@"
-            target.Value = grid
-            print(f"書き込み: {ws.Name}!{target.Address} ← TSV {nrows}行 x {ncols}列")
+                rng.NumberFormat = "@"   # 文字列として保持（"007" 等の先頭ゼロを守る）
+                rng.Value = inline_value
+            else:
+                rng.Value = _coerce_cell(inline_value)
+            print(f"書き込み: {ws.Name}!{rng.Address} ← {inline_value}")
         else:
-            # 行の長さが不揃い: 矩形化して None を書くと右側の既存セルが消えるため、
-            # 行ごとに実際の長さぶんだけ書き込む
-            print(f"⚠ TSVの行の長さが不揃いです（{min(lens)}〜{max(lens)}列）。"
-                  "行ごとに書き込み、短い行の右側セルには触れません。")
-            for i, row in enumerate(grid):
-                if not row:
-                    continue
-                r_tgt = ws.Range(ws.Cells(rng.Row + i, rng.Column),
-                                 ws.Cells(rng.Row + i, rng.Column + len(row) - 1))
+            path = (smart_path_resolve(tsv_opt) if tsv_opt else _LAST_VALUES_FILE)
+            if not path or not os.path.exists(path):
+                print(f"エラー: TSVが見つかりません: {tsv_opt or _LAST_VALUES_FILE}")
+                print("  単一値ならインラインで: write-range A1 \"値\"")
+                return False
+            grid = _read_tsv_grid(path, raw=raw)
+            if not grid:
+                print("エラー: TSVが空です")
+                return False
+            nrows = len(grid)
+            lens = {len(r) for r in grid}
+            top = ws.Cells(rng.Row, rng.Column)
+            if nrows == 1 and len(grid[0]) == 1:
                 if raw:
-                    r_tgt.NumberFormat = "@"
-                r_tgt.Value = (row,)
-            print(f"書き込み: {ws.Name}!{top.Address} 起点 ← TSV {nrows}行（不揃い）")
+                    top.NumberFormat = "@"
+                top.Value = grid[0][0]
+                print(f"書き込み: {ws.Name}!{top.Address} ← {grid[0][0]}")
+            elif len(lens) == 1:
+                ncols = len(grid[0])
+                target = ws.Range(top, ws.Cells(rng.Row + nrows - 1,
+                                                rng.Column + ncols - 1))
+                if raw:
+                    target.NumberFormat = "@"
+                target.Value = grid
+                print(f"書き込み: {ws.Name}!{target.Address} ← TSV {nrows}行 x {ncols}列")
+            else:
+                # 行の長さが不揃い: 矩形化して None を書くと右側の既存セルが消えるため、
+                # 行ごとに実際の長さぶんだけ書き込む
+                print(f"⚠ TSVの行の長さが不揃いです（{min(lens)}〜{max(lens)}列）。"
+                      "行ごとに書き込み、短い行の右側セルには触れません。")
+                for i, row in enumerate(grid):
+                    if not row:
+                        continue
+                    r_tgt = ws.Range(ws.Cells(rng.Row + i, rng.Column),
+                                     ws.Cells(rng.Row + i, rng.Column + len(row) - 1))
+                    if raw:
+                        r_tgt.NumberFormat = "@"
+                    r_tgt.Value = (row,)
+                print(f"書き込み: {ws.Name}!{top.Address} 起点 ← TSV {nrows}行（不揃い）")
+    finally:
+        _dlg_watcher.stop()
 
+    note = _dialog_watcher_note(_dlg_watcher, None)
+    if note:
+        print(note, file=sys.stderr)
     print("（保存はしていません。Excelで確認後に保存してください）")
     return True
 

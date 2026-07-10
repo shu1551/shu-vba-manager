@@ -608,6 +608,36 @@ def test_import_verified_unrecoverable_raises_not_silent_success():
 
 
 # ================================================================
+# ダイアログ自動解除の報告（マクロ発火中のMsgBoxを黙って握りつぶさない）
+# 2026-07-11: write-range→Worksheet_Change→MsgBox で無言ハングした実害の対策。
+# COM/win32 部は実機E2Eで担保、ここは「検出時に報告文を出す」純粋部分の回帰。
+# ================================================================
+
+class _FakeWatcher:
+    def __init__(self, count, last=""):
+        self.count = count
+        self.last_text = last
+
+
+def test_dialog_note_empty_when_no_dialog():
+    assert vm._dialog_watcher_note(_FakeWatcher(0), None) == ""
+    assert vm._dialog_watcher_note(None, None) == ""
+
+
+def test_dialog_note_safe_mode_reports_body():
+    note = vm._dialog_watcher_note(_FakeWatcher(1, "B1が変わりました"), None)
+    assert "1件" in note
+    assert "安全側" in note
+    assert "B1が変わりました" in note
+
+
+def test_dialog_note_explicit_mode_says_specified_button():
+    note = vm._dialog_watcher_note(_FakeWatcher(2, "確認"), "ok")
+    assert "2件" in note
+    assert "指定ボタン" in note
+
+
+# ================================================================
 # _collect_shapes: OnAction のブック修飾を落とさない（wiring の外部ブック判定の素）
 # ================================================================
 
