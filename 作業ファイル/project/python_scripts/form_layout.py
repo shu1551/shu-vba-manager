@@ -815,14 +815,20 @@ def build_form(form_name, caption, rows, width=None, vba_file=None,
                       f"標準モジュール: {', '.join(names) or '(なし)'}")
             else:
                 proc = f"{form_name}を開く"
-                cm = mod.CodeModule
-                try:
-                    cm.ProcStartLine(proc, 0)
-                    print(f"起動マクロは既存: [{mod.Name}] {proc}（変更なし）")
-                except Exception:
-                    body = f"\nSub {proc}()\n    {form_name}.Show\nEnd Sub"
-                    cm.InsertLines(cm.CountOfLines + 1, body)
-                    print(f"起動マクロ追加: [{mod.Name}] Sub {proc}()")
+                # 識別子ガード（注入点側の多層防御）: フォーム名由来の Sub 名を注入前に検査
+                import vba_manager
+                bad = vba_manager.check_vba_identifier(proc)
+                if bad:
+                    print(f"⚠ 起動マクロを追加しません（VBA の識別子規則違反）: {bad}")
+                else:
+                    cm = mod.CodeModule
+                    try:
+                        cm.ProcStartLine(proc, 0)
+                        print(f"起動マクロは既存: [{mod.Name}] {proc}（変更なし）")
+                    except Exception:
+                        body = f"\nSub {proc}()\n    {form_name}.Show\nEnd Sub"
+                        cm.InsertLines(cm.CountOfLines + 1, body)
+                        print(f"起動マクロ追加: [{mod.Name}] Sub {proc}()")
 
         if save:
             fb.save()

@@ -767,3 +767,63 @@ def test_check_bas_rejects_invalid_identifier(tmp_path):
     p = tmp_path / "m.bas"
     p.write_bytes('Attribute VB_Name = "M"\r\nSub _tmp検証()\r\nEnd Sub\r\n'.encode('cp932'))
     assert vm._check_bas_one(str(p)) is False
+
+
+# ================================================================
+# 注入経路の台帳（機械検査）
+# ================================================================
+
+def test_injection_route_ledger():
+    """VBA へコードを入れる注入プリミティブの台帳。
+
+    2026-07-12 の識別子ガード配線で一番時間を食ったのは「注入経路の洗い出し」
+    だった。この台帳が現物と一致する限り、次回の穴塞ぎで経路の再調査は不要。
+    新しい注入点を足す手順: ①ガードを配線する（または安全な理由を確認する）
+    ②下の EXPECTED に理由コメントつきで登録する。
+    未登録の注入点が現れたらこのテストが落ちる＝ガード無しの新経路の検知器。
+    """
+    import re as _re
+    base = os.path.dirname(os.path.abspath(__file__))
+    PRIM = _re.compile(r'\.AddFromString\(|\.InsertLines\(|VBComponents\.Import\(')
+    DEF = _re.compile(r'^\s*def\s+(\w+)')
+    EXPECTED = {
+        # (ファイル, 関数): ガードの所在／安全な理由
+        ('form_builder.py', 'inject_vba'),          # 注入前に識別子検査（既存コード削除より前）
+        ('form_inspect.py', 'render_form_png'),     # 機械固定名 tmpFormInspect* のみ＝安全
+        ('form_layout.py', 'build_form'),           # 起動マクロ名を check_vba_identifier で検査
+        ('form_tool.py', 'cmd_copy_form'),          # 新フォーム名を check_vba_identifier で検査
+        ('live_sync_vba.py', 'update_excel_live'),  # 既存コード往復＋固定名マクロ追記のみ＝新規名の流入なし
+        ('optimize_vba_modules.py', 'apply_module'),  # 自前export→固定規則変換→再Importの往復＝同上
+        ('vba_manager.py', '_import_module_verified'),  # 取込の中央関数（名前衝突ガード）。内容の識別子検査は呼び元
+        ('vba_manager.py', 'cmd_replace_procedure'),    # validate_vba_code で識別子検査
+        ('vba_manager.py', 'cmd_add_procedure'),        # validate_vba_code で識別子検査
+        ('vba_manager.py', 'cmd_test'),                 # 機械固定名 VMT_n ハーネス＝安全
+    }
+    found = set()
+    for fname in sorted(os.listdir(base)):
+        if not fname.endswith('.py') or fname == os.path.basename(__file__):
+            continue
+        cur = '(module)'
+        with open(os.path.join(base, fname), encoding='utf-8', errors='replace') as f:
+            for line in f:
+                m = DEF.match(line)
+                if m:
+                    cur = m.group(1)
+                if PRIM.search(line):
+                    found.add((fname, cur))
+    new_routes = found - EXPECTED
+    gone = EXPECTED - found
+    assert not new_routes, (
+        f"台帳に無い注入経路: {sorted(new_routes)}\n"
+        "  ガード（check_vba_identifier / _find_invalid_procedure_names）を配線してから"
+        "台帳に理由コメントつきで登録すること。")
+    assert not gone, f"台帳にあるのに現物に無い注入経路（台帳の掃除が必要）: {sorted(gone)}"
+
+
+def test_copy_form_rejects_leading_underscore():
+    # 旧regexは先頭 _ を素通しした（\w−数字＝英字＋_）。COM接続前に止まることの回帰
+    import argparse
+    import pytest
+    import form_tool
+    with pytest.raises(SystemExit):
+        form_tool.cmd_copy_form(argparse.Namespace(form="F_X", new="_F_X2"))

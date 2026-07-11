@@ -388,8 +388,11 @@ def cmd_copy_form(args):
     Export した .frm/.frx のヘッダー（VB_Name / Begin行 / OleObjectBlob 参照）を
     CP932 バイナリのまま書き換えて Import する。レイアウトもコードも丸ごと複製。
     """
-    if not re.fullmatch(r'[^\d\W]\w*', args.new, re.UNICODE):
-        sys.exit(f"'{args.new}' はフォーム名に使えません（先頭数字・記号・空白は不可）。")
+    # 旧regex [^\d\W]\w* は先頭 _ を通してしまう（\w−数字＝英字＋_）ため共通ガードに統一
+    import vba_manager
+    reason = vba_manager.check_vba_identifier(args.new)
+    if reason:
+        sys.exit(f"'{args.new}' はフォーム名に使えません: {reason}")
     xl, wb, comp = connect_form(args.form)
     for c in wb.VBProject.VBComponents:
         if c.Name.lower() == args.new.lower():
