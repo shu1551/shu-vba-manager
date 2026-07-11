@@ -393,6 +393,14 @@ class FormBuilder:
         abs_vba = os.path.abspath(vba_file)
         with open(abs_vba, "r", encoding="utf-8") as fp:
             code = fp.read()
+        # 識別子ガード（注入点側の多層防御）: 先頭 _ 等の無効なプロシージャ名は
+        # AddFromString が黙って受け入れてコンパイルで死ぬ。既存コードを消す前に止める。
+        import vba_manager
+        bad = vba_manager._find_invalid_procedure_names(re.sub(r'\r\n|\r', '\n', code))
+        if bad:
+            for ln, _nm, reason in bad:
+                print(f"エラー: 行{ln}: プロシージャ名が VBA の識別子規則に反しています: {reason}")
+            raise ValueError("VBA 識別子規則違反のため注入を中止しました（フォームの既存コードは残っています）")
         cm = frm_comp.CodeModule
         if cm.CountOfLines > 0:
             cm.DeleteLines(1, cm.CountOfLines)

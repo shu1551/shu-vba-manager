@@ -702,6 +702,11 @@ def validate_vba_code(code, force=False):
     if decl_func != end_func:
         errors.append(f"Function宣言数 ({decl_func}) と End Function数 ({end_func}) が一致しません。")
 
+    # 3. プロシージャ名の識別子チェック（`_tmp検証` 級の先頭 _ 注入が繰り返された定番事故。
+    #    AddFromString/InsertLines は構文検査をせず成功報告になるため、ここが水際）
+    for ln, _name, reason in _find_invalid_procedure_names(code):
+        errors.append(f"行{ln}: プロシージャ名が VBA の識別子規則に反しています: {reason}")
+
     if errors:
         for err in errors:
             print(f"構文エラー警告: {err}")
@@ -870,12 +875,60 @@ def _find_consecutive_dup_lines(norm_text):
     return hits
 
 
+def check_vba_identifier(name):
+    """VBA 識別子として無効なら理由（文字列）を返す。有効なら None。
+
+    先頭 `_` の名前（例: `_tmp検証`）は VBE が黙って受け入れるがコンパイルで死ぬ。
+    AddFromString / InsertLines は構文検査をしないため、注入自体は成功報告になり
+    事故が繰り返された。VBA の識別子は英字か日本語などの文字で始まる必要があり、
+    `_`・数字・記号では始められない。注入前にここで機械的に止める。
+    """
+    if not name:
+        return "名前が空です"
+    if name[0] == '_':
+        suggestion = name.lstrip('_') or 'tmp'
+        return (f"'{name}' は _ 始まりです。VBA の識別子は _ で始められません"
+                f"（英字か日本語で始める。例: '{suggestion}'）")
+    if name[0].isdigit():
+        return f"'{name}' は数字始まりです。VBA の識別子は英字か日本語で始めてください"
+    bad = re.sub(r'\w', '', name)
+    if bad:
+        return f"'{name}' に識別子に使えない文字が含まれています: {bad}"
+    if len(name) > 255:
+        return f"'{name}' が長すぎます（{len(name)}文字。VBA の上限は255文字）"
+    return None
+
+
+def _find_invalid_procedure_names(norm_text):
+    """Sub/Function/Property 宣言の名前が VBA 識別子規則に反するものを列挙。
+
+    コメント行は対象外。Declare 宣言は行頭トークンが合わないので元から素通り
+    （外部 API 名は別規則のため対象にしない）。
+    戻り値: [(行番号, 名前, 理由), ...]
+    """
+    decl_pattern = re.compile(
+        r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
+        r'(?:Sub|Function|Property\s+(?:Get|Let|Set))\s+([^\s\(]+)',
+        re.IGNORECASE)
+    hits = []
+    for idx, line in enumerate(norm_text.split('\n'), 1):
+        s = line.strip()
+        if s.startswith("'") or s.lower().startswith('rem '):
+            continue
+        m = decl_pattern.match(line)
+        if m:
+            reason = check_vba_identifier(m.group(1))
+            if reason:
+                hits.append((idx, m.group(1), reason))
+    return hits
+
+
 def cmd_check_bas(args):
     """.bas を取り込む前の単体検査（COM不要）。複数ファイル可。
 
     バイパス経路（vba_manager を通さず手書きスクリプトで .bas を作る）でも、取り込み前に
-    この1コマンドで「文字コード事故 / 改行二重化 / プロシージャ重複 / 連続重複行」を機械的に
-    検査できる。COM接続が落ちていても動くのが要点（安全確認を不安全な手順と同じ手数にする）。
+    この1コマンドで「文字コード事故 / 改行二重化 / プロシージャ重複 / 識別子規則違反 /
+    連続重複行」を機械的に検査できる。COM接続が落ちていても動くのが要点（安全確認を不安全な手順と同じ手数にする）。
     --fix を付けると改行二重化だけ CP932 のまま自動修正する
     （重複は判断が要るので自動修正しない＝Pythonは機械的検査まで）。
     """
@@ -955,6 +1008,16 @@ def _check_bas_one(path, fix=False):
         problems += 1
     else:
         print("  [OK] プロシージャ名: 重複なし")
+
+    # 3b. プロシージャ名の識別子規則（先頭 _ 等。VBE は黙って受け入れコンパイルで死ぬ）
+    bad_names = _find_invalid_procedure_names(norm_text)
+    if bad_names:
+        print("  [NG] VBA の識別子規則に反するプロシージャ名を検知（コンパイルエラーになります）:")
+        for ln, _nm, reason in bad_names:
+            print(f"        行{ln}: {reason}")
+        problems += 1
+    else:
+        print("  [OK] プロシージャ名: 識別子規則OK")
 
     # 4. 連続する同一コード行（On Error Resume Next ×2 等の臭い）
     cdl = _find_consecutive_dup_lines(norm_text)
@@ -2187,8 +2250,9 @@ def cmd_add_module(args):
         return False
     comp_type = type_map[type_opt]
 
-    if re.search(r'\s', module_name):
-        print("エラー: モジュール名に空白は使えません。")
+    reason = check_vba_identifier(module_name)
+    if reason:
+        print(f"エラー: モジュール名が VBA の識別子規則に反しています: {reason}")
         return False
 
     xl, wb = get_workbook(target_file)
@@ -2407,6 +2471,16 @@ def cmd_replace_module(args):
     if m_name.group(1).lower() != module_name.lower():
         print(f"エラー: .bas の VB_Name '{m_name.group(1)}' が指定モジュール名 '{module_name}' と一致しません。")
         print("  別モジュールの .bas を取り込もうとしている可能性があります（対象取り違え防止のため停止）。")
+        if tmp_norm and os.path.exists(tmp_norm):
+            _remove_export_artifacts(tmp_norm)
+        return False
+
+    # プロシージャ名の識別子チェック（先頭 _ 等は Import 自体は通るがコンパイルで死ぬ）
+    bad_names = _find_invalid_procedure_names(re.sub(r'\r\n|\r', '\n', bas_head))
+    if bad_names and not getattr(args, 'force', False):
+        print("エラー: VBA の識別子規則に反するプロシージャ名があります（--force で強行可）:")
+        for ln, _nm, reason in bad_names:
+            print(f"  行{ln}: {reason}")
         if tmp_norm and os.path.exists(tmp_norm):
             _remove_export_artifacts(tmp_norm)
         return False

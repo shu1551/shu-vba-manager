@@ -716,3 +716,54 @@ def test_trailing_spacer_counts_fully():
     _, _, h_a = fl.compute_layout(base)
     _, _, h_b = fl.compute_layout(base + [fl.spacer(24)])
     assert abs((h_b - h_a) - (fl.STYLE['gap_y'] + 24)) < 0.01
+
+
+# ================================================================
+# vba_manager: VBA 識別子ガード（先頭 _ の Sub 注入事故 `_tmp検証` の回帰）
+# ================================================================
+
+def test_check_vba_identifier_rejects_leading_underscore():
+    assert vm.check_vba_identifier("_tmp検証") is not None
+
+
+def test_check_vba_identifier_rejects_leading_digit():
+    assert vm.check_vba_identifier("1テスト") is not None
+
+
+def test_check_vba_identifier_rejects_symbols():
+    assert vm.check_vba_identifier("foo-bar") is not None
+
+
+def test_check_vba_identifier_accepts_normal_names():
+    for name in ("tmp検証", "テスト検証", "Btn_Click", "UserForm_Initialize", "A1"):
+        assert vm.check_vba_identifier(name) is None, name
+
+
+def test_find_invalid_procedure_names_hits_declaration():
+    code = "Sub _tmp検証()\nEnd Sub\n"
+    hits = vm._find_invalid_procedure_names(code)
+    assert len(hits) == 1
+    assert hits[0][1] == "_tmp検証"
+
+
+def test_find_invalid_procedure_names_ignores_comments_and_events():
+    code = ("' Sub _コメントは対象外()\n"
+            "Private Sub CommandButton1_Click()\n"
+            "End Sub\n"
+            "Property Get 値()\n"
+            "End Property\n")
+    assert vm._find_invalid_procedure_names(code) == []
+
+
+def test_validate_vba_code_rejects_underscore_name():
+    assert vm.validate_vba_code("Sub _tmp検証()\nEnd Sub\n") is False
+
+
+def test_validate_vba_code_accepts_valid_japanese_name():
+    assert vm.validate_vba_code("Sub tmp検証()\nEnd Sub\n") is True
+
+
+def test_check_bas_rejects_invalid_identifier(tmp_path):
+    p = tmp_path / "m.bas"
+    p.write_bytes('Attribute VB_Name = "M"\r\nSub _tmp検証()\r\nEnd Sub\r\n'.encode('cp932'))
+    assert vm._check_bas_one(str(p)) is False
