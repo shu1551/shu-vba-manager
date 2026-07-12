@@ -67,6 +67,7 @@ _last_checkup.md
 
 # sync_tools.py の同期時退避（ローカル作業ゴミ・非公開）
 作業ファイル/project/python_scripts/_sync_backup/
+.claude/skills/_sync_backup/
 
 # =============================================================================
 # ローカルのワンショットスクリプト退避先（非公開・公開対象外）
