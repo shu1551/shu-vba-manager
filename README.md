@@ -59,6 +59,7 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 | **`bas_editor.py`** | `.bas` ファイル編集ヘルパー（プロシージャ単位の `replace_sub`, `read_bas`） |
 | **`format_bas.py`** | `.bas` 整形（空行・インデント正規化） |
 | **`optimize_vba_modules.py`** | VBA モジュール最適化 |
+| **`publish_check.py`** | ブック公開前の個人情報チェック（作成者実名・隠しシート・定義名のローカルパス・外部リンク・コメント・残留入力値）＋ `--scrub` でメタデータ空欄化。ブックを配布・公開する前に1コマンドで |
 
 ---
 
