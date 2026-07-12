@@ -107,6 +107,71 @@ def parse_target_and_rest(posargs):
     return None, list(posargs)
 
 
+def release_created_instances(only_saved=True):
+    """自動起動した Excel インスタンスのうち、後始末してよいものを閉じて終了する。
+
+    常駐プロセス（MCPサーバー）では終了時の cleanup_excel が何時間も来ないため、
+    パス指定で自動起動した非表示 Excel がセッション中ずっと残留する。COM 起動の
+    Excel はアドイン・PERSONAL.XLSB を読まないため、残留中にユーザーが開いた
+    ファイルがそこへ合流すると「アドインが効かない・マクロが効かない」状態になる
+    （2026-07-12 特定。6/13 ゾンビ事故と同症状。当日実測で非表示3体が残留していた）。
+    MCP のアイドル解放（5秒）からこれを呼んで畳む。
+
+    only_saved=True では未保存の変更を持つインスタンスは温存する
+    （アイドルのたびに無言で変更破棄をしないため。それらは終了時の
+    cleanup_excel が警告つきで始末する）。戻り値: (閉じた台数, 温存した台数)
+    """
+    global _created_instances, _created_xl, _created_xl_pid
+    import gc
+    import os
+    import signal
+    keep = []
+    closed = 0
+    for inst in _created_instances:
+        xl = inst.get("xl")
+        pid = inst.get("pid")
+        alive = True
+        dirty = False
+        try:
+            wbs = xl.Workbooks
+            for i in range(wbs.Count, 0, -1):
+                try:
+                    if not wbs.Item(i).Saved:
+                        dirty = True
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            alive = False  # 参照が既に死んでいる（手動で閉じられた等）→ 台帳から落とすだけ
+        if alive and only_saved and dirty:
+            keep.append(inst)
+            continue
+        if alive:
+            try:
+                wbs = xl.Workbooks
+                for i in range(wbs.Count, 0, -1):
+                    try:
+                        wbs.Item(i).Close(SaveChanges=False)
+                    except Exception:
+                        pass
+                xl.Quit()
+            except Exception:
+                pass
+        if pid is not None:
+            # Quit がゾンビ化しても残さない（cleanup_excel と同じ最終手段）
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+        closed += 1
+    _created_instances = keep
+    if not keep:
+        _created_xl = None
+        _created_xl_pid = None
+    gc.collect()
+    return closed, len(keep)
+
+
 def cleanup_excel():
     """新規起動されたExcelインスタンスがあれば（複数でも）全て終了し、COMを初期化解除する"""
     global _created_instances, _created_xl, _created_xl_pid
@@ -989,6 +1054,7 @@ __all__ = [
     'argparse',
     'check_vba_identifier',
     'cleanup_excel',
+    'release_created_instances',
     'datetime',
     'get_workbook',
     'load_excel_addins_and_personal',

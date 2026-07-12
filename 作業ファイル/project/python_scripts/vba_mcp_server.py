@@ -50,15 +50,21 @@ _worker_lock = threading.Lock()
 def _release_com_refs():
     """接続キャッシュの Excel COM 参照を手放す（COM を作ったワーカースレッド上で呼ぶ）。
 
-    対象は get_workbook の接続キャッシュだけ。ツールが自動起動した Excel
-    （_created_instances）は終了時の後始末に参照が要るため触らない。
-    「ユーザーの Excel に参照を残さない」が目的のすべて。
+    ①get_workbook の接続キャッシュを手放す（ユーザーの Excel に参照を残さない）。
+    ②ツールが自動起動した非表示 Excel（_created_instances）も畳む。
+      常駐サーバーでは終了時の cleanup_excel が何時間も来ないため、放置すると
+      アドインを読まない非表示 Excel が残留し、ユーザーが開いたファイルが合流して
+      「アドインが効かない」事故になる（2026-07-12 特定・当日3体残留の実害）。
+      未保存の変更を持つインスタンスだけは温存する（無言の変更破棄をしない）。
     """
     try:
-        if not vba_manager._wb_cache:
-            return
-        vba_manager._wb_cache.clear()
-        gc.collect()  # 参照サイクルに残った COM ラッパも確実に Release させる
+        if vba_manager._wb_cache:
+            vba_manager._wb_cache.clear()
+            gc.collect()  # 参照サイクルに残った COM ラッパも確実に Release させる
+    except Exception:
+        pass
+    try:
+        vba_manager.release_created_instances()
     except Exception:
         pass
 
