@@ -1,5 +1,14 @@
 # 変更履歴
 
+## 2026-07-12
+
+### 内部構成の分割（使い方は不変）
+
+- `vba_manager.py`（約10,600行）を**薄い入口＋5パート**に分割: `vbam_core.py`（COM接続・ガード・共有ヘルパー）／`vbam_vba.py`（VBAコマンド）／`vbam_view.py`（目＝読み取り）／`vbam_edit.py`（手＝編集）／`vbam_heavy.py`（チャート/ピボット/PowerQuery/データモデル）
+- **呼び出し方は一切変わらない**（`py vba_manager.py <コマンド>` / `import vba_manager` ともそのまま）。全72コマンド健在
+- ⚠ 手動ダウンロード派は `vba_manager.py` 1本ではなく `vbam_*.py` 5本も同じフォルダに置くこと（clone / zip 取得なら従来どおり何もしなくてよい）
+- 検証: pytest 67件パス＋実機E2E（モジュール作成→マクロ注入→実行→セル読み取り）
+
 ## 2026-07-06〜11
 
 MCP サーバー化と「現地調査」コマンド群（snapshot / snapshot-diff / wiring）の追加、点検ラウンド3回。

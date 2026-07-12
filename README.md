@@ -46,13 +46,14 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 
 | ツール | 役割 |
 |---|---|
-| **`vba_manager.py`** | 中核ツール。VBA の `list / get / replace-module / replace-procedure / add-procedure / delete-procedure` に、コード検索 `grep`・一括置換 `code-replace`・復元 `restore`・一括実行 `batch`・導入診断 `setup-check`、シート読取（`read-range` / `sheet-info` / `screenshot`）・編集（`write-range` / `format-range` / `find-replace` / `export-pdf` 等）・グラフ／ピボット／PowerQuery／データモデル・検分（`checkup` / `snapshot` / `snapshot-diff` / `wiring`）まで **72コマンド** |
+| **`vba_manager.py`** | 中核ツール。VBA の `list / get / replace-module / replace-procedure / add-procedure / delete-procedure` に、コード検索 `grep`・一括置換 `code-replace`・復元 `restore`・一括実行 `batch`・導入診断 `setup-check`、シート読取（`read-range` / `sheet-info` / `screenshot`）・編集（`write-range` / `format-range` / `find-replace` / `export-pdf` 等）・グラフ／ピボット／PowerQuery／データモデル・検分（`checkup` / `snapshot` / `snapshot-diff` / `wiring`）まで **72コマンド**。実装は入口＋5パート構成（`vbam_core / vbam_vba / vbam_view / vbam_edit / vbam_heavy`・2026-07-12 分割）で、使い方は従来どおり `py vba_manager.py <コマンド>` |
+| **`vbam_*.py`（5本）** | vba_manager の分割パート。**単体では使わない**が、`vba_manager.py` と同じフォルダに必要（clone / zip 取得なら自動で揃う） |
 | **`vba_mcp_server.py`** | vba_manager を **MCP サーバー化**する薄い窓口（2026-07 追加）。常駐 COM 接続でコマンドごとの再接続が消え、応答は実測 0.01〜0.2 秒級。`vba`（1行で全コマンド）＋ `get_procedure / set_procedure_code / replace_procedure / vba_help` の5ツール |
 | **`form_layout.py`** | UserForm を**宣言で構築**するレイアウトエンジン。行構造を書くだけでラベル整列・ボタンバー・タブ順・イベント雛形まで自動。Excel 不要の配置プレビューも（`py form_layout.py preview 宣言.py`） |
 | **`form_inspect.py`** | フォームの点検。コントロール配置＋コードを1接続で取得、実表示PNG撮影（`--png` / `--png-all`）、機械検査（`--lint`）、既存フォームの宣言コード逆変換（`--to-layout`） |
 | **`form_tool.py`** | フォームの幾何操作 CLI。`scale / set / move / align / size-match / distribute / tab-order / rename-control / delete-control / copy-form` |
 | **`form_builder.py`** | UserForm 構築の低レベル部品。`add_btn`, `add_lbl` などのヘルパーと `Grid` 配置（カレンダー等の自由配置向け） |
-| **`test_tools.py`** | 自動テスト（pytest・53件）。レイアウト計算・エンコーディングガード・lint・名前衝突ガード等の COM 不要部分を検証 |
+| **`test_tools.py`** | 自動テスト（pytest・67件）。レイアウト計算・エンコーディングガード・lint・名前衝突ガード等の COM 不要部分を検証 |
 | **`live_sync_vba.py`** | VBE と `.bas` ファイルをリアルタイム同期 |
 | **`menu_launcher.py`** / **`select_macro_gui.py`** | customtkinter 製のマクロ検索／実行 GUI |
 | **`bas_editor.py`** | `.bas` ファイル編集ヘルパー（プロシージャ単位の `replace_sub`, `read_bas`） |

@@ -46,6 +46,11 @@ _last_checkup.md
 # =============================================================================
 作業ファイル/project/python_scripts/*.py
 !作業ファイル/project/python_scripts/vba_manager.py
+!作業ファイル/project/python_scripts/vbam_core.py
+!作業ファイル/project/python_scripts/vbam_vba.py
+!作業ファイル/project/python_scripts/vbam_view.py
+!作業ファイル/project/python_scripts/vbam_edit.py
+!作業ファイル/project/python_scripts/vbam_heavy.py
 !作業ファイル/project/python_scripts/vba_mcp_server.py
 !作業ファイル/project/python_scripts/form_builder.py
 !作業ファイル/project/python_scripts/form_inspect.py
@@ -58,6 +63,9 @@ _last_checkup.md
 !作業ファイル/project/python_scripts/bas_editor.py
 !作業ファイル/project/python_scripts/format_bas.py
 !作業ファイル/project/python_scripts/optimize_vba_modules.py
+
+# sync_tools.py の同期時退避（ローカル作業ゴミ・非公開）
+作業ファイル/project/python_scripts/_sync_backup/
 
 # =============================================================================
 # ローカルのワンショットスクリプト退避先（非公開・公開対象外）

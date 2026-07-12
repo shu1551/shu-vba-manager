@@ -794,10 +794,11 @@ def test_injection_route_ledger():
         ('form_tool.py', 'cmd_copy_form'),          # 新フォーム名を check_vba_identifier で検査
         ('live_sync_vba.py', 'update_excel_live'),  # 既存コード往復＋固定名マクロ追記のみ＝新規名の流入なし
         ('optimize_vba_modules.py', 'apply_module'),  # 自前export→固定規則変換→再Importの往復＝同上
-        ('vba_manager.py', '_import_module_verified'),  # 取込の中央関数（名前衝突ガード）。内容の識別子検査は呼び元
-        ('vba_manager.py', 'cmd_replace_procedure'),    # validate_vba_code で識別子検査
-        ('vba_manager.py', 'cmd_add_procedure'),        # validate_vba_code で識別子検査
-        ('vba_manager.py', 'cmd_test'),                 # 機械固定名 VMT_n ハーネス＝安全
+        # 2026-07-12 分割: vba_manager.py の実装は vbam_core/vbam_vba 等へ移動（入口は不変）
+        ('vbam_core.py', '_import_module_verified'),  # 取込の中央関数（名前衝突ガード）。内容の識別子検査は呼び元
+        ('vbam_vba.py', 'cmd_replace_procedure'),     # validate_vba_code で識別子検査
+        ('vbam_vba.py', 'cmd_add_procedure'),         # validate_vba_code で識別子検査
+        ('vbam_vba.py', 'cmd_test'),                  # 機械固定名 VMT_n ハーネス＝安全
     }
     found = set()
     for fname in sorted(os.listdir(base)):
