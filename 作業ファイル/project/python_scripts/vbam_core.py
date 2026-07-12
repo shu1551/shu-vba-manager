@@ -727,6 +727,39 @@ def _wait_component_gone(wb, name, timeout=15.0, interval=0.25):
         time.sleep(interval)
 
 
+def _reregister_shortcuts_from_bas(wb, import_path):
+    """Import した .bas の Attribute VB_Invoke_Func からショートカットをその場で再登録する。
+
+    ショートカット（Attribute VB_ProcData.VB_Invoke_Func）が Excel に登録されるのは
+    「ブックを開いた瞬間」だけ。Remove+Import はモジュールごと登録を剥がすため、
+    Import 直後のセッションではショートカットが無反応になり、閉じて開き直すまで
+    直らない（2026-07-12 発覚。修正のたびにマクロが効かなくなる症状の正体）。
+    ここで MacroOptions により実行中セッションへ再登録して、開き直し不要にする。
+    大文字=Ctrl+Shift+キー / 小文字=Ctrl+キー（MacroOptions の仕様どおり渡す）。
+    """
+    try:
+        with open(import_path, 'rb') as f:
+            text = f.read().decode('cp932', errors='replace')
+    except Exception:
+        return
+    pairs = re.findall(
+        r'^Attribute\s+([^\s.]+)\.VB_ProcData\.VB_Invoke_Func\s*=\s*"(.)\\n14"',
+        text, re.MULTILINE)
+    if not pairs:
+        return
+    xl = wb.Application
+    for proc, key in pairs:
+        if not key.strip():
+            continue  # 空白キー（キー未割当の名残）は再登録しない
+        try:
+            xl.MacroOptions(Macro=f"'{wb.Name}'!{proc}",
+                            HasShortcutKey=True, ShortcutKey=key)
+            label = f"Ctrl+Shift+{key.upper()}" if key.isupper() else f"Ctrl+{key}"
+            print(f"  ショートカット再登録: {label} → {proc}")
+        except Exception as ex:
+            print(f"  ⚠ ショートカット再登録に失敗: {proc} ({ex})")
+
+
 def _import_module_verified(wb, import_path, expected_name,
                             ghost_timeout=15.0, rename_timeout=20.0, settle=1.5):
     """Import ＋ 取り込み実名の検証。Remove+Import 系3経路の共用ガード。
@@ -752,6 +785,7 @@ def _import_module_verified(wb, import_path, expected_name,
     pythoncom.PumpWaitingMessages()
     actual = imported.Name
     if actual.lower() == expected_name.lower():
+        _reregister_shortcuts_from_bas(wb, import_path)
         return imported
     # 名前衝突を検出（例: shu005 → shu0051）。旧名が空くのを待って改名で回復する
     print(f"⚠ 名前衝突を検出: '{expected_name}' が '{actual}' として取り込まれました。"
@@ -769,6 +803,7 @@ def _import_module_verified(wb, import_path, expected_name,
         raise ModuleNameCollisionError(
             expected_name, actual, f"改名後の実名が '{imported.Name}' のままです")
     print(f"回復成功: '{actual}' → '{expected_name}' に改名しました。")
+    _reregister_shortcuts_from_bas(wb, import_path)
     return imported
 
 

@@ -702,6 +702,10 @@ replace-module は取り込み直前に①②を
 - Remove+Import でモジュールが VBComponents の末尾に移動する
 - マクロの表示順（メニュー等）が変わる場合がある
 - 影響を受けたモジュールも replace-module して順番を揃える
+- ショートカットキー（Attribute VB_Invoke_Func）の**セッション登録は Remove で剥がれる**が、
+  Import 直後にツールが MacroOptions で自動再登録する（2026-07-12〜）。
+  「修正直後にショートカットが効かない・開き直すと直る」症状はこれで解消済み。
+  再登録された鍵は実行結果に「ショートカット再登録: Ctrl+Shift+X → マクロ名」と表示される。
 
 ### InsertLines の改行問題
 - Python の \n では正しく複数行に分割されないことがある
