@@ -1025,6 +1025,164 @@ def _coerce_cell(s):
     return f
 
 
+# ================================================================
+# 保護シート対策（2026-07-13）
+#
+# UserInterfaceOnly:=True で保護したシートでも、外部COM(このツール)からの
+# ClearContents/Clear/CopyPicture・Shapes操作の一部は例外的にブロックされる
+# （Value代入は素通りするが挙動が不統一）。VBAマクロ実行(run-macro)経由の
+# 変更だけは正しく素通りするため、これは「マクロ実行か外部COMか」で
+# UserInterfaceOnly の適用され方が違うことに起因する。
+# 対策として、保護されたシートのある操作の前後で一時解除→元の設定で再保護する。
+# ================================================================
+
+# Protect()/Protection オブジェクトの真偽値フラグ（DrawingObjects/Contents/Scenarios/
+# UserInterfaceOnly の4つ以外）。Worksheet.Protection.AllowXxx で現在値を読める。
+# これを記録・復元しないと、並べ替え許可や行列挿入許可などブック固有のカスタム設定が
+# 一時解除→再保護の往復で既定値(False=不許可)に巻き戻ってしまう。
+_PROTECTION_ALLOW_FLAGS = (
+    'AllowFormattingCells', 'AllowFormattingColumns', 'AllowFormattingRows',
+    'AllowInsertingColumns', 'AllowInsertingRows', 'AllowInsertingHyperlinks',
+    'AllowDeletingColumns', 'AllowDeletingRows',
+    'AllowSorting', 'AllowFiltering', 'AllowUsingPivotTables',
+)
+
+
+def _unprotect_all_sheets(wb):
+    """ブック内の保護されたシートを全て記録して一時解除する。
+
+    戻り値は再保護用の (ws, drawing, contents, scenarios, ui_only, allow_kwargs) の
+    リスト。allow_kwargs は並べ替え許可・行列挿入許可など細かい許可設定の辞書
+    （Protect() にそのまま **allow_kwargs で渡せる）。
+    パスワード保護等で解除できないシートは諦めて記録しない（そのシートは
+    保護されたままなので、そのシートを触る操作は従来どおり失敗しうる）。
+    """
+    saved = []
+    try:
+        sheets = list(wb.Worksheets)
+    except Exception:
+        return saved
+    for ws in sheets:
+        try:
+            protected = bool(ws.ProtectContents or ws.ProtectDrawingObjects
+                              or ws.ProtectScenarios)
+        except Exception:
+            protected = False
+        if not protected:
+            continue
+        try:
+            drawing = bool(ws.ProtectDrawingObjects)
+        except Exception:
+            drawing = False
+        try:
+            contents = bool(ws.ProtectContents)
+        except Exception:
+            contents = False
+        try:
+            scenarios = bool(ws.ProtectScenarios)
+        except Exception:
+            scenarios = False
+        try:
+            ui_only = bool(ws.ProtectionMode)
+        except Exception:
+            ui_only = False
+        allow_kwargs = {}
+        try:
+            prot = ws.Protection
+            for flag in _PROTECTION_ALLOW_FLAGS:
+                try:
+                    allow_kwargs[flag] = bool(getattr(prot, flag))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            ws.Unprotect()
+            saved.append((ws, drawing, contents, scenarios, ui_only, allow_kwargs))
+        except Exception:
+            pass
+    return saved
+
+
+def _reprotect_sheets(saved):
+    """_unprotect_all_sheets で記録した設定どおりに再保護する。"""
+    for ws, drawing, contents, scenarios, ui_only, allow_kwargs in saved:
+        try:
+            ws.Protect(DrawingObjects=drawing, Contents=contents,
+                       Scenarios=scenarios, UserInterfaceOnly=ui_only,
+                       **allow_kwargs)
+        except Exception:
+            try:
+                # allow_kwargs の一部が今の Excel バージョンで受理されない場合の保険
+                ws.Protect(DrawingObjects=drawing, Contents=contents,
+                           Scenarios=scenarios, UserInterfaceOnly=ui_only)
+            except Exception:
+                pass
+
+
+class protected_sheets_guard:
+    """保護されたシートのあるブックに対する外部COM操作を安全に行う with 文。
+
+    シート保護に加えてブック構造保護（Protect Structure。シートの追加・削除・
+    移動・改名を外部COMからもブロックする）も同じ流儀で一時解除→復元する。
+    パスワード付きで解除できない場合は諦めて従来どおり（操作は失敗しうる）。
+
+    使い方: with protected_sheets_guard(wb): ...操作...
+    """
+    def __init__(self, wb):
+        self.wb = wb
+        self._saved = []
+        self._wb_saved = None  # (structure, windows) 解除できた場合のみ
+
+    def __enter__(self):
+        try:
+            structure = bool(self.wb.ProtectStructure)
+            windows = bool(self.wb.ProtectWindows)
+        except Exception:
+            structure = windows = False
+        if structure or windows:
+            try:
+                self.wb.Unprotect()
+                self._wb_saved = (structure, windows)
+            except Exception:
+                pass
+        self._saved = _unprotect_all_sheets(self.wb)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _reprotect_sheets(self._saved)
+        if self._wb_saved:
+            try:
+                self.wb.Protect(Structure=self._wb_saved[0],
+                                Windows=self._wb_saved[1])
+            except Exception:
+                pass
+        return False
+
+
+def protect_safe(cmd_func):
+    """cmd_* 関数を「対象ブックの保護シートを一時解除してから実行」に変える decorator。
+
+    対象ブックは他の cmd_* 関数と同じ流儀（posargs先頭がExcelファイルなら
+    それを対象、なければアクティブブック）で解決する。get_workbook は
+    接続キャッシュを持つため、ここでの解決が二重コストにはならない。
+    """
+    import functools
+
+    @functools.wraps(cmd_func)
+    def wrapper(args):
+        try:
+            target_file, _rest = parse_target_and_rest(getattr(args, 'posargs', []) or [])
+            xl, wb = get_workbook(target_file)
+        except Exception:
+            # ブック解決に失敗した場合は元の関数にそのまま委ね、
+            # そちらのエラーメッセージを出させる
+            return cmd_func(args)
+        with protected_sheets_guard(wb):
+            return cmd_func(args)
+    return wrapper
+
+
 __all__ = [
     'BACKUP_DIR',
     'LAST_PROC_FILE',
@@ -1051,6 +1209,10 @@ __all__ = [
     '_running_excel_workbooks',
     '_wait_component_gone',
     '_wb_cache',
+    '_unprotect_all_sheets',
+    '_reprotect_sheets',
+    'protected_sheets_guard',
+    'protect_safe',
     'argparse',
     'check_vba_identifier',
     'cleanup_excel',

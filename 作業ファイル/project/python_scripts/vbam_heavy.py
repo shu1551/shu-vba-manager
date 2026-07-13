@@ -37,6 +37,7 @@ _XL_CHART_TYPE = {
 _XL_CHART_TYPE_NAME = {v: k for k, v in _XL_CHART_TYPE.items()}
 
 
+@protect_safe
 def cmd_chart(args):
     """グラフ操作: chart <create|list|delete> ...
 
@@ -124,6 +125,7 @@ _XL_TRENDLINE = {'linear': -4132, 'exponential': 5, 'logarithmic': -4133,
                  'movingaverage': 6, 'polynomial': 3, 'power': 4}
 
 
+@protect_safe
 def cmd_chart_config(args):
     """グラフ詳細設定: chart-config <action> <chart名> ...
 
@@ -413,6 +415,7 @@ def _unique_sheet_name(wb, base):
     return f"{base}{i}"
 
 
+@protect_safe
 def cmd_pivot(args):
     """ピボット操作: pivot <create|list|delete> ...
 
@@ -561,6 +564,7 @@ def _find_pivot(wb, name):
 _XL_PIVOT_ORIENT = {'row': 1, 'col': 2, 'column': 2, 'filter': 3, 'page': 3, 'value': 4, 'data': 4, 'hidden': 0}
 
 
+@protect_safe
 def cmd_pivot_field(args):
     """ピボットのフィールド管理: pivot-field <action> <pivot名> <フィールド> ...
 
@@ -734,6 +738,7 @@ def cmd_pivot_field(args):
     return False
 
 
+@protect_safe
 def cmd_pivot_calc(args):
     """ピボットの計算フィールド・レイアウト: pivot-calc <action> <pivot名> ...
 
@@ -864,6 +869,7 @@ def _find_pivot_or_table(wb, name):
     return None, None, None
 
 
+@protect_safe
 def cmd_slicer(args):
     """スライサー操作: slicer <add|list|delete> ...
 
@@ -993,6 +999,7 @@ def cmd_calc_mode(args):
 # 重量級コマンド (4) PowerQuery （一覧・更新・作成・M式書換・削除・読み込み配線）
 # ================================================================
 
+@protect_safe
 def cmd_powerquery(args):
     """PowerQuery: powerquery <list|refresh> ...
 
@@ -1319,6 +1326,7 @@ _XL_CONN_TYPE = {1: 'OLEDB', 2: 'ODBC', 3: 'XMLMAP', 4: 'TEXT',
                  5: 'WEB', 6: 'DATAFEED', 7: 'MODEL', 8: 'WORKSHEET', 9: 'NOSOURCE'}
 
 
+@protect_safe
 def cmd_connection(args):
     """ブック接続の管理: connection <list|refresh|delete> [name]
 
@@ -1397,6 +1405,7 @@ def cmd_connection(args):
     return False
 
 
+@protect_safe
 def cmd_datamodel(args):
     """データモデル: datamodel <list|relation|measure>
 

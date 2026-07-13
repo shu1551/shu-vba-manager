@@ -902,6 +902,7 @@ def cmd_wiring(args):
     return not broken
 
 
+@protect_safe
 def cmd_screenshot(args):
     """範囲を画像(PNG)として書き出す（目・画像版）"""
     target_file, rest = parse_target_and_rest(args.posargs)

@@ -66,6 +66,7 @@ def _read_tsv_grid(path, raw=False):
                  for line in text.split('\n'))
 
 
+@protect_safe
 def cmd_write_range(args):
     """セル範囲に値・数式を書き込む (read-range の対)"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -187,6 +188,7 @@ def cmd_write_range(args):
     return True
 
 
+@protect_safe
 def cmd_clear_range(args):
     """セル範囲をクリア (既定: すべて)"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -217,6 +219,7 @@ def cmd_clear_range(args):
     return True
 
 
+@protect_safe
 def cmd_format_range(args):
     """セル範囲に書式・整形を適用"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -310,6 +313,7 @@ def cmd_format_range(args):
     return True
 
 
+@protect_safe
 def cmd_sheet(args):
     """シート操作: add/delete/rename/copy/activate/show/hide"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -456,6 +460,7 @@ def cmd_sheet(args):
     return True
 
 
+@protect_safe
 def cmd_table(args):
     """テーブル(ListObject)操作: create/list/delete"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -692,6 +697,7 @@ def cmd_table(args):
     return False
 
 
+@protect_safe
 def cmd_name(args):
     """名前付き範囲操作: add/list/delete"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -786,6 +792,7 @@ def _sheet_or_active(wb, sheet_name):
     return None
 
 
+@protect_safe
 def cmd_row(args):
     """行の挿入・削除: row <insert|delete> <行番号> [本数]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -815,6 +822,7 @@ def cmd_row(args):
     return True
 
 
+@protect_safe
 def cmd_col(args):
     """列の挿入・削除: col <insert|delete> <列文字> [本数]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -845,6 +853,7 @@ def cmd_col(args):
     return True
 
 
+@protect_safe
 def cmd_copy_range(args):
     """範囲コピー: copy-range <src> <dst> [--values]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -887,6 +896,7 @@ def cmd_copy_range(args):
     return True
 
 
+@protect_safe
 def cmd_fill(args):
     """オートフィル: fill <range> [--right]（既定は下方向）"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -912,6 +922,7 @@ def cmd_fill(args):
     return True
 
 
+@protect_safe
 def cmd_sort(args):
     """並べ替え: sort <range> [--key 列文字] [--desc] [--header|--no-header]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -953,6 +964,7 @@ def cmd_sort(args):
     return True
 
 
+@protect_safe
 def cmd_autofilter(args):
     """オートフィルタ: autofilter [range] [--off]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -1037,6 +1049,7 @@ def cmd_find(args):
     return True
 
 
+@protect_safe
 def cmd_find_replace(args):
     """一括置換: find-replace <検索> <置換> [range] [--whole] [--wildcard]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -1396,6 +1409,7 @@ def cmd_printer_setup(args):
 _XL_COND_OP = {'gt': 5, 'lt': 6, 'eq': 3, 'ne': 4, 'ge': 7, 'le': 8, 'between': 1}
 
 
+@protect_safe
 def cmd_cond_format(args):
     """条件付き書式(セルの値): cond-format <range> --gt 100 --bg '#FFC7CE'"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -1457,6 +1471,7 @@ def cmd_cond_format(args):
     return True
 
 
+@protect_safe
 def cmd_hyperlink(args):
     """ハイパーリンク: hyperlink <cell> <url> [--text 表示文字] / --remove / --list
 
@@ -1539,6 +1554,7 @@ def cmd_hyperlink(args):
     return True
 
 
+@protect_safe
 def cmd_validation(args):
     """入力規則(ドロップダウン): validation <range> --list 'A,B,C' / --clear"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -1573,6 +1589,7 @@ def cmd_validation(args):
     return True
 
 
+@protect_safe
 def cmd_freeze(args):
     """ウィンドウ枠固定: freeze <cell> / freeze off"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -1593,6 +1610,7 @@ def cmd_freeze(args):
     return True
 
 
+@protect_safe
 def cmd_comment(args):
     """セルコメント: comment <cell> <text> / comment <cell> --remove"""
     target_file, rest = parse_target_and_rest(args.posargs)
