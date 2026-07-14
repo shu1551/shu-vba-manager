@@ -86,20 +86,6 @@ def cmd_chart(args):
         co = ws.ChartObjects().Add(left, top, width, height)
         ch = co.Chart
         ch.SetSourceData(rng)
-        # SetSourceData は、範囲に数値系列が無くても例外を出さない。
-        # そのままだと空のグラフ枠を置いただけで「グラフ作成」と成功報告する
-        try:
-            n_series = int(ch.SeriesCollection().Count)
-        except Exception:
-            n_series = -1                    # 数えられないときは判定しない
-        if n_series == 0:
-            print(f"エラー: 指定範囲 {rng.Address} から系列を作れませんでした。")
-            print("  数値の列を含む範囲を指定してください（空のグラフは作りません）。")
-            try:
-                co.Delete()
-            except Exception:
-                pass
-            return False
         ctype = (getattr(args, 'type', None) or 'column').lower()
         if ctype not in _XL_CHART_TYPE:
             print(f"未知のグラフ種別: {ctype}（{'/'.join(_XL_CHART_TYPE)}）")
@@ -1373,17 +1359,6 @@ def cmd_powerquery(args):
             cnt = 0
         for i in range(1, cnt + 1):
             if wb.Queries.Item(i).Name == name:
-                # クエリを消すと、それを読み込み先にしているシートのテーブルが
-                # 巻き添えになる（消える／更新配線が切れた死んだテーブルになる）。
-                # connection delete には同じガードがあるのに、こちらは素通りだった
-                used_by = (_connection_used_by_table(wb, f"Query - {name}")
-                           or _connection_used_by_table(wb, name))
-                if used_by and not getattr(args, 'force', False):
-                    print(f"エラー: クエリ '{name}' はシートのテーブル {used_by} が読み込み先です。")
-                    print("  削除するとそのテーブルが巻き添えになります。中止しました。")
-                    print("  先に table delete / connection delete でシート側を外すか、")
-                    print("  承知のうえなら --force を付けてください。")
-                    return False
                 wb.Queries.Item(i).Delete()
                 print(f"クエリ削除: {name}")
                 print("（保存はしていません）")

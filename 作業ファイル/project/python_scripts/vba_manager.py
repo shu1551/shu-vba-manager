@@ -445,8 +445,6 @@ def build_parser():
     # name [excel_file] <add|list|delete> ...
     p = sub.add_parser("name")
     p.add_argument("posargs", nargs="*")
-    p.add_argument("--force", action="store_true",
-                   help="add: 既存の同名定義を上書きする（既定では中止する）")
 
     # --- 手コマンド 第2弾 ---
     # a. 編集の足回り
@@ -480,8 +478,6 @@ def build_parser():
     p.add_argument("--no-header", dest="no_header", action="store_true", help="見出しなし")
     p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
                    help="シート名だけの指定（使用範囲全域）を許可する")
-    p.add_argument("--single-column", dest="single_column", action="store_true",
-                   help="隣接列があっても1列だけを並べ替える（行の対応が壊れる。通常は使わない）")
     p.add_argument("--sheet", dest="sheet_opt", default=None,
                    help="対象シート名（rangeと分離指定）")
     p = sub.add_parser("autofilter")   # autofilter [range] [--off]
@@ -632,7 +628,7 @@ def build_parser():
     p.add_argument("--sheet", dest="sheet", default=None, help="load --to sheet の出力先シート（省略時アクティブ）")
     p.add_argument("--at", dest="at", default=None, help="load --to sheet の左上セル（省略時 A1）")
     p.add_argument("--force", action="store_true",
-                   help="delete: 読み込み先テーブルを巻き添えにしてでも削除する")
+                   help="load --to model: 既にモデルに載っていても作り直す（メジャー/リレーションは失われる）")
 
     # 重量級(5) connection <list|refresh|delete> / datamodel [list]
     p = sub.add_parser("connection")

@@ -790,30 +790,8 @@ def cmd_name(args):
         ws, rng = _resolve_range(xl, wb, rest[2])
         # rng.Address は既定で絶対参照 ($A$2)。pywin32 ではプロパティなので引数なしで使う
         refers = "='" + ws.Name.replace("'", "''") + "'!" + rng.Address
-        # Names.Add は既存の同名定義を黙って上書き（再定義）する。delete 側は
-        # 多重一致を弾いて取り違えを防いでいるのに、add 側が素通りでは非対称。
-        # 印刷範囲などの重要な定義名を握り潰しても「追加」としか出ず気づけない
-        existing = []
-        for nm in wb.Names:
-            try:
-                # ブックスコープは "名前"、シートスコープは "'Sheet1'!名前" で返る
-                if nm.Name == nm_name or nm.Name.split('!')[-1] == nm_name:
-                    existing.append(nm)
-            except Exception:
-                continue
-        if existing and not getattr(args, 'force', False):
-            print(f"エラー: 名前 '{nm_name}' は既に定義されています。上書きを中止しました。")
-            for nm in existing:
-                try:
-                    print(f"  既存: {nm.Name} → {nm.RefersTo}")
-                except Exception:
-                    print(f"  既存: {nm_name}")
-            print("  差し替えるなら --force を付けてください（name delete で消してからでも可）。")
-            return False
         wb.Names.Add(nm_name, refers)
         print(f"名前付き範囲を追加: {nm_name} → {refers}")
-        if existing:
-            print("  ※ --force により既存の定義を上書きしました。")
         print("（保存はしていません）")
         return True
 
@@ -1049,21 +1027,6 @@ def cmd_sort(args):
         print(f"  全域を並べ替えるなら --whole-sheet を付けてください（--header の明示も推奨）。")
         return False
     ws, rng = _resolve_range(xl, wb, rest[0], sheet_opt)
-    # 単一列だけを範囲に取ると、Excel の UI が出す「選択範囲を拡張しますか」が
-    # COM では出ないまま、その1列だけが並べ替わる＝隣接列との行対応が破壊される
-    # （このツールの書き込みは Undo 履歴を消すため復旧できない）
-    if rng.Columns.Count == 1 and not getattr(args, 'single_column', False):
-        try:
-            region_cols = int(rng.CurrentRegion.Columns.Count)
-        except Exception:
-            region_cols = 1
-        if region_cols > 1:
-            print(f"エラー: '{rest[0]}' は1列だけですが、隣接列にデータがあります"
-                  f"（連続領域は {region_cols} 列）。")
-            print("  このまま並べ替えると、その列だけが動いて他の列との行の対応が壊れます。")
-            print("  表全体を範囲に指定し、--key で並べ替えの基準列を指定してください。")
-            print("  1列だけを本当に並べ替えるなら --single-column を付けてください。")
-            return False
     keycol = getattr(args, 'key', None)
     if keycol and not (keycol.isascii() and keycol.isalpha()):
         # _col_num は英字以外も黙って数値化してしまい、"A1" が K列扱いになる。
@@ -1469,15 +1432,6 @@ def cmd_printer_setup(args):
     """
     # 対象プリンター名の決定
     printer_name = getattr(args, 'printer', None)
-    # プリンター名を位置引数で渡されても、ここは --printer しか見ない。黙って捨てると
-    # 「指定したプリンターを設定したつもり」が、実際は既定プリンター（＝別のプリンター）の
-    # 設定を即時・不可逆に書き換える事故になる。名前らしき位置引数があれば必ず止める。
-    _, _rest = parse_target_and_rest(args.posargs)
-    if _rest:
-        print(f"エラー: プリンター名は --printer で指定してください: {' '.join(_rest)}")
-        print(f"  例: printer-setup --printer \"{_rest[0]}\" --duplex vertical")
-        print("  （位置引数は無視され、既定プリンターの設定を書き換えてしまいます）")
-        return False
     if not printer_name:
         # Excelが起動していればそのアクティブプリンター名を使用、さもなくばデフォルトプリンター
         try:

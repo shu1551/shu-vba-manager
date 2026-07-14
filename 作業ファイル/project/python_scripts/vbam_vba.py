@@ -4750,12 +4750,11 @@ def cmd_run_macro(args):
     # 実行前にアドインや個人用マクロをロードする
     xl, wb = get_workbook(target_file, load_addins=True)
 
-    # DisplayAlerts は切らない。切ると Excel 組み込みの破壊確認
-    # （Sheets("取説").Delete の「完全に削除されます」等）が「既定の応答＝実行」で
-    # 無言のうちに通ってしまう。手で実行すれば出る確認が、ツール経由だと出ずに消える＝
-    # 下のダイアログ監視の「既定は安全側（キャンセル優先）に倒す」と正反対だった。
-    # VBA の MsgBox は元々 DisplayAlerts では消せず、いずれにせよ監視役が面倒を見る。
-    # 監視役は解除したダイアログを必ず本文で報告するので、無言にはならない。
+    # 警告を非表示にする
+    try:
+        xl.DisplayAlerts = False
+    except Exception:
+        pass
 
     full_macro_path = macro_name
 
@@ -4932,9 +4931,10 @@ def cmd_test(args):
     _auto_dialog = getattr(args, 'auto_dialog', None)
     _dlg_watcher = _start_dialog_watcher(xl, _auto_dialog)
 
-    # DisplayAlerts は切らない（run-macro と同じ理由）。切ると Excel 組み込みの
-    # 破壊確認が「既定の応答＝実行」で無言に通る。テストが実データを撃つ事故は
-    # まさにこれで起きるため、監視役に安全側（キャンセル優先）で任せる。
+    try:
+        xl.DisplayAlerts = False
+    except Exception:
+        pass
 
     # エラー捕捉ハーネスを一時モジュールとして注入する。
     # 直接 Application.Run すると、テスト内の実行時エラー（Err.Raise 含む）は
