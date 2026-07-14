@@ -19,6 +19,7 @@ form_builder.py - UserForm作成のための共通ユーティリティ
     FormBuilder.connect()                                # アクティブブック
 """
 
+import gc
 import os
 import re
 import pythoncom
@@ -288,8 +289,9 @@ class FormBuilder:
                 raise RuntimeError("アクティブなブックがありません。")
             return cls(xl, wb)
         except Exception:
-            # connect 失敗時は __exit__ に到達しないため、ここで対にして解放する
-            pythoncom.CoUninitialize()
+            # ここでも CoUninitialize は呼ばない（__exit__ と同じ理由）。
+            # 接続に失敗しただけで、呼び出し側が既に握っている COM 参照を
+            # 道連れに殺してはならない
             raise
 
     # ---- コンテキストマネージャ ----
@@ -298,7 +300,25 @@ class FormBuilder:
         return self
 
     def __exit__(self, *_):
-        pythoncom.CoUninitialize()
+        # CoUninitialize は呼ばない。手放すのは「自分が握った参照」だけ。
+        #
+        # CoInitialize/CoUninitialize はスレッド単位の参照カウントで、ここで落とすと
+        # そのスレッドの COM ごと終了し、「呼び出し側が握っていた Excel の参照」まで
+        # 道連れで無効になる（2026-07-15 実測: 直後の wb.Name が
+        # 「オブジェクトをサーバーに接続できません」で失敗）。その結果、呼び出し側の
+        # xl.Quit() も失敗して Excel がゾンビとして残り、次に GetActiveObject する処理が
+        # そのゾンビを掴んで「意図しないブックに build_form が走る」事故になる（実際に踏んだ）。
+        #
+        # かといって何もしないと、今度は自分が握った Excel/Workbook の COM 参照が
+        # 残り続け、呼び出し側が Quit してもプロセスが死なない（別のゾンビになる）。
+        # 従来の CoUninitialize は、スレッドごと落とすことで結果的に自分の参照も
+        # 消していた＝正しい後始末を、乱暴な手段で代用していた。
+        #
+        # 正しくは「自分の参照だけを解放する」。gc.collect() は参照サイクルに残った
+        # COM ラッパを確実に Release させるため（_release_com_refs と同じ流儀）。
+        self._wb = None
+        self._xl = None
+        gc.collect()
 
     # ---- プロパティ ----
 
