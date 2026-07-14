@@ -2119,7 +2119,12 @@ def cmd_list_backups(args):
     if not entries:
         print("該当するバックアップはありません。" + (f"（キーワード: {kw}）" if kw else ""))
         return True
-    limit = getattr(args, 'max_hits', None) or 30
+    # `or 30` だと --max 0（件数だけ見たい）が偽値で既定に化ける（is None 判定にする）
+    _m = getattr(args, 'max_hits', None)
+    limit = 30 if _m is None else int(_m)
+    if limit < 0:
+        print("エラー: --max は 0 以上で指定してください（0 は件数のみ表示）")
+        return False
     print(f"--- バックアップ一覧（新しい順・{min(limit, len(entries))}/{len(entries)}件） ---")
     for mtime, name, size in entries[:limit]:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
@@ -2369,7 +2374,7 @@ def cmd_setup_check(args):
     return ng == 0
 
 
-def _collect_book_inventory(xl, wb, include_vba=True):
+def _collect_book_inventory(xl, wb, include_vba=True, quiet=False):
     """ブックの棚卸しデータを機械収集する（docs / call-graph の共通土台）。
 
     include_vba=False は VBA プロジェクトに触らない縮退モード
@@ -2480,7 +2485,10 @@ def _collect_book_inventory(xl, wb, include_vba=True):
             _remove_export_artifacts(tmp)
     inv['shortcuts'] = shortcuts
     inv['shortcuts_unread'] = sc_unread
-    if sc_unread:
+    if sc_unread and not quiet:
+        # MCP では stderr と stdout が同じバッファなので、--json 時にここへ書くと
+        # JSON の前にゴミが混ざって呼び出し側の json.loads が落ちる。
+        # --json の呼び出し元は quiet=True にし、内容は inv['shortcuts_unread'] で受け取る
         print(f"⚠ ショートカット走査で読めなかったモジュール（{len(sc_unread)}件）: "
               + '、'.join(f"{m}({e})" for m, e in sc_unread), file=sys.stderr)
 
@@ -3268,7 +3276,7 @@ def cmd_call_graph(args):
     return not unresolved
 
 
-def _checkup_one(xl, wb, note=None, ack_all=False):
+def _checkup_one(xl, wb, note=None, ack_all=False, quiet=False):
     """1ブックぶんの健康診断（収集・検査・履歴比較まで）。
 
     note はカルテのメモ＝今回のスナップショットに添付して履歴に残す
@@ -3283,10 +3291,10 @@ def _checkup_one(xl, wb, note=None, ack_all=False):
     # シート側だけの縮退診断に切り替える（入口で転ばない）
     vba_error = None
     try:
-        inv = _collect_book_inventory(xl, wb)
+        inv = _collect_book_inventory(xl, wb, quiet=quiet)
     except Exception as e:
         vba_error = str(e).strip() or "VBAプロジェクトにアクセスできません"
-        inv = _collect_book_inventory(xl, wb, include_vba=False)
+        inv = _collect_book_inventory(xl, wb, include_vba=False, quiet=quiet)
     calls = _analyze_calls(inv)
     extra = _extra_code_scans(inv)
     refs = _vba_references(wb) if not vba_error else {'total': 0, 'broken': []}
@@ -3834,7 +3842,8 @@ def cmd_checkup(args):
     for b in books:
         try:
             results.append(_checkup_one(xl, b, note=getattr(args, 'note', None),
-                                        ack_all=getattr(args, 'ack_all', False)))
+                                        ack_all=getattr(args, 'ack_all', False),
+                                        quiet=getattr(args, 'json', False)))
         except Exception as e:
             print(f"警告: {getattr(b, 'Name', '?')} の診断に失敗しました: {e}")
     if not results:
@@ -4032,7 +4041,12 @@ def cmd_grep(args):
     else:
         pat = re.compile(re.escape(needle), flags)
     mod_filter = getattr(args, 'module_opt', None)
-    max_hits = getattr(args, 'max_hits', None) or 200
+    # `or 200` だと --max 0（件数だけ見たい）が偽値で既定に化ける（is None 判定にする）
+    _m = getattr(args, 'max_hits', None)
+    max_hits = 200 if _m is None else int(_m)
+    if max_hits < 0:
+        print("エラー: --max は 0 以上で指定してください（0 は件数のみ表示）")
+        return False
 
     # コードを読むだけ → 読み取り専用で開く（Workbook_Open を起こさない）
     xl, wb = get_workbook(target_file, readonly=True)

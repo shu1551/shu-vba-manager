@@ -393,8 +393,17 @@ def cmd_tab_order(args):
         # 先頭に持ってきて ListBox を後ろへ落とすため、この配置を壊す（2026-07-11 実害）。
         # 機械的な視線順では正解を決められないので、ListBox のあるフォームでは
         # 自動整列を拒否し、--controls で明示させる。
-        listboxes = [ct.Name for ct in comp.Designer.Controls
-                     if _ctrl_type(ct).startswith('ListBox')]
+        # 型が1つも取れない環境では、ListBox を見落として自動整列に進んでしまう
+        # （ガードなのに黙って開く＝fail-open）。守る側は「分からないなら止まる」が正しい
+        ctrls_all = list(comp.Designer.Controls)
+        types = [_ctrl_type(ct) for ct in ctrls_all]
+        if ctrls_all and not any(t for t in types):
+            print("エラー: コントロールの種類を判定できませんでした。")
+            print("  ListBox があるフォームで自動整列すると、開いた瞬間のフォーカスを壊します。")
+            print("  安全のため中止します。--controls で順序を明示してください。")
+            return
+        listboxes = [ct.Name for ct, t in zip(ctrls_all, types)
+                     if t.startswith('ListBox')]
         if listboxes:
             print(f"エラー: このフォームには ListBox があります: {', '.join(listboxes)}")
             print("  一覧系フォームは ListBox が TabIndex 0（開いた瞬間のフォーカスが一覧）"

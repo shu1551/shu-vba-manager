@@ -73,8 +73,14 @@ class _alerts_off:
     def __exit__(self, exc_type, exc, tb):
         try:
             self.xl.DisplayAlerts = self.prev
-        except Exception:
-            pass
+        except Exception as ex:
+            # 戻せないと DisplayAlerts=False のままの Excel が残る＝以後の上書き確認・
+            # シート削除確認が全部抑止された状態でユーザーが使い続ける（開いたまま運用では実害）。
+            # 保護の再適用失敗と同じく、黙らずに報告する
+            print(f"⚠ DisplayAlerts を元に戻せませんでした（{self.prev} に戻す予定でした）: {ex}",
+                  file=sys.stderr)
+            print("  この Excel では確認ダイアログが抑止されたままです。"
+                  "Excel を開き直すか、手動で設定を確認してください。", file=sys.stderr)
         return False
 
 

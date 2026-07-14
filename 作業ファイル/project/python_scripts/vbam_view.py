@@ -533,7 +533,15 @@ def cmd_snapshot(args):
                 if cmap:
                     cells.append({"r": r0 + i, "c": cmap})
             if nr > max_rows:
-                info["cells_truncated"] = {"read_rows": max_rows, "total_rows": nr}
+                # first_row / last_read_row は「絶対行番号」。セルは r0+i の絶対行で
+                # 格納されるので、read_rows（＝読んだ行数）だけを持たせると
+                # snapshot-diff 側が行数と絶対行番号を取り違える
+                # （UsedRange が1行目から始まらないシートで、読み込み済みの実差分まで
+                #   捨てて「差分なし」と嘘をつく。2026-07-14 実弾で確認）
+                info["cells_truncated"] = {
+                    "read_rows": max_rows, "total_rows": nr,
+                    "first_row": r0, "last_read_row": r0 + read_rows - 1,
+                }
         info["cells"] = cells
 
         # --- 結合（①の素を流用）---
@@ -603,24 +611,57 @@ def cmd_snapshot(args):
     return True
 
 
+def _sheet_first_row(info):
+    """シートの UsedRange 先頭行（絶対行番号）。取れなければ None。
+
+    新しい snapshot は cells_truncated.first_row を持つ。古い JSON にはないので
+    used のアドレス（"$A$200:$C$699" 等）から復元する。
+    """
+    t = info.get('cells_truncated') or {}
+    fr = t.get('first_row')
+    try:
+        fr = int(fr)
+        if fr > 0:
+            return fr
+    except (TypeError, ValueError):
+        pass
+    m = re.search(r'\$?[A-Z]{1,3}\$?(\d+)', str(info.get('used') or ''))
+    return int(m.group(1)) if m else None
+
+
 def _cell_compare_limit(old_info, new_info):
-    """snapshot 2つのシート情報から「セルを比較してよい行の上限」を返す（無ければ None）。
+    """snapshot 2つのシート情報から「セルを比較してよい行の上限（絶対行番号）」を返す。
 
     snapshot は --max-rows で読み込む行を打ち切る（cells_truncated に記録）。
     打ち切りは「そこから下は読んでいない」だけで「空だった」ではないため、
-    打ち切り行より下を比較すると片側だけ空＝疑似差分になる。両側の read_rows の
-    小さい方（打ち切りが片側だけなら、その値）を上限として返す。
+    打ち切り行より下を比較すると片側だけ空＝疑似差分になる。
+
+    ※ 返すのは「絶対行番号」であって行数ではない。セルは r0+i の絶対行で格納
+    されるため、read_rows（読んだ行数）をそのまま上限にすると単位が食い違い、
+    UsedRange が1行目から始まらないシートでは読み込み済みの実差分まで捨てて
+    「差分なし」と嘘をつく（2026-07-14 実弾で確認）。
+    上限は last_read_row（＝first_row + read_rows - 1）で判定する。
     """
     limits = []
     for info in (old_info, new_info):
         t = info.get('cells_truncated') or {}
-        r = t.get('read_rows')
-        try:
-            r = int(r)
-        except (TypeError, ValueError):
+        if not t:
             continue
-        if r > 0:
-            limits.append(r)
+        last = t.get('last_read_row')
+        try:
+            last = int(last)
+        except (TypeError, ValueError):
+            last = None
+        if last is None:
+            # 古い snapshot（last_read_row を持たない）は used から復元する
+            fr = _sheet_first_row(info)
+            try:
+                rr = int(t.get('read_rows'))
+            except (TypeError, ValueError):
+                rr = None
+            last = (fr + rr - 1) if (fr is not None and rr) else None
+        if last is not None and last > 0:
+            limits.append(last)
     return min(limits) if limits else None
 
 
@@ -1067,6 +1108,7 @@ def _screenshot_cleanup(xl, ws):
 __all__ = [
     'LAST_VIEW_FILE',
     '_cell_compare_limit',
+    '_sheet_first_row',
     '_collect_shapes',
     '_disp_pad',
     '_disp_truncate',

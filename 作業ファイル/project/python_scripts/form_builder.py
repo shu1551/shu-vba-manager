@@ -404,23 +404,32 @@ class FormBuilder:
     def clear_controls(self, frm_comp):
         """フォームの既存コントロールをすべて削除し、Designer オブジェクトを返す。
 
-        消せなかったものは必ず報告する。1個でも残ると後段の Controls.Add が
-        名前衝突で落ちるのに、失敗を握りつぶして「元の個数」を削除数として
-        出していたため、ログ上は「全部消した」に見えていた（偽の成功報告）。
+        本当に残ったものだけを報告する。判定は Remove の戻りではなく
+        「最後に Controls に何が残っているか」で行う:
+        Designer.Controls は Frame / MultiPage の子まで含むフラットな一覧なので、
+        親を先に Remove すると子も道連れに消え、その後の子の Remove は必ず失敗する。
+        これは正常な挙動であって失敗ではない。Remove の例外をそのまま失敗として
+        数えると、枠のあるフォームで毎回「削除できませんでした」という嘘の警告が
+        子の数だけ出る（2026-07-14 実機で確認。握りつぶしを直したつもりが誤報を
+        生んでいた）。1個でも本当に残れば後段の Controls.Add が名前衝突で落ちるため、
+        残存の報告自体は必要。
         """
         f = frm_comp.Designer
         names = [c.Name for c in f.Controls]
-        removed = 0
-        failed = []
         for n in names:
             try:
                 f.Controls.Remove(n)
-                removed += 1
-            except Exception as e:
-                failed.append((n, e))
-        print(f"コントロールをクリア ({removed}/{len(names)} 個削除)")
-        for n, e in failed:
-            print(f"⚠ 削除できませんでした: {n} ({e}) "
+            except Exception:
+                # 親ごと消えた子はここに来る。残ったかどうかは後でまとめて確認する
+                pass
+        try:
+            remaining = [c.Name for c in f.Controls]
+        except Exception as ex:
+            print(f"⚠ 残存コントロールを確認できませんでした: {ex}")
+            remaining = []
+        print(f"コントロールをクリア ({len(names) - len(remaining)}/{len(names)} 個削除)")
+        for n in remaining:
+            print(f"⚠ 削除できませんでした: {n} "
                   "— この名前で再追加すると名前衝突で失敗します")
         return f
 

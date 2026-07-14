@@ -1115,7 +1115,7 @@ def _snapshot_connection(cn):
     None を返し、呼び出し側は「消したまま失敗した」ことを明示する。
     """
     snap = {'name': None, 'desc': '', 'conn': None, 'cmd_text': None,
-            'cmd_type': 1, 'in_model': False}
+            'cmd_type': None, 'in_model': None}
     try:
         snap['name'] = cn.Name
     except Exception:
@@ -1123,18 +1123,26 @@ def _snapshot_connection(cn):
     try:
         snap['desc'] = cn.Description or ''
     except Exception:
-        pass
+        pass                              # 説明は欠けても接続の実体は変わらない
+    # 以下は復元の同一性に効く項目。1つでも取れなければ「復元できる」と言ってはいけない。
+    # まとめて try に入れると、接続文字列だけ取れて CommandText/CommandType が
+    # 欠けたまま初期値で復元し、別物の接続を作って「元に戻しました」と報告してしまう
+    # （PowerQuery のモデル接続は CommandType=6。既定の 1 で復元すると配線が変わる）
     try:
         snap['in_model'] = bool(cn.InModel)
     except Exception:
-        pass
+        return None
     try:
         sub = cn.OLEDBConnection            # PowerQuery 接続は OLEDB
-        snap['conn'] = str(sub.Connection)
-        snap['cmd_text'] = sub.CommandText
-        snap['cmd_type'] = int(sub.CommandType)
     except Exception:
-        pass
+        return None
+    for key, get in (('conn', lambda: str(sub.Connection)),
+                     ('cmd_text', lambda: sub.CommandText),
+                     ('cmd_type', lambda: int(sub.CommandType))):
+        try:
+            snap[key] = get()
+        except Exception:
+            return None
     if not snap['conn']:
         return None
     return snap

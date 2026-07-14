@@ -33,6 +33,14 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 LAST_PROC = os.path.join(SCRIPT_DIR, "_last_proc.vba")
 BLOCKED = {"shell", "batch"}  # 対話・標準入力前提のコマンドは MCP では使えない
 
+# 本物の標準入出力（JSON-RPC の通信線）を起動時に控えておく。
+# ワーカーは実行中 sys.stdout を自分のバッファに差し替えるが、復元先を
+# 「入った時点の sys.stdout」にすると、世代交代（_restart_worker）後に
+# 起動した新ワーカーが「前の世代の捨てられたバッファ」を掴んでそこへ復元し続ける。
+# 以後ジョブ外の print（cleanup の DEBUG 行など）が誰も読まないバッファに溜まる。
+# 復元先は常にこの実体にする。
+REAL_STDIN, REAL_STDOUT, REAL_STDERR = sys.stdin, sys.stdout, sys.stderr
+
 # アイドルでこの秒数コマンドが来なければ Excel への COM 参照を解放する。
 # 常駐が Application/Workbook 参照を握ったままだと、ユーザーが Excel を×で
 # 閉じてもプロセスが数十秒死なずゾンビ化し、その隙にブックを開くと死にかけ
@@ -114,9 +122,6 @@ def _worker(jobs):
                 continue
             box["started"] = True
         buf = io.StringIO()
-        old_stdin = sys.stdin
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
         fake_stdin = io.StringIO("")
         ok = False
         try:
@@ -124,8 +129,10 @@ def _worker(jobs):
             # with 文の __exit__ は「自分が入った時点の値」を無条件に復元するため、
             # 世代交代（_restart_worker）後に旧ワーカーが復帰すると、新ワーカーが
             # 据えたリダイレクトを剥がして本物の stdout ＝ JSON-RPC の通信線を
-            # 露出させてしまう。stdin と同じく「自分が据えたものが残っているときだけ
-            # 戻す」に揃える
+            # 露出させてしまう。「自分が据えたものが残っているときだけ戻す」に加え、
+            # 戻し先は入った時点の値ではなく REAL_*（本物の通信線）にする。
+            # 入った時点の値だと、前世代の捨てられたバッファを掴んで復元し続け、
+            # ジョブ外の print が誰も読まないバッファに溜まる
             sys.stdin = fake_stdin
             sys.stdout = buf
             sys.stderr = buf
@@ -142,15 +149,15 @@ def _worker(jobs):
         except Exception as e:
             buf.write(f"\nエラー: {e}")
         finally:
-            # 世代交代後に旧ワーカーが復帰した場合、新世代が据えた stdin/stdout を
-            # 本物（JSON-RPC の通信線）に戻してしまわないよう、
-            # 自分が据えたものが残っているときだけ復元する
+            # 世代交代後に旧ワーカーが復帰した場合、新世代が据えたものを剥がして
+            # 本物（JSON-RPC の通信線）を露出させないよう、自分が据えたものが
+            # 残っているときだけ復元する。戻し先は必ず REAL_*（起動時に控えた実体）
             if sys.stdin is fake_stdin:
-                sys.stdin = old_stdin
+                sys.stdin = REAL_STDIN
             if sys.stdout is buf:
-                sys.stdout = old_stdout
+                sys.stdout = REAL_STDOUT
             if sys.stderr is buf:
-                sys.stderr = old_stderr
+                sys.stderr = REAL_STDERR
             box["ok"] = ok
             box["out"] = buf.getvalue()
             done.set()

@@ -50,6 +50,10 @@ _created_instances = []          # [{"xl": <COM>, "pid": int|None}, ...]
 # 後方互換の別名（コード内の他参照・デバッグ表示用に「最後の1台」を指す）
 _created_xl = None
 _created_xl_pid = None
+# 直前の _get_workbook_uncached が「このツール自身でブックを開いた」かどうか。
+# 健診モード(readonly)の後始末は自分が開いたブックにしか許されない
+# （ユーザーが読み取り専用で開いていたブックを閉じる事故の防止・2026-07-14）
+_last_open_by_tool = False
 
 
 def setup_encoding():
@@ -113,11 +117,20 @@ _COM_BUSY_HRESULTS = (
     -2147418111,  # 0x80010001 RPC_E_CALL_REJECTED
     -2147417846,  # 0x8001010A RPC_E_SERVERCALL_RETRYLATER
     -2147417847,  # 0x80010109 RPC_E_SERVERCALL_REJECTED
+    -2147417851,  # 0x80010105 RPC_E_SERVERFAULT
+    -2146777072,  # 0x800AC472 VBA_E_IGNORE（Excel がセル編集中・モーダル表示中に返す
+                  #             一番ありふれた「今は無理」。これを外すと、ビジーな
+                  #             Excel を「死んでいる」と誤判定して強制終了し、
+                  #             未保存の変更を捨てる＝温存の約束を破る）
 )
 
 
 def _com_is_busy(ex):
-    """COM 例外が「Excel がビジー（＝生きているが今は応答できない）」かどうか"""
+    """COM 例外が「Excel がビジー（＝生きているが今は応答できない）」かどうか。
+
+    判定できない例外（COM 以外・HRESULT が読めない）は False を返すが、
+    呼び出し側はそれを「死んでいる」と決めつけずに扱うこと。
+    """
     for val in (getattr(ex, 'hresult', None),) + tuple(getattr(ex, 'args', ()) or ()):
         if isinstance(val, int) and val in _COM_BUSY_HRESULTS:
             return True
@@ -466,22 +479,40 @@ def get_workbook(target_file_arg=None, load_addins=False, readonly=False):
                 except Exception:
                     pass
             if was_ro and not readonly:
-                # 健診モード（読み取り専用・イベント無効）で開いたブックを、同じ
-                # セッション（batch/shell/MCP は接続キャッシュを持ち越す）で書き込み系に
-                # 渡すと、編集が分かりにくい COM エラーで失敗する。
+                # 健診モード（読み取り専用・イベント無効）で「このツールが」開いた
+                # ブックを、同じセッション（batch/shell/MCP は接続キャッシュを持ち越す）で
+                # 書き込み系に渡すと、編集が分かりにくい COM エラーで失敗する。
                 # 例: get <path> → replace-procedure <path>
-                # 警告だけでは直らないので、書き込みが要るときは通常モードで開き直す
+                # 警告だけでは直らないので、書き込みが要るときは通常モードで開き直す。
+                # ※ was_ro はツール自身が開いたときにしか立たない（_last_open_by_tool）。
+                #   ユーザーが読み取り専用で開いていたブックをここで閉じてはならない。
                 print("（診断用に読み取り専用で開いていたブックを、書き込みのため通常モードで開き直します）")
                 try:
                     wb.Close(SaveChanges=False)
-                except Exception:
-                    pass
+                except Exception as ex:
+                    # 閉じられない（ビジー・モーダル表示中等）のに開き直したことにすると、
+                    # 読み取り専用のまま書き込みに進み、Save で落ちるか黙って捨てられる
+                    print(f"エラー: 読み取り専用で開いたブックを閉じられませんでした: {ex}")
+                    print("  Excel がビジー（マクロ実行中・ダイアログ表示中）の可能性があります。")
+                    print("  少し待ってから再実行してください。")
+                    raise
                 try:
                     xl.EnableEvents = True   # 健診モードで切っていたイベントを戻す
-                except Exception:
-                    pass
+                except Exception as ex:
+                    print(f"⚠ EnableEvents を戻せませんでした: {ex}", file=sys.stderr)
+                    print("  このExcelではイベントマクロ(Worksheet_Change等)が動きません。",
+                          file=sys.stderr)
                 del _wb_cache[key]
                 xl, wb = _get_workbook_uncached(target_file_arg, load_addins, False)
+                # 本当に書き込み可能になったかを実測する（「開き直しました」と言いながら
+                # 読み取り専用のまま、を防ぐ）
+                try:
+                    if bool(wb.ReadOnly):
+                        raise Exception(
+                            "開き直しましたが、まだ読み取り専用です"
+                            "（ファイルが読み取り専用属性、または他で開かれています）")
+                except pywintypes.com_error:
+                    pass
                 _wb_cache[key] = (xl, wb, False)
                 return xl, wb
             if load_addins:
@@ -490,8 +521,12 @@ def get_workbook(target_file_arg=None, load_addins=False, readonly=False):
         except Exception:
             del _wb_cache[key]
     xl, wb = _get_workbook_uncached(target_file_arg, load_addins, readonly)
-    # readonly フラグは「このツールが自動で開いた場合」だけ意味を持つ
-    opened_ro = readonly and target_file_arg is not None
+    # 健診モードの印は「このツールが今このブックを開いた場合」だけ立てる。
+    # wb.ReadOnly だけで判定すると、ユーザーが読み取り専用で開いていたブック
+    # （読み取り専用属性・読み取り専用推奨・他者がロック中・「読み取り専用で開く」を
+    # 選択）を健診モードと誤認し、後で書き込み系が来たときに勝手に Close して
+    # 開き直す＝ユーザーのウィンドウが消える（2026-07-14 実機で再現）。
+    opened_ro = readonly and target_file_arg is not None and _last_open_by_tool
     try:
         opened_ro = opened_ro and bool(wb.ReadOnly)
     except Exception:
@@ -505,7 +540,14 @@ def _get_workbook_uncached(target_file_arg=None, load_addins=False, readonly=Fal
     target_file_arg が None/空 → アクティブExcelブックを自動使用
     それ以外 → 既に開いているか確認、なければ新規オープン
     戻り値: (xl, wb)
+
+    副作用: グローバル _last_open_by_tool に「このツールが今開いたのか
+    （True）／既に開いていたブックを掴んだだけか（False）」を記録する。
+    健診モード(readonly)の後始末は自分が開いたブックにしか許されないため
+    （ユーザーが読み取り専用で開いていたブックを閉じる事故の防止）。
     """
+    global _last_open_by_tool
+    _last_open_by_tool = False
     pythoncom.CoInitialize()
 
     if not target_file_arg:
@@ -607,10 +649,12 @@ def _get_workbook_uncached(target_file_arg=None, load_addins=False, readonly=Fal
         except Exception:
             pass
         wb = xl.Workbooks.Open(target_path, 0, True)   # UpdateLinks=0, ReadOnly=True
+        _last_open_by_tool = True
         print(f"対象ブック: {wb.Name}  (新規オープン・読み取り専用・イベント無効=健診モード)")
         return xl, wb
 
     wb = xl.Workbooks.Open(target_path)
+    _last_open_by_tool = True
     print(f"対象ブック: {wb.Name}  (新規オープン)")
     if not excel_running and not load_addins:
         # COM起動のExcelは起動処理が走らず、アドインや PERSONAL.XLSB が読み込まれない
@@ -1325,6 +1369,7 @@ __all__ = [
     '_created_instances',
     '_created_xl',
     '_created_xl_pid',
+    '_last_open_by_tool',
     '_find_component',
     '_find_invalid_procedure_names',
     '_get_active_excel',

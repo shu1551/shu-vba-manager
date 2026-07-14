@@ -231,8 +231,11 @@ def main():
     ng = 0
     for p in args.files:
         print(f'===== {p}')
-        if args.scrub:
-            scrub(p)
+        # 必ず check を先に回す。scrub は dc:creator / cp:lastModifiedBy を空欄化するが、
+        # vbaProject.bin の実名検索はその作成者名を手がかり(needle)にしている。
+        # 先に scrub すると手がかりが消え、bin に実名が残っていても「0件・全項目クリア・
+        # 終了コード0」と言い切る＝実名を抱えたまま公開GOを出す
+        # （2026-07-14 実弾で確認。7/11 の公開事故の再演になるところだった）
         issues = check(p)
         if issues:
             ng += 1
@@ -241,6 +244,10 @@ def main():
                 print(f'    - {i}')
         else:
             print('  ✓ 機械チェックは全項目クリア（残留値は上の表示を目視）')
+        if args.scrub:
+            scrub(p)
+            print('  ※ 空欄化しました。上の検査結果は空欄化「前」の状態です。')
+            print('     空欄化後の状態を確認するには --scrub なしでもう一度実行してください。')
     sys.exit(1 if ng else 0)
 
 
