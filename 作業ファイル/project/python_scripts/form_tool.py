@@ -474,10 +474,16 @@ def cmd_copy_form(args):
             elif ln.strip().startswith(b"Begin "):
                 # Begin {GUID} フォーム名 — 末尾のフォーム名トークンだけ書き換える。
                 # 全体 replace だと旧名が16進文字だけの短い名前（"C" 等）のとき
-                # GUID 側まで置換されてヘッダーが壊れる
-                head, sep, tail = ln.rpartition(b" ")
+                # GUID 側まで置換されてヘッダーが壊れる。
+                # .frm の Begin 行はフォーム名の後ろに空白が付く。rstrip せずに
+                # rpartition すると tail が空文字になってこのガードが一度も発火せず、
+                # 素の全体 replace に落ちていた（2026-07-14 修正）。
+                # 付いていた末尾の空白はそのまま復元する
+                stripped = ln.rstrip()
+                trail = ln[len(stripped):]
+                head, sep, tail = stripped.rpartition(b" ")
                 if sep and tail == old_name:
-                    lines[i] = head + b" " + new_b
+                    lines[i] = head + b" " + new_b + trail
                 else:
                     lines[i] = ln.replace(old_name, new_b)
         with open(new_frm, "wb") as f:

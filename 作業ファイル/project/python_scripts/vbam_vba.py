@@ -1305,6 +1305,7 @@ def cmd_replace_procedure(args):
         # Remove + Import（例外時も DisplayAlerts を戻し、一時ファイルを残さない）
         xl.DisplayAlerts = False
         removed = False
+        imported = False
         try:
             wb.Save()
             time.sleep(0.5)
@@ -1315,14 +1316,21 @@ def cmd_replace_procedure(args):
             pythoncom.PumpWaitingMessages()
             # 実名検証つき Import（Remove 遅延完了→名前衝突→shu0051 化事故のガード）
             _import_module_verified(wb, tmp_bas, module_name)
-            wb.Save()
+            # ここから先の失敗は「保存の失敗」であって「モジュールの消失」ではない。
+            # この印を立てずに復旧へ落ちると、正しく入った新モジュールにバックアップを
+            # 重ね Import して、ツール自身が連番モジュールを作ってしまう（2026-07-14 発見）
+            imported = True
+            _save_with_retry(wb)
         except ModuleNameCollisionError as ex:
             # コードは連番付き別名側に生きている。バックアップ再 Import は三重化するので禁止
             _print_collision_guidance(ex, module_name, module_backup)
             return False
         except Exception as ex:
             print(f"エラー: 置換中に失敗しました: {ex}")
-            if removed:
+            if imported:
+                # Import は成功済み＝消えていない。再 Import は連番モジュールを生むだけ
+                _print_save_failed_guidance(module_name)
+            elif removed:
                 # Remove 成功後の Import 失敗＝開いているブックからモジュール消失。
                 # 直前のモジュールバックアップ（置換前の内容）から自動復旧を試みる。
                 print(f"⚠ モジュール '{module_name}' は Remove 済みです。バックアップから復旧を試みます...")
@@ -1599,7 +1607,21 @@ def cmd_delete_module(args):
         return False
     backup = make_module_backup(wb, comp.Name)
 
+    actual_name = comp.Name
     wb.VBProject.VBComponents.Remove(comp)
+    # VBE の Remove は遅延完了することがある（対象モジュールのコードが実行中など）。
+    # 消える前に Save すると「削除完了」と報告しながらファイルには残り、
+    # あとから遅延 Remove だけが効いて未保存のまま消える——という食い違いが起きる
+    pythoncom.PumpWaitingMessages()
+    if not _wait_component_gone(wb, actual_name):
+        print(f"エラー: モジュール '{actual_name}' の Remove が完了しませんでした"
+              f"（そのモジュールのコードが実行中の可能性があります）。", file=sys.stderr)
+        print("  保存はしていません。Excel 側の実行中マクロ・開いているフォームを"
+              "閉じてから、もう一度実行してください。", file=sys.stderr)
+        if backup:
+            print(f"  モジュールのバックアップ: {backup}", file=sys.stderr)
+        return False
+
     wb.Save()
     print(f"削除完了: モジュール '{module_name}' → 保存しました")
     if backup:
@@ -1699,6 +1721,7 @@ def cmd_replace_module(args):
         if comp.Name.lower() == module_name.lower():
             xl.DisplayAlerts = False
             removed = False
+            imported = False
             try:
                 wb.Save()
                 time.sleep(0.5)
@@ -1709,14 +1732,19 @@ def cmd_replace_module(args):
                 pythoncom.PumpWaitingMessages()
                 # 実名検証つき Import（Remove 遅延完了→名前衝突→shu0051 化事故のガード）
                 _import_module_verified(wb, import_path, module_name)
-                wb.Save()
+                # ここから先の失敗は「保存の失敗」であって「モジュールの消失」ではない
+                imported = True
+                _save_with_retry(wb)
             except ModuleNameCollisionError as ex:
                 # コードは連番付き別名側に生きている。バックアップ再 Import は三重化するので禁止
                 _print_collision_guidance(ex, module_name, module_backup)
                 return False
             except Exception as ex:
                 print(f"エラー: 置換中に失敗しました: {ex}")
-                if removed:
+                if imported:
+                    # Import は成功済み＝消えていない。再 Import は連番モジュールを生むだけ
+                    _print_save_failed_guidance(module_name)
+                elif removed:
                     # Remove だけ成功して Import に失敗＝開いているブックからモジュール消失。
                     # 直前のモジュールバックアップから自動復旧を試みる。
                     print(f"⚠ モジュール '{module_name}' は Remove 済みです。バックアップから復旧を試みます...")
@@ -1950,6 +1978,7 @@ def cmd_reorder_macro(args):
     # replace-module と同じ安定化手順（sleep + PumpWaitingMessages）に揃える
     xl.DisplayAlerts = False
     removed = False
+    imported = False
     success = False
     try:
         wb.Save()
@@ -1961,7 +1990,10 @@ def cmd_reorder_macro(args):
         pythoncom.PumpWaitingMessages()
         # 実名検証つき Import（Remove 遅延完了→名前衝突→shu0051 化事故のガード）
         _import_module_verified(wb, tmp_bas, module_name)
-        wb.Save()
+        # ここから先の失敗は「保存の失敗」であって「モジュールの消失」ではない。
+        # success は最後の Save の後にしか立たないので、復旧判定には使えない
+        imported = True
+        _save_with_retry(wb)
         success = True
     except ModuleNameCollisionError as ex:
         # コードは連番付き別名側に生きている。バックアップ再 Import は三重化するので禁止
@@ -1970,7 +2002,11 @@ def cmd_reorder_macro(args):
     except Exception as ex:
         # Remove 成功後に Import が失敗するとモジュールが消えたままになる。
         # replace-module と同じく、モジュールバックアップからの自動復旧を先に試みる
-        if removed:
+        if imported:
+            # Import は成功済み＝消えていない。再 Import は連番モジュールを生むだけ
+            print(f"エラー: 並べ替え後の保存に失敗しました: {ex}", file=sys.stderr)
+            _print_save_failed_guidance(module_name, err=True)
+        elif removed:
             print(f"エラー: 並べ替え中に失敗しました（モジュール '{module_name}' が"
                   f"開いているブックから外れた可能性があります）: {ex}", file=sys.stderr)
             try:
@@ -1997,8 +2033,9 @@ def cmd_reorder_macro(args):
         return False
     finally:
         xl.DisplayAlerts = True
-        # 「Remove 済みで Import 失敗」のときだけ復旧用に残し、それ以外は掃除する
-        if not (removed and not success) and os.path.exists(tmp_bas):
+        # 「Remove 済みで Import 失敗」のときだけ復旧用に残し、それ以外は掃除する。
+        # Import 済み（保存だけ失敗）はブック側に新コードが入っているので残す必要はない
+        if not (removed and not imported) and os.path.exists(tmp_bas):
             _remove_export_artifacts(tmp_bas)
 
     print(f"完了: [{module_name}] '{macro_name}' を {direction}に移動")

@@ -607,6 +607,61 @@ def test_import_verified_unrecoverable_raises_not_silent_success():
     assert any(c.Name == "TestMod1" for c in comps.comps)
 
 
+def test_backup_reimport_only_when_import_actually_failed():
+    """Import 成功後の Save 失敗で、バックアップを再 Import してはいけない（回帰）。
+
+    2026-07-14 発見の実害: Remove+Import 系3経路の except が removed フラグしか
+    見ておらず、Import が成功した後の wb.Save() が失敗すると「モジュールが消えた」と
+    誤認してバックアップを重ね Import していた。期待名のモジュールは既に正しく
+    存在するので _wait_component_gone は空振りし（15秒）、VB_Name 衝突で連番別名として
+    取り込まれ、改名待ちも空振りして（20秒）例外になる——つまりツール自身が
+    「旧コード入りの連番モジュール」を生み、35秒待たせたうえで失敗していた。
+
+    復旧（バックアップの再 Import）は Import 自体が失敗したときだけ通ること。
+    構文木で「復旧呼び出しを囲む if の条件に imported が出てくるか」を機械照合する。
+    """
+    import ast as _ast
+    base = os.path.dirname(os.path.abspath(__file__))
+    targets = ['vbam_vba.py', 'optimize_vba_modules.py']
+
+    def _func_name(node):
+        f = node.func
+        return getattr(f, 'id', None) or getattr(f, 'attr', None) or ''
+
+    total = 0
+    for fname in targets:
+        with open(os.path.join(base, fname), encoding='utf-8') as f:
+            tree = _ast.parse(f.read())
+        parents = {}
+        for parent in _ast.walk(tree):
+            for child in _ast.iter_child_nodes(parent):
+                parents[child] = parent
+
+        recoveries = [
+            n for n in _ast.walk(tree)
+            if isinstance(n, _ast.Call)
+            and _func_name(n) == '_import_module_verified'
+            and len(n.args) >= 2
+            and getattr(n.args[1], 'id', '') == 'module_backup'
+        ]
+        for call in recoveries:
+            names = set()
+            node = call
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, _ast.If):
+                    names |= {n.id for n in _ast.walk(node.test)
+                              if isinstance(n, _ast.Name)}
+            assert 'imported' in names, (
+                f"{fname}: バックアップの再 Import が imported フラグで守られていない。\n"
+                "  Import 成功後の Save 失敗で、ツール自身が連番モジュール"
+                "（旧コード入り）を作る経路が復活している。")
+        total += len(recoveries)
+
+    # replace-procedure(Attribute経路) / replace-module / reorder / optimize の4経路
+    assert total == 4, f"復旧経路の数が想定と違う（台帳の更新が必要）: {total}"
+
+
 # ================================================================
 # ダイアログ自動解除の報告（マクロ発火中のMsgBoxを黙って握りつぶさない）
 # 2026-07-11: write-range→Worksheet_Change→MsgBox で無言ハングした実害の対策。
@@ -792,13 +847,17 @@ def test_injection_route_ledger():
         ('form_inspect.py', 'render_form_png'),     # 機械固定名 tmpFormInspect* のみ＝安全
         ('form_layout.py', 'build_form'),           # 起動マクロ名を check_vba_identifier で検査
         ('form_tool.py', 'cmd_copy_form'),          # 新フォーム名を check_vba_identifier で検査
-        ('live_sync_vba.py', 'update_excel_live'),  # 既存コード往復＋固定名マクロ追記のみ＝新規名の流入なし
-        ('optimize_vba_modules.py', 'apply_module'),  # 自前export→固定規則変換→再Importの往復＝同上
+        ('live_sync_vba.py', 'update_module'),      # 既存コード往復＋固定名マクロ追記のみ＝新規名の流入なし
+                                                    # （2026-07-14: 失敗時に旧コードを書き戻すため関数へ切り出し）
+        # 2026-07-14: optimize_vba_modules.apply_module は素の VBComponents.Import をやめ、
+        # vbam_core._import_module_verified（実名検証つき）に委譲したので注入経路ではなくなった
         # 2026-07-12 分割: vba_manager.py の実装は vbam_core/vbam_vba 等へ移動（入口は不変）
         ('vbam_core.py', '_import_module_verified'),  # 取込の中央関数（名前衝突ガード）。内容の識別子検査は呼び元
         ('vbam_vba.py', 'cmd_replace_procedure'),     # validate_vba_code で識別子検査
         ('vbam_vba.py', 'cmd_add_procedure'),         # validate_vba_code で識別子検査
         ('vbam_vba.py', 'cmd_test'),                  # 機械固定名 VMT_n ハーネス＝安全
+        ('test_e2e_com.py', 'book'),                  # E2E の使い捨てブック生成。固定リテラルの
+                                                      # テストコードのみ＝外から名前が流入しない
     }
     found = set()
     for fname in sorted(os.listdir(base)):

@@ -9,6 +9,7 @@ import os
 import sys
 import win32com.client
 import pythoncom
+import vbam_core  # 実名検証つき Import（名前衝突ガード）を本体と共用する
 sys.stdout.reconfigure(encoding='utf-8')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -321,16 +322,54 @@ def optimize_shu003(text):
 
 
 def apply_module(wb, module_name, bas_fname):
-    """既存モジュールを Remove + Import で差し替え（Attributeを正しく処理）"""
+    """既存モジュールを Remove + Import で差し替え（Attributeを正しく処理）
+
+    素の Remove→Import は、VBE の Remove が遅延完了する隙に同名を取り込んで
+    「shu0031」のような連番別名になり、しかもエラーにならず成功扱いになる
+    （2026-07-11 の shu005 消滅事故と同型）。vba_manager 本体と同じ
+    _import_module_verified（実名検証つき Import）を通す。
+    """
     bas_path = os.path.join(BASE_DIR, bas_fname)
-    for comp in wb.VBProject.VBComponents:
-        if comp.Name.lower() == module_name.lower():
-            wb.VBProject.VBComponents.Remove(comp)
-            wb.VBProject.VBComponents.Import(bas_path)
-            print(f"  ✓ モジュール '{module_name}' を Remove+Import で更新完了")
-            return True
-    print(f"  ! エラー: モジュール '{module_name}' が見つかりません")
-    return False
+    if not os.path.exists(bas_path):
+        print(f"  ! エラー: {bas_fname} がありません")
+        return False
+
+    comp = vbam_core._find_component(wb, module_name)
+    if comp is None:
+        print(f"  ! エラー: モジュール '{module_name}' が見つかりません")
+        return False
+
+    # 差し替え前の内容を退避（Import 失敗時の復旧素材）
+    module_backup = vbam_core.make_module_backup(wb, module_name)
+
+    removed = False
+    imported = False
+    try:
+        wb.VBProject.VBComponents.Remove(comp)
+        removed = True
+        pythoncom.PumpWaitingMessages()
+        vbam_core._import_module_verified(wb, bas_path, module_name)
+        imported = True
+        print(f"  ✓ モジュール '{module_name}' を Remove+Import で更新完了（実名検証済み）")
+        return True
+    except vbam_core.ModuleNameCollisionError as ex:
+        vbam_core._print_collision_guidance(ex, module_name, module_backup)
+        return False
+    except Exception as ex:
+        print(f"  ! エラー: '{module_name}' の差し替えに失敗しました: {ex}")
+        if removed and not imported:
+            print(f"  ⚠ モジュール '{module_name}' は Remove 済みです。バックアップから復旧を試みます...")
+            try:
+                if module_backup and os.path.exists(module_backup):
+                    vbam_core._import_module_verified(wb, module_backup, module_name)
+                    print(f"  復旧成功: {module_backup} を再インポートしました（差し替え前の内容に戻っています）")
+                else:
+                    raise RuntimeError("モジュールバックアップがありません")
+            except Exception as ex2:
+                print(f"  復旧失敗: {ex2}")
+                print("  ⚠ このままブックを保存するとモジュールがファイルからも消えます。")
+                print("  対処: ブックを『保存せずに閉じて』開き直してください。")
+        return False
 
 
 def main():
@@ -352,31 +391,34 @@ def main():
         xl = win32com.client.GetActiveObject("Excel.Application")
     except Exception:
         print("  ! Excel が起動していません。対象ブックを開いてから実行してください。")
-        return
+        return 1
 
     try:
         wb = xl.ActiveWorkbook
         if wb is None:
             print("  ! アクティブなブックがありません。対象ブックを開いてから実行してください。")
-            return
+            return 1
         print(f"  対象ブック: {wb.Name}")
 
         ok1 = apply_module(wb, 'shu001', 'shu001_optimized.bas')
         ok3 = apply_module(wb, 'shu003', 'shu003_optimized.bas')
 
         if ok1 and ok3:
-            wb.Save()
+            vbam_core._save_with_retry(wb)
             print(f"  ✓ {wb.Name} 保存完了")
         else:
             print("  ! エラーがあるため保存しませんでした")
+            return 1
 
     except Exception as e:
         print(f"  ! エラー: {e}")
         import traceback
         traceback.print_exc()
+        return 1
 
     print("\n完了")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

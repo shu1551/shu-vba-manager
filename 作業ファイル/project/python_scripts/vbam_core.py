@@ -1001,6 +1001,53 @@ def _print_collision_guidance(ex, module_name, module_backup, err=False):
         print(f"  置換前の内容のバックアップ: {module_backup}", file=out)
 
 
+def _save_with_retry(wb, attempts=5, delay=0.6):
+    """Import 直後の保存だけはビジー拒否で諦めない。
+
+    Excel はセル編集中・メニュー展開中・モーダル表示中に COM 呼び出しを
+    RPC_E_CALL_REJECTED / RPC_E_SERVERCALL_RETRYLATER / VBA_E_IGNORE で弾く
+    （_com_is_busy 参照）。Remove+Import 直後にこれを食らうと、モジュールは
+    正しく入れ替わっているのにブックだけ未保存で残る。一過性の拒否がほとんど
+    なので、少し待って撃ち直す。恒久的な失敗（読み取り専用・ロック等）は
+    そのまま送出して呼び出し側に判断させる。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            wb.Save()
+            return
+        except Exception as ex:
+            last = ex
+            if not _com_is_busy(ex) or i == attempts - 1:
+                raise
+            print(f"  Excel がビジーのため保存を再試行します（{i + 1}/{attempts - 1}）...")
+            time.sleep(delay)
+            pythoncom.PumpWaitingMessages()
+    if last:
+        raise last
+
+
+def _print_save_failed_guidance(module_name, err=False):
+    """Import は成功したが、その後の『保存』で失敗したときの案内。
+
+    2026-07-14 に発見した実害筋: Remove+Import 系3経路の except が removed
+    フラグしか見ておらず、Import 成功後に wb.Save() が失敗すると「モジュールが
+    消えた」と誤認してバックアップを再 Import していた。期待名のモジュールは
+    既に正しく存在するので _wait_component_gone は空振りし（15秒）、VB_Name 衝突で
+    連番別名として取り込まれ、改名待ちも空振りして（20秒）例外になる——つまり
+    ツール自身が「旧コード入りの連番モジュール」を生んで 35 秒待たせていた。
+    ここに来たら再 Import は絶対にしない。壊れているのは『保存』だけである。
+    """
+    out = sys.stderr if err else sys.stdout
+    print(f"  ⚠ モジュール '{module_name}' の取り込みは成功しています"
+          f"（開いているブックの中身は新しいコードに置き換わっています）。", file=out)
+    print(f"  ⚠ 失敗したのは『保存』だけです。バックアップの再 Import はしません"
+          f"（すると連番モジュールが増えるだけです）。", file=out)
+    print(f"  対処: Excel のダイアログ・セル編集モードを解除してから、", file=out)
+    print(f"        Excel で保存する（Ctrl+S）か、同じコマンドをもう一度実行してください。", file=out)
+    print(f"  ⚠ 保存せずにブックを閉じると、この置換内容は失われます。", file=out)
+
+
 
 
 # ================================================================
@@ -1376,6 +1423,8 @@ __all__ = [
     '_get_workbook_uncached',
     '_import_module_verified',
     '_print_collision_guidance',
+    '_print_save_failed_guidance',
+    '_save_with_retry',
     '_range_values_2d',
     '_reject_extra_args',
     '_remove_export_artifacts',
