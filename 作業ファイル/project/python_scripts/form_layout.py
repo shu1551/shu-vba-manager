@@ -773,14 +773,20 @@ def _place_control(container, e, left, top, w, h, tab_state):
                 pass
     if kind == 'lbl' and e.get('bold'):
         ct.Font.Bold = True
-    # tab_index を明示した要素はその値を使う（省略時のみ配置順で自動採番）。
+    # tab_index を明示した要素は「全コントロール配置後」にまとめて適用する
+    # （build_form 側）。配置の途中で代入すると、まだ存在しない番号への代入が
+    # 黙って失敗したり、後の代入が先に置いたコントロールの番号を押しずらしたり
+    # して、最終結果が追加順に依存して壊れる（2026-07-14 実機で確認）。
     # ListBox 先頭フォーカスのような「配置順では表せない意図」を、
     # inspect --to-layout → build の往復で失わないための逃げ道
     ti = e.get('tab_index')
-    try:
-        ct.TabIndex = tab_state['tab'] if ti is None else ti
-    except Exception:
-        pass
+    if ti is None:
+        try:
+            ct.TabIndex = tab_state['tab']
+        except Exception:
+            pass
+    else:
+        tab_state.setdefault('explicit', []).append((ct, name, ti))
     tab_state['tab'] += 1
     return ct
 
@@ -853,6 +859,15 @@ def build_form(form_name, caption, rows, width=None, vba_file=None,
             else:
                 _place_control(f, e, left, top, w, h, tab_state)
                 n += 1
+
+        # tab_index 明示分の適用。望む番号の昇順で代入すると、代入のたびに他の
+        # コントロールが押しずれても最終的に全員が意図の番号に収まる
+        # （TabIndex はコンテナごとの番号なので、コンテナをまたいだ昇順でも互いに干渉しない）
+        for ct, cname, ti in sorted(tab_state.get('explicit', []), key=lambda x: x[2]):
+            try:
+                ct.TabIndex = ti
+            except Exception as ex:
+                print(f"⚠ {cname} の TabIndex={ti} を適用できませんでした: {ex}")
 
         print(f"レイアウト構築: {form_name}  コントロール {n}個  "
               f"フォーム {form_w:g}x{form_h:g}")
