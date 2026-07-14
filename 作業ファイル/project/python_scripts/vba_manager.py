@@ -351,6 +351,8 @@ def build_parser():
                    help="対象シート名（1シートだけ畳む。posargでも可）")
     p.add_argument("--max-rows", dest="max_rows", default=None,
                    help="1シートあたりのセル読み込み行上限（既定5000。超過は打ち切り注記）")
+    p.add_argument("--no-format", dest="no_format", action="store_true",
+                   help="書式を採らない（速いが、書式が消えても snapshot-diff で気づけない）")
 
     # snapshot-diff <before.json> [after.json] [--max N]
     p = sub.add_parser("snapshot-diff",
@@ -443,6 +445,8 @@ def build_parser():
     # name [excel_file] <add|list|delete> ...
     p = sub.add_parser("name")
     p.add_argument("posargs", nargs="*")
+    p.add_argument("--force", action="store_true",
+                   help="add: 既存の同名定義を上書きする（既定では中止する）")
 
     # --- 手コマンド 第2弾 ---
     # a. 編集の足回り
@@ -476,6 +480,8 @@ def build_parser():
     p.add_argument("--no-header", dest="no_header", action="store_true", help="見出しなし")
     p.add_argument("--whole-sheet", dest="whole_sheet", action="store_true",
                    help="シート名だけの指定（使用範囲全域）を許可する")
+    p.add_argument("--single-column", dest="single_column", action="store_true",
+                   help="隣接列があっても1列だけを並べ替える（行の対応が壊れる。通常は使わない）")
     p.add_argument("--sheet", dest="sheet_opt", default=None,
                    help="対象シート名（rangeと分離指定）")
     p = sub.add_parser("autofilter")   # autofilter [range] [--off]
@@ -625,6 +631,8 @@ def build_parser():
     p.add_argument("--to", dest="to", default=None, help="load 用 読み込み先: sheet|model")
     p.add_argument("--sheet", dest="sheet", default=None, help="load --to sheet の出力先シート（省略時アクティブ）")
     p.add_argument("--at", dest="at", default=None, help="load --to sheet の左上セル（省略時 A1）")
+    p.add_argument("--force", action="store_true",
+                   help="delete: 読み込み先テーブルを巻き添えにしてでも削除する")
 
     # 重量級(5) connection <list|refresh|delete> / datamodel [list]
     p = sub.add_parser("connection")

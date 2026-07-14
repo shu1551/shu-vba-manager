@@ -85,7 +85,7 @@ def _text_w(s, font=None):
 # 要素（宣言）。すべて dict を返すだけの純粋関数
 # ================================================================
 
-def lbl(caption, width=None, bold=False, name=None, tab_index=None):
+def lbl(caption, width=None, bold=False, name=None, tab_index=None, font=None):
     """ラベル。行の先頭に置くとラベル列として自動整列。
 
     name 省略時は build 時に lbl1, lbl2... と機械採番する。VBA から
@@ -96,7 +96,7 @@ def lbl(caption, width=None, bold=False, name=None, tab_index=None):
         check_control_name(name)
     return {'kind': 'lbl', 'caption': caption, 'width': width,
             'height': STYLE['lbl_h'], 'bold': bold, 'name': name,
-            'tab_index': tab_index}
+            'tab_index': tab_index, 'font': font}
 
 
 def heading(caption, name=None):
@@ -110,7 +110,7 @@ def heading(caption, name=None):
 
 
 def txt(name, width=None, height=None, multiline=False, value="", required=False,
-        tab_index=None):
+        tab_index=None, font=None):
     """テキストボックス。width 省略で入力列いっぱいにストレッチ。
 
     required=True で直前ラベルに「＊」を付け、vba_stub の実行ボタンに
@@ -120,7 +120,7 @@ def txt(name, width=None, height=None, multiline=False, value="", required=False
     return {'kind': 'txt', 'name': name, 'width': width,
             'height': height or STYLE['ctrl_h'],
             'multiline': multiline, 'value': value, 'required': required,
-            'tab_index': tab_index}
+            'tab_index': tab_index, 'font': font}
 
 
 def refedit(name, width=None):
@@ -166,17 +166,17 @@ def spin_txt(name, value="0", width=48, min_=0, max_=100):
     return [t, s]
 
 
-def combo(name, width=None, items=None, rowsource=None, tab_index=None):
+def combo(name, width=None, items=None, rowsource=None, tab_index=None, font=None):
     """コンボボックス。items は vba_stub の Initialize で AddItem、
     rowsource="シート名!A1:A10" はシート範囲への直結（デザイン時プロパティ）"""
     check_control_name(name)
     return {'kind': 'combo', 'name': name, 'width': width,
             'height': STYLE['ctrl_h'], 'items': items or [],
-            'rowsource': rowsource, 'tab_index': tab_index}
+            'rowsource': rowsource, 'tab_index': tab_index, 'font': font}
 
 
 def lst(name, width=None, height=None, rows_visible=6, items=None, rowsource=None,
-        tab_index=None):
+        tab_index=None, font=None):
     """リストボックス。height 省略時は rows_visible 行ぶん。rowsource はシート範囲直結
 
     一覧系フォームは ListBox が TabIndex 0（開いた瞬間のフォーカスが一覧＝PageDown
@@ -185,23 +185,23 @@ def lst(name, width=None, height=None, rows_visible=6, items=None, rowsource=Non
     check_control_name(name)
     return {'kind': 'lst', 'name': name, 'width': width,
             'height': height or (rows_visible * 12 + 6), 'items': items or [],
-            'rowsource': rowsource, 'tab_index': tab_index}
+            'rowsource': rowsource, 'tab_index': tab_index, 'font': font}
 
 
-def chk(name, caption, width=None, tab_index=None):
+def chk(name, caption, width=None, tab_index=None, font=None):
     """チェックボックス"""
     check_control_name(name)
     return {'kind': 'chk', 'name': name, 'caption': caption,
             'width': width or (_text_w(caption) + 16), 'height': STYLE['lbl_h'],
-            'tab_index': tab_index}
+            'tab_index': tab_index, 'font': font}
 
 
-def opt(name, caption, width=None, group=None, tab_index=None):
+def opt(name, caption, width=None, group=None, tab_index=None, font=None):
     """オプションボタン。group で排他グループを指定"""
     check_control_name(name)
     return {'kind': 'opt', 'name': name, 'caption': caption,
             'width': width or (_text_w(caption) + 16), 'height': STYLE['lbl_h'],
-            'group': group, 'tab_index': tab_index}
+            'group': group, 'tab_index': tab_index, 'font': font}
 
 
 def opt_group(*pairs, group=None):
@@ -214,14 +214,14 @@ def opt_group(*pairs, group=None):
 
 
 def btn(name, caption, width=None, height=None, default=False, cancel_btn=False,
-        bold=False, accel=None, tab_index=None):
+        bold=False, accel=None, tab_index=None, font=None):
     """ボタン。button_bar 内では全ボタンが同サイズに揃えられる。accel=アクセラレータ文字"""
     check_control_name(name)
     return {'kind': 'btn', 'name': name, 'caption': caption,
             'width': width or max(STYLE['btn_w'], _text_w(caption) + 16),
             'height': height or STYLE['btn_h'],
             'default': default, 'cancel': cancel_btn, 'bold': bold, 'accel': accel,
-            'tab_index': tab_index}
+            'tab_index': tab_index, 'font': font}
 
 
 def ok(name="btnOK", caption="OK", **kw):
@@ -700,7 +700,14 @@ _PROGID = {
 
 
 def _backup_existing_form(fb, form_name):
-    """既存フォームを作り直す前に .frm/.frx を backups へ退避する（安全網）"""
+    """既存フォームを作り直す前に .frm/.frx を backups へ退避する（安全網）。
+
+    戻り値: True=退避した / False=退避に失敗した / None=対象の既存フォームが無い
+
+    build_form は「退避 → get_or_create → clear_controls（全コントロール削除）」の
+    順に進む。従来は Export に失敗しても警告1行で続行し、次の行で既存フォームを
+    破壊していた（復元手段なし）。安全網を名乗る以上、網が破れたら止まる。
+    """
     for comp in fb.vbproject.VBComponents:
         if comp.Name.lower() == form_name.lower() and comp.Type == 3:
             try:
@@ -710,9 +717,11 @@ def _backup_existing_form(fb, form_name):
                 path = os.path.join(BACKUP_DIR, f"{base}_{form_name}_{stamp}.frm")
                 comp.Export(path)
                 print(f"フォーム退避: backups/{os.path.basename(path)} (+.frx)")
+                return True
             except Exception as e:
-                print(f"⚠ フォーム退避に失敗（続行）: {e}")
-            return
+                print(f"エラー: フォーム '{form_name}' の退避に失敗しました: {e}")
+                return False
+    return None      # 既存フォームなし＝新規作成。退避するものが無い
 
 
 def _place_control(container, e, left, top, w, h, tab_state):
@@ -792,7 +801,7 @@ def _place_control(container, e, left, top, w, h, tab_state):
 
 
 def build_form(form_name, caption, rows, width=None, vba_file=None,
-               vba_stub=False, png=False, save=True, launcher=None):
+               vba_stub=False, png=False, save=True, launcher=None, force=False):
     """宣言的レイアウトからフォームを構築する。
 
     width: コンテンツ幅の明示（省略時は自動）。vba_file: UTF-8 の .vba を注入。
@@ -821,7 +830,13 @@ def build_form(form_name, caption, rows, width=None, vba_file=None,
         vba_file = generate_vba_stub(rows)
 
     with FormBuilder.connect() as fb:
-        _backup_existing_form(fb, form_name)
+        backed = _backup_existing_form(fb, form_name)
+        if backed is False and not force:
+            # この直後の clear_controls が既存の全コントロールを消す。退避が
+            # 取れていないのに進むと、元に戻す手段が無くなる
+            print("  既存フォームを退避できないため、作り直しを中止しました。")
+            print("  backups フォルダに書けるか確認してください（--force で強行可）。")
+            raise RuntimeError(f"フォーム '{form_name}' の退避に失敗（中止）")
         frm = fb.get_or_create(form_name, caption=caption,
                                width=form_w, height=form_h)
         f = fb.clear_controls(frm)

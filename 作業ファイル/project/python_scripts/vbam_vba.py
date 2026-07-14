@@ -33,12 +33,19 @@ def _find_duplicate_procedures(norm_text):
         r'(?P<kind>Sub|Function)\s+(?P<name>[^\s\(]+)',
         re.IGNORECASE
     )
-    seen = {}
+    seen = {}       # 小文字名 -> [行番号, ...]（照合用）
+    disp = {}       # 小文字名 -> 最初に現れた綴り（表示用）
     for idx, line in enumerate(norm_text.split('\n'), 1):
         m = sub_pattern.match(line)
         if m:
-            seen.setdefault(m.group('name'), []).append(idx)
-    return {name: lns for name, lns in seen.items() if len(lns) > 1}
+            # VBA の識別子は大小文字を区別しない。Calc と calc は「同名」で
+            # コンパイルエラーになるため、照合は小文字化して行う
+            # （区別して数えると「重複なし・取り込み可」と誤って報告する）。
+            # ただし報告は元の綴りで出す（キーごと小文字に潰すと表示が化ける）
+            key = m.group('name').lower()
+            seen.setdefault(key, []).append(idx)
+            disp.setdefault(key, m.group('name'))
+    return {disp[key]: lns for key, lns in seen.items() if len(lns) > 1}
 
 
 def _find_consecutive_dup_lines(norm_text):
@@ -920,6 +927,69 @@ def _extract_proc(wb, module_name, macro_name):
     return None, None
 
 
+def _narrow_proc_range(cm, start, count):
+    """ProcStartLine/ProcCountLines の領域を「実体だけ」に絞る。
+
+    ProcCountLines の領域には前後の空行に加え、次プロシージャの宣言行が
+    食い込むことがある（1行完結 Sub「Sub X(): Call Main: End Sub」の直後など）。
+    get(_extract_proc) と replace-procedure は同じ条件でその行を落としているが、
+    delete-procedure だけが生の start/count を DeleteLines に渡しており、
+    隣のプロシージャの宣言行ごと消して「削除完了」と報告していた。
+
+    戻り値: (実効start, 実効count)
+    """
+    lines = cm.Lines(start, count).replace('\r\n', '\n').split('\n')
+    lead = 0
+    while lead < len(lines) and lines[lead].strip() == '':
+        lead += 1
+    end = len(lines)
+    while end - lead > 1:
+        last = lines[end - 1].strip()
+        if last == '':
+            end -= 1
+        elif (re.match(
+                r'^(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?(?:Sub|Function)\s+',
+                last, re.IGNORECASE)
+              and not re.search(r'\bEnd\s+(?:Sub|Function)\b', last, re.IGNORECASE)):
+            end -= 1
+        else:
+            break
+    return start + lead, end - lead
+
+
+def _inline_body_after_decl(raw, decl_end):
+    """宣言行に同居する本体（1行完結 Sub）を取り出す。無ければ空文字。
+
+    「Sub X(): Call Main: End Sub」の "Call Main: End Sub" の部分を返す。
+    引数リストの括弧は対応を取って読み飛ばす（既定値の文字列に ':' や ')' が
+    入っていても誤らないように、文字列リテラルの中は数えない）。
+    """
+    s = raw[decl_end:]
+    i = 0
+    if i < len(s) and s[i] == '(':
+        depth = 0
+        in_str = False
+        while i < len(s):
+            c = s[i]
+            if c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+            i += 1
+    rest = s[i:]
+    # 引数リストの後ろに ':' があれば、それ以降が同じ行に書かれた本体
+    # （'As String' のような戻り型指定はコロンの手前にある）
+    if ':' not in rest:
+        return ''
+    return rest.split(':', 1)[1]
+
+
 def cmd_get(args):
     """プロシージャのコードを取得・表示・ファイル保存
 
@@ -1226,8 +1296,12 @@ def cmd_replace_procedure(args):
                     check += 1
                 # 「Sub X(): 処理: End Sub」の1行完結は宣言行自身で閉じている。
                 # 次の End Sub まで探すと後続プロシージャを巻き込んで消すため、
-                # ここで終端を確定する（随伴 Attribute 行までが置換対象）
-                no_str = re.sub(r'"[^"]*"', '""', line)
+                # ここで終端を確定する（随伴 Attribute 行までが置換対象）。
+                # 文字列リテラルだけでなくコメントも落とす。落とさないと
+                # 「Public Sub 印刷実行()  ' 途中で Exit せず End Sub まで通す」のような
+                # 行末コメントを1行完結Subと誤判定し、置換範囲が宣言行だけになって
+                # 旧本体が残る（新旧の本体が並んで二重化・構文破壊）
+                no_str = _strip_vba_comment(re.sub(r'"[^"]*"', '""', line))
                 if re.search(r'\bEnd\s+(?:Sub|Function)\b', no_str, re.IGNORECASE):
                     proc_end_idx = check - 1
                     break
@@ -1387,13 +1461,23 @@ def cmd_add_procedure(args):
     new_code = read_code_file(resolved)
     if not validate_vba_code(new_code, force=getattr(args, 'force', False)):
         return False
-    m = re.search(r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
-                  r'(?:Sub|Function)\s+([^\s\(]+)', new_code,
-                  re.MULTILINE | re.IGNORECASE)
-    if not m:
+    # コードファイルに複数本入っていることがある（get は3本以上を連結して
+    # 1つの _last_proc.vba に書く）。先頭1本だけ見て重複検査すると、2本目以降が
+    # 既存と同名でも素通りし、同一モジュール内に二重定義されてコンパイル不能になる
+    decl_names = re.findall(
+        r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
+        r'(?:Sub|Function)\s+([^\s\(]+)', new_code,
+        re.MULTILINE | re.IGNORECASE)
+    if not decl_names:
         print("エラー: コードに Sub/Function 宣言が見つかりません")
         return False
-    proc_name = m.group(1)
+    proc_name = decl_names[0]
+    # コードファイル自身の中の同名重複も弾く（VBA は大小文字を区別しない）
+    _lowered = [n.lower() for n in decl_names]
+    for n in decl_names:
+        if _lowered.count(n.lower()) > 1:
+            print(f"エラー: コードファイル内に同名のプロシージャが複数あります: {n}")
+            return False
 
     xl, wb = get_workbook(target_file)
     comp = None
@@ -1406,12 +1490,17 @@ def cmd_add_procedure(args):
         return False
     cm = comp.CodeModule
     # 同名の重複挿入を防止（ブック全体はマクロ実行時の曖昧さになるだけだが、
-    # 同一モジュール内はコンパイルエラーになるため必ず止める）
-    try:
-        cm.ProcStartLine(proc_name, 0)
-        exists = True
-    except Exception:
-        exists = False
+    # 同一モジュール内はコンパイルエラーになるため必ず止める）。
+    # コードファイル内の全宣言について検査する（先頭1本だけでは 2本目以降が素通りする）
+    exists = False
+    for _n in decl_names:
+        try:
+            cm.ProcStartLine(_n, 0)
+            proc_name = _n          # 実際に衝突した名前を報告する
+            exists = True
+            break
+        except Exception:
+            continue
     if exists:
         print(f"エラー: '{proc_name}' は [{comp.Name}] に既に存在します。修正なら replace-procedure を使ってください。")
         return False
@@ -1538,6 +1627,10 @@ def cmd_delete_procedure(args):
 
     comp, start, count = matches[0]
     cm = comp.CodeModule
+    # 領域に食い込んだ「次プロシージャの宣言行」を削除範囲から外す。
+    # 外さないと 1行完結 Sub の直後のプロシージャが宣言を失って壊れる
+    # （get / replace-procedure は同じ絞り込みを既に持っている）
+    start, count = _narrow_proc_range(cm, start, count)
     print(f"--- 削除するプロシージャ: [{comp.Name}] {macro_name} ({count}行) ---")
     print(cm.Lines(start, count).rstrip())
     print("-" * 40)
@@ -1816,8 +1909,11 @@ def _parse_module_blocks(bas_text):
         if m:
             # 「Sub X(): 処理: End Sub」の1行完結は宣言行自身で閉じている。
             # 次の End 行まで探すと後続プロシージャを同一ブロックに巻き込むため、
-            # その行（＋随伴 Attribute 行）でブロックを閉じる
-            no_str = re.sub(r'"[^"]*"', '""', lines[i])
+            # その行（＋随伴 Attribute 行）でブロックを閉じる。
+            # 文字列リテラルだけでなくコメントも落とす。落とさないと行末コメントの
+            # 「End Sub」で誤判定し、ブロックが宣言行だけで閉じて本体が次の
+            # プロシージャに吸収され、reorder で本体が隣へ道連れになる
+            no_str = _strip_vba_comment(re.sub(r'"[^"]*"', '""', lines[i]))
             if re.search(r'\bEnd\s+(?:Sub|Function|Property)\b', no_str, re.IGNORECASE):
                 j = i
                 while j + 1 < n and lines[j + 1].strip().startswith('Attribute '):
@@ -2783,15 +2879,28 @@ def _analyze_calls(inv):
     for m in inv['modules']:
         cur = None
         for i, raw in enumerate(m['code'].split('\r\n'), 1):
+            close_after = False
+            scan = raw            # 走査対象（表示は raw のまま＝元の行を見せる）
             dm = defn_pat.match(raw)
             if dm:
                 cur = dm.group(1)
-                continue
-            if end_pat.match(raw):
+                # 1行完結 Sub「Sub X(): Call Main: End Sub」は宣言行に本体が同居する。
+                # ここで無条件に continue すると Call が走査されず、呼ばれている Main が
+                # 「どこからも呼ばれていない」に誤って載り、誤記（Call 印刷実効）も
+                # 未解決Callとして検出されない（call-graph の検出器がこの形だけ素通り）。
+                inline = _inline_body_after_decl(raw, dm.end())
+                if not inline.strip():
+                    continue
+                scan = inline
+                # 同じ行で End Sub まで来ているなら、この行を見終えた時点で閉じる
+                close_after = bool(re.search(
+                    r'\bEnd\s+(?:Sub|Function|Property)\b',
+                    _strip_vba_comment(inline), re.IGNORECASE))
+            elif end_pat.match(raw):
                 cur = None
                 continue
             # 文字列リテラルを潰してからコメントを落とす（' の誤爆防止）
-            line = re.sub(r'"[^"]*"', '""', raw).split("'")[0]
+            line = re.sub(r'"[^"]*"', '""', scan).split("'")[0]
             # Rem コメント行の Call/Run を生きた呼び出し扱いしない
             low = line.strip().lower()
             if low == 'rem' or low.startswith('rem '):
@@ -2816,7 +2925,7 @@ def _analyze_calls(inv):
             ran_static = False
             # Run の名前は文字列内にあるのでコメントだけ除いた原文から拾う
             # （生 raw だとコメントアウトされた Run を誤検知する）
-            for rm_ in run_pat.finditer(_strip_vba_comment(raw)):
+            for rm_ in run_pat.finditer(_strip_vba_comment(scan)):
                 ran_static = True
                 name = rm_.group(1)
                 hit = known.get(name.lower())
@@ -2838,6 +2947,10 @@ def _analyze_calls(inv):
                     if cur and name.lower() == cur.lower():
                         continue          # 自分自身の再帰は流れの把握には不要
                     edges.setdefault(caller, set()).add(name)
+            if close_after:
+                # 1行完結 Sub は宣言行で閉じている。ここで戻さないと、後続行の
+                # 呼び出しがこの Sub の名で計上され続ける
+                cur = None
 
     # 図形・ボタンに登録されたマクロ（OnAction）＝ボタンからの実行入口
     onaction = {}
@@ -4378,8 +4491,13 @@ def _start_dialog_watcher(xl, mode=None):
         return want_id
 
     stop_evt = threading.Event()
-    state = {'count': 0, 'last': ''}       # 解除した回数と最後に見た本文
-    handled = set()                        # 同じダイアログを二重に数えない
+    # count は「窓が実際に消えたことを確認した数」。PostMessage は非同期で、
+    # 送っただけでは閉じたことにならない（ボタンID解決が外れる／WM_CLOSE を
+    # 無視するダイアログでは閉じない）。従来は送信した時点で数えて「解除しました」と
+    # 報告し、その hwnd を二度と再送しなかったため、安全弁が仕事をせずハングし続けた。
+    state = {'count': 0, 'last': '', 'unclosed': []}
+    pending = {}                           # hwnd -> {tries, last_ts, text}
+    _RESEND_SEC = 0.6                      # 消えなければこの間隔で再送する
 
     def _loop():
         while not stop_evt.is_set():
@@ -4409,10 +4527,17 @@ def _start_dialog_watcher(xl, mode=None):
                 win32gui.EnumWindows(_cb, None)
             except Exception:
                 pass
-            handled.intersection_update(targets)   # 消えた hwnd は忘れる
+            # 消えた hwnd ＝ 本当に閉じられたもの。ここで初めて「解除した」と数える
+            for hwnd in [h for h in pending if h not in targets]:
+                info = pending.pop(hwnd)
+                state['count'] += 1
+                if info.get('text'):
+                    state['last'] = info['text']
+            now = time.time()
             for hwnd in targets:
-                if hwnd in handled:                # 既に解除送信済みなら二重送信しない
-                    continue
+                info = pending.get(hwnd)
+                if info is not None and now - info['last_ts'] < _RESEND_SEC:
+                    continue                       # 送ったばかり。反応を待つ
                 try:
                     txt = _dialog_text(hwnd)
                     if win32gui.GetClassName(hwnd) == '#32770':
@@ -4422,13 +4547,20 @@ def _start_dialog_watcher(xl, mode=None):
                         # Excel内蔵/Office描画ダイアログは子がWin32 Buttonでないため
                         # ボタンID解決が効かない。WM_CLOSE(=×ボタン)がキャンセル相当
                         win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                    handled.add(hwnd)
-                    state['count'] += 1
-                    if txt:
-                        state['last'] = txt
+                    if info is None:
+                        pending[hwnd] = {'tries': 1, 'last_ts': now, 'text': txt}
+                    else:
+                        info['tries'] += 1
+                        info['last_ts'] = now
+                        if txt:
+                            info['text'] = txt
                 except Exception:
                     pass
             stop_evt.wait(0.15)
+        # 監視終了時点で残っているもの＝送っても閉じなかったダイアログ。
+        # 「解除しました」と混ぜず、閉じられなかった事実として別に報告する
+        for info in pending.values():
+            state['unclosed'].append(info.get('text') or '(本文なし)')
 
     th = threading.Thread(target=_loop, daemon=True)
     th.start()
@@ -4436,6 +4568,12 @@ def _start_dialog_watcher(xl, mode=None):
     class _Watcher:
         def stop(self):
             stop_evt.set()
+            # ループが抜けきるのを待つ。待たずに戻ると、直後に unclosed を読む
+            # 呼び出し側が「閉じられなかったダイアログ」を取りこぼす（競合）
+            try:
+                th.join(timeout=1.0)
+            except Exception:
+                pass
 
         @property
         def count(self):
@@ -4445,6 +4583,11 @@ def _start_dialog_watcher(xl, mode=None):
         def last_text(self):
             return state['last']
 
+        @property
+        def unclosed(self):
+            """送っても閉じなかったダイアログの本文（安全弁が効かなかった証拠）"""
+            return state['unclosed']
+
     return _Watcher()
 
 
@@ -4453,13 +4596,29 @@ def _dialog_watcher_note(watcher, mode):
 
     「黙って握りつぶした」にしないための報告。何が出て、どう閉じたかを一行で残す。
     """
-    if watcher is None or not getattr(watcher, 'count', 0):
+    if watcher is None:
+        return ""
+    if not getattr(watcher, 'count', 0):
+        # 1件も閉じられていなくても、閉じられずに残ったダイアログがあれば報告する
+        stuck0 = list(getattr(watcher, 'unclosed', ()) or ())
+        if stuck0:
+            return ("⚠ 実行中にダイアログを検出しましたが、閉じられませんでした"
+                    f"（{len(stuck0)}件・Excel 側に残っている可能性があります）: "
+                    + " / ".join(s[:60] for s in stuck0[:3]))
         return ""
     how = "指定ボタンで応答" if mode else "安全側（キャンセル優先）で自動解除"
     body = watcher.last_text or "(本文なし)"
     n = watcher.count
-    return (f"⚠ 実行中にダイアログを{n}件検出し、{how}しました。"
-            f"マクロがメッセージを出しています → 内容: {body}")
+    msg = (f"⚠ 実行中にダイアログを{n}件検出し、{how}しました。"
+           f"マクロがメッセージを出しています → 内容: {body}")
+    # 送っても閉じなかったもの＝安全弁が効かなかった証拠。「解除しました」と
+    # 混ぜず、閉じられなかった事実として必ず別に出す（黙って成功にしない）
+    stuck = list(getattr(watcher, 'unclosed', ()) or ())
+    if stuck:
+        msg += (f"\n⚠ うち {len(stuck)}件は閉じられませんでした"
+                "（Excel 側に残っている可能性があります）: "
+                + " / ".join(s[:60] for s in stuck[:3]))
+    return msg
 
 
 def dialog_safe(cmd_func):
@@ -4591,11 +4750,12 @@ def cmd_run_macro(args):
     # 実行前にアドインや個人用マクロをロードする
     xl, wb = get_workbook(target_file, load_addins=True)
 
-    # 警告を非表示にする
-    try:
-        xl.DisplayAlerts = False
-    except Exception:
-        pass
+    # DisplayAlerts は切らない。切ると Excel 組み込みの破壊確認
+    # （Sheets("取説").Delete の「完全に削除されます」等）が「既定の応答＝実行」で
+    # 無言のうちに通ってしまう。手で実行すれば出る確認が、ツール経由だと出ずに消える＝
+    # 下のダイアログ監視の「既定は安全側（キャンセル優先）に倒す」と正反対だった。
+    # VBA の MsgBox は元々 DisplayAlerts では消せず、いずれにせよ監視役が面倒を見る。
+    # 監視役は解除したダイアログを必ず本文で報告するので、無言にはならない。
 
     full_macro_path = macro_name
 
@@ -4681,8 +4841,9 @@ def cmd_run_macro(args):
     finally:
         if _dlg_watcher is not None:
             _dlg_watcher.stop()
-        # 戻さないとユーザーの Excel セッションに DisplayAlerts=False が残り、
-        # 以後の手動操作で保存確認などの警告が出なくなる
+        # ツール側では切っていないが、実行したマクロが DisplayAlerts=False を立てたまま
+        # 落ちている場合がある。そのままだとユーザーの Excel セッションに残り、以後の
+        # 手動操作で保存確認などの警告が出なくなるため、必ず有効に戻す
         try:
             xl.DisplayAlerts = True
         except Exception:
@@ -4764,16 +4925,16 @@ def cmd_test(args):
     print(f"テスト実行: {wb.Name}  （{len(tests)}本）")
     print("-" * 60)
 
-    # ダイアログ自動応答（テスト中の MsgBox で止まらないように）
-    _dlg_watcher = None
+    # ダイアログ対策は既定で常設（run-macro / write-range と同じ）。test は任意の
+    # テスト Sub を Application.Run する＝最も VBA を発火させる経路で、テスト内の
+    # MsgBox で無言ハングする（--auto-dialog 明示時だけ監視、では守れない）。
+    # 明示時はそのボタンで応答、省略時は安全解除（キャンセル優先）。
     _auto_dialog = getattr(args, 'auto_dialog', None)
-    if _auto_dialog:
-        _dlg_watcher = _start_dialog_watcher(xl, _auto_dialog)
+    _dlg_watcher = _start_dialog_watcher(xl, _auto_dialog)
 
-    try:
-        xl.DisplayAlerts = False
-    except Exception:
-        pass
+    # DisplayAlerts は切らない（run-macro と同じ理由）。切ると Excel 組み込みの
+    # 破壊確認が「既定の応答＝実行」で無言に通る。テストが実データを撃つ事故は
+    # まさにこれで起きるため、監視役に安全側（キャンセル優先）で任せる。
 
     # エラー捕捉ハーネスを一時モジュールとして注入する。
     # 直接 Application.Run すると、テスト内の実行時エラー（Err.Raise 含む）は
@@ -4821,6 +4982,11 @@ def cmd_test(args):
                       "（既定名のモジュールが残っていたら手で削除してください）", file=sys.stderr)
         if _dlg_watcher is not None:
             _dlg_watcher.stop()
+            # 失敗して抜ける経路でも、検出したダイアログは必ず報告する
+            # （通常の finally は報告するのに、ここだけ黙って捨てていた）
+            _note = _dialog_watcher_note(_dlg_watcher, _auto_dialog)
+            if _note:
+                print(_note)
         try:
             xl.DisplayAlerts = True
         except Exception:
@@ -4865,6 +5031,10 @@ def cmd_test(args):
                       f"'{_HARNESS}' が残っていたら手で削除してください）", file=sys.stderr)
         if _dlg_watcher is not None:
             _dlg_watcher.stop()
+            # 解除したダイアログがあれば必ず本文で報告する（無言で握りつぶさない）
+            _note = _dialog_watcher_note(_dlg_watcher, _auto_dialog)
+            if _note:
+                print(_note)
         # 戻さないとユーザーの Excel セッションに DisplayAlerts=False が残る
         try:
             xl.DisplayAlerts = True
@@ -4909,9 +5079,11 @@ __all__ = [
     '_find_consecutive_dup_lines',
     '_find_duplicate_procedures',
     '_find_macro_owner_books',
+    '_inline_body_after_decl',
     '_inventory_or_explain',
     '_load_checkup_ack',
     '_load_checkup_history',
+    '_narrow_proc_range',
     '_parse_module_blocks',
     '_project_book_name',
     '_save_checkup_ack',

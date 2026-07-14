@@ -357,6 +357,7 @@ def cmd_format_range(args):
 
 
 @protect_safe
+@dialog_safe
 def cmd_sheet(args):
     """シート操作: add/delete/rename/copy/activate/show/hide"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -721,6 +722,20 @@ def cmd_table(args):
         if tsv_out is not None:
             path = _LAST_VALUES_FILE if tsv_out == '_DEFAULT_' else os.path.abspath(tsv_out)
             rows = _range_values_2d(rng)
+            # セル内改行(Alt+Enter)・タブは TSV の行/列区切りと衝突する。
+            # 検査せずに書き戻しコマンドまで案内すると、改行1つで TSV の行数が増え、
+            # write-range の「不揃い」経路に落ちて以降の全行が1行ずつ下へズレて
+            # 上書きされる（＝無警告のデータ破壊）。read-range 側と同じ警告を出す
+            dirty = []
+            for ri, r in enumerate(rows):
+                for ci, v in enumerate(r):
+                    if isinstance(v, str) and ('\n' in v or '\r' in v or '\t' in v):
+                        dirty.append(f"{_col_letter(rng.Column + ci)}{rng.Row + ri}")
+            if dirty:
+                shown = ", ".join(dirty[:8]) + ("" if len(dirty) <= 8 else f" …他{len(dirty) - 8}件")
+                print(f"⚠ 警告: セル内に改行/タブを含むセルが {len(dirty)}件あります: {shown}")
+                print("  このTSVをそのまま write-range で書き戻すと行・列がずれます。")
+                print("  該当セルは手で編集するか、write-range の対象から外してください。")
             with open(path, 'w', encoding='utf-8-sig', newline='') as f:
                 f.write('\n'.join('\t'.join(_cell_str(v) for v in r) for r in rows) + '\n')
             print(f"TSV書き出し: {path}  ({len(rows)}行)")
@@ -775,8 +790,30 @@ def cmd_name(args):
         ws, rng = _resolve_range(xl, wb, rest[2])
         # rng.Address は既定で絶対参照 ($A$2)。pywin32 ではプロパティなので引数なしで使う
         refers = "='" + ws.Name.replace("'", "''") + "'!" + rng.Address
+        # Names.Add は既存の同名定義を黙って上書き（再定義）する。delete 側は
+        # 多重一致を弾いて取り違えを防いでいるのに、add 側が素通りでは非対称。
+        # 印刷範囲などの重要な定義名を握り潰しても「追加」としか出ず気づけない
+        existing = []
+        for nm in wb.Names:
+            try:
+                # ブックスコープは "名前"、シートスコープは "'Sheet1'!名前" で返る
+                if nm.Name == nm_name or nm.Name.split('!')[-1] == nm_name:
+                    existing.append(nm)
+            except Exception:
+                continue
+        if existing and not getattr(args, 'force', False):
+            print(f"エラー: 名前 '{nm_name}' は既に定義されています。上書きを中止しました。")
+            for nm in existing:
+                try:
+                    print(f"  既存: {nm.Name} → {nm.RefersTo}")
+                except Exception:
+                    print(f"  既存: {nm_name}")
+            print("  差し替えるなら --force を付けてください（name delete で消してからでも可）。")
+            return False
         wb.Names.Add(nm_name, refers)
         print(f"名前付き範囲を追加: {nm_name} → {refers}")
+        if existing:
+            print("  ※ --force により既存の定義を上書きしました。")
         print("（保存はしていません）")
         return True
 
@@ -851,6 +888,15 @@ def cmd_row(args):
     action = rest[0].lower()
     start = int(rest[1])
     count = int(rest[2]) if len(rest) >= 3 else 1
+    # 本数・行番号の下限検査。count=0 だと Rows("10:9") のような逆順アドレスになり、
+    # Excel がこれを正規化するため delete では 9〜10 行＝隣の行まで消える
+    # （バッチや計算値から 0 が渡ると無警告でデータが飛ぶ）
+    if count < 1:
+        print(f"エラー: 本数は1以上で指定してください: {count}")
+        return False
+    if start < 1:
+        print(f"エラー: 行番号は1以上で指定してください: {start}")
+        return False
     xl, wb = get_workbook(target_file)
     ws = _sheet_or_active(wb, getattr(args, 'sheet', None))
     if ws is None:
@@ -888,6 +934,11 @@ def cmd_col(args):
         print(f"エラー: 列は列文字（A〜XFD）で指定してください: '{start}'")
         return False
     count = int(rest[2]) if len(rest) >= 3 else 1
+    # 本数の下限検査。count=0 だと Columns("C:B") のような逆順アドレスになり、
+    # Excel がこれを正規化するため delete では B〜C 列＝隣の列まで消える
+    if count < 1:
+        print(f"エラー: 本数は1以上で指定してください: {count}")
+        return False
     end = _col_letter(_col_num(start) + count - 1)
     xl, wb = get_workbook(target_file)
     ws = _sheet_or_active(wb, getattr(args, 'sheet', None))
@@ -998,6 +1049,21 @@ def cmd_sort(args):
         print(f"  全域を並べ替えるなら --whole-sheet を付けてください（--header の明示も推奨）。")
         return False
     ws, rng = _resolve_range(xl, wb, rest[0], sheet_opt)
+    # 単一列だけを範囲に取ると、Excel の UI が出す「選択範囲を拡張しますか」が
+    # COM では出ないまま、その1列だけが並べ替わる＝隣接列との行対応が破壊される
+    # （このツールの書き込みは Undo 履歴を消すため復旧できない）
+    if rng.Columns.Count == 1 and not getattr(args, 'single_column', False):
+        try:
+            region_cols = int(rng.CurrentRegion.Columns.Count)
+        except Exception:
+            region_cols = 1
+        if region_cols > 1:
+            print(f"エラー: '{rest[0]}' は1列だけですが、隣接列にデータがあります"
+                  f"（連続領域は {region_cols} 列）。")
+            print("  このまま並べ替えると、その列だけが動いて他の列との行の対応が壊れます。")
+            print("  表全体を範囲に指定し、--key で並べ替えの基準列を指定してください。")
+            print("  1列だけを本当に並べ替えるなら --single-column を付けてください。")
+            return False
     keycol = getattr(args, 'key', None)
     if keycol and not (keycol.isascii() and keycol.isalpha()):
         # _col_num は英字以外も黙って数値化してしまい、"A1" が K列扱いになる。
@@ -1014,11 +1080,13 @@ def cmd_sort(args):
         header = 2                                          # xlNo
     else:
         header = 0                                          # xlGuess
-    # Orientation / MatchCase は Excel が「前回の並べ替え設定」をシートに保存して
-    # 引き継ぐ仕様。未指定だと手動の列単位ソート等が引き継がれ、行方向のつもりが
-    # 列方向に並べ替わる事故になるため必ず明示する（xlTopToBottom=1）
+    # Orientation / MatchCase / OrderCustom は Excel が「前回の並べ替え設定」をシートに
+    # 保存して引き継ぐ仕様。未指定だと手動の列単位ソート等が引き継がれ、行方向のつもりが
+    # 列方向に並べ替わる事故になるため必ず明示する（xlTopToBottom=1）。
+    # OrderCustom も同族で、UI で一度「ユーザー設定リスト」（曜日順・部署順など）を
+    # 使うとその順が残り、五十音順のつもりがカスタム順で並ぶ（OrderCustom=1＝通常順）
     rng.Sort(Key1=keycell, Order1=order, Header=header,
-             Orientation=1, MatchCase=False)
+             Orientation=1, MatchCase=False, OrderCustom=1)
     print(f"並べ替え: {ws.Name}!{rng.Address}  キー列={keycol or _col_letter(rng.Column)}  "
           f"{'降順' if order == 2 else '昇順'}")
     print("（保存はしていません）")
@@ -1157,7 +1225,17 @@ def cmd_find_replace(args):
     # （LookIn は Replace と同じ数式(-4123)で揃える）
     count = 0
     first = None
-    cell = rng.Find(What=needle, LookAt=look_at, LookIn=-4123, MatchCase=match_case)
+    # SearchFormat / MatchByte も Sort の Orientation と同じ「省略すると前回値を
+    # 引き継ぐ」族。UI で「書式を指定して検索」した後だと Find が書式条件つきで走り、
+    # 0件になって「見つかりませんでした（置換なし）」と正常終了する＝無言失敗。
+    # MatchByte も残ると日本語シートで半角/全角の区別が勝手に付く
+    try:
+        xl.FindFormat.Clear()
+        xl.ReplaceFormat.Clear()
+    except Exception:
+        pass
+    cell = rng.Find(What=needle, LookAt=look_at, LookIn=-4123, MatchCase=match_case,
+                    SearchFormat=False, MatchByte=False)
     while cell is not None:
         addr = cell.Address
         if first is None:
@@ -1169,7 +1247,8 @@ def cmd_find_replace(args):
     if count == 0:
         print(f"'{needle}' は {ws.Name}!{rng.Address} に見つかりませんでした（置換なし）")
         return True
-    rng.Replace(What=needle, Replacement=repl, LookAt=look_at, MatchCase=match_case)
+    rng.Replace(What=needle, Replacement=repl, LookAt=look_at, MatchCase=match_case,
+                SearchFormat=False, ReplaceFormat=False, MatchByte=False)
     print(f"置換: {ws.Name}!{rng.Address}  '{needle}' → '{repl}'  （{count}セルにヒット）")
     print("（保存はしていません）")
     return True
@@ -1177,6 +1256,7 @@ def cmd_find_replace(args):
 
 # ---- c. 保存・印刷まわり ----
 
+@dialog_safe
 def cmd_save(args):
     """上書き保存: save [excel_file]"""
     target_file, _ = parse_target_and_rest(args.posargs)
@@ -1301,6 +1381,7 @@ def cmd_export_pdf(args):
     return True
 
 
+@protect_safe
 def cmd_print_setup(args):
     """印刷設定: print-setup [--area R] [--title-rows 1:3] [--title-cols A:B] ..."""
     target_file, _ = parse_target_and_rest(args.posargs)
@@ -1388,6 +1469,15 @@ def cmd_printer_setup(args):
     """
     # 対象プリンター名の決定
     printer_name = getattr(args, 'printer', None)
+    # プリンター名を位置引数で渡されても、ここは --printer しか見ない。黙って捨てると
+    # 「指定したプリンターを設定したつもり」が、実際は既定プリンター（＝別のプリンター）の
+    # 設定を即時・不可逆に書き換える事故になる。名前らしき位置引数があれば必ず止める。
+    _, _rest = parse_target_and_rest(args.posargs)
+    if _rest:
+        print(f"エラー: プリンター名は --printer で指定してください: {' '.join(_rest)}")
+        print(f"  例: printer-setup --printer \"{_rest[0]}\" --duplex vertical")
+        print("  （位置引数は無視され、既定プリンターの設定を書き換えてしまいます）")
+        return False
     if not printer_name:
         # Excelが起動していればそのアクティブプリンター名を使用、さもなくばデフォルトプリンター
         try:

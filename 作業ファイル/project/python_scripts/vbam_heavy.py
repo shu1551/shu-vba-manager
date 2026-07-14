@@ -86,6 +86,20 @@ def cmd_chart(args):
         co = ws.ChartObjects().Add(left, top, width, height)
         ch = co.Chart
         ch.SetSourceData(rng)
+        # SetSourceData は、範囲に数値系列が無くても例外を出さない。
+        # そのままだと空のグラフ枠を置いただけで「グラフ作成」と成功報告する
+        try:
+            n_series = int(ch.SeriesCollection().Count)
+        except Exception:
+            n_series = -1                    # 数えられないときは判定しない
+        if n_series == 0:
+            print(f"エラー: 指定範囲 {rng.Address} から系列を作れませんでした。")
+            print("  数値の列を含む範囲を指定してください（空のグラフは作りません）。")
+            try:
+                co.Delete()
+            except Exception:
+                pass
+            return False
         ctype = (getattr(args, 'type', None) or 'column').lower()
         if ctype not in _XL_CHART_TYPE:
             print(f"未知のグラフ種別: {ctype}（{'/'.join(_XL_CHART_TYPE)}）")
@@ -761,12 +775,25 @@ def cmd_pivot_field(args):
             print(f"  このフィールドの値: {item_names}")
             return False
         failed = []
+        # Excel は「表示ゼロ項目」を許さない。一巡ループで上から順に
+        # Visible = (名前 in wanted) を代入すると、wanted の項目がまだ非表示のまま
+        # 最後の表示項目を隠そうとして失敗し、その項目が表示に残る
+        # （例: 項目[A,B,C]でA・B表示中に C だけを指定 → B が消せず B と C が表示）。
+        # 先に「表示するもの」を出してから、「隠すもの」を隠す2パスにする。
         for i in range(1, p.PivotItems().Count + 1):
             it = p.PivotItems().Item(i)
-            try:
-                it.Visible = (it.Name in wanted)
-            except Exception:
-                failed.append(it.Name)
+            if it.Name in wanted:
+                try:
+                    it.Visible = True
+                except Exception:
+                    failed.append(it.Name)
+        for i in range(1, p.PivotItems().Count + 1):
+            it = p.PivotItems().Item(i)
+            if it.Name not in wanted:
+                try:
+                    it.Visible = False
+                except Exception:
+                    failed.append(it.Name)
         if failed:
             print(f"⚠ 一部の項目の表示切替に失敗しました: {failed}")
             print("  （Excel の制約: 全項目非表示は不可、など。実際の表示状態を確認してください）")
@@ -1089,6 +1116,34 @@ def cmd_calc_mode(args):
 # 重量級コマンド (4) PowerQuery （一覧・更新・作成・M式書換・削除・読み込み配線）
 # ================================================================
 
+def _refresh_connection_sync(cn):
+    """接続を「完了まで待って」更新する。
+
+    WorkbookConnection.Refresh は BackgroundQuery=True（Excel が作る Query 接続では
+    しばしば既定で True）だと即座に戻り、更新はバックグラウンドで走る。そのまま
+    「更新しました」と報告すると、まだ古いデータのままなのに成功と言うことになり、
+    直後の read-range が旧データを読む。更新中のエラーも戻り値・例外に出ない。
+    そこで一時的に BackgroundQuery=False にして同期実行させ、元に戻す。
+    """
+    ole = None
+    prev = None
+    try:
+        ole = cn.OLEDBConnection
+        prev = bool(ole.BackgroundQuery)
+        if prev:
+            ole.BackgroundQuery = False
+    except Exception:
+        ole = None                      # OLEDB でない接続（テキスト等）はそのまま撃つ
+    try:
+        cn.Refresh()
+    finally:
+        if ole is not None and prev:
+            try:
+                ole.BackgroundQuery = prev
+            except Exception:
+                pass
+
+
 def _connection_used_by_table(wb, cn_name):
     """接続 cn_name を使っているシートのテーブルがあれば "シート名!テーブル名" を返す。
 
@@ -1160,6 +1215,7 @@ def _restore_connection(wb, snap):
 
 
 @protect_safe
+@dialog_safe
 def cmd_powerquery(args):
     """PowerQuery: powerquery <list|refresh|add|edit|delete|load> ...
 
@@ -1225,7 +1281,9 @@ def cmd_powerquery(args):
                     target_conn = cn
                     break
             if target_conn:
-                target_conn.Refresh()
+                # 完了を待って更新する（待たないと「更新しました」と言った時点では
+                # まだ古いデータのまま＝誤った成功報告になる）
+                _refresh_connection_sync(target_conn)
                 print(f"更新しました: {target_conn.Name}")
                 return True
             # 接続が無い（読み込みなしクエリ等）
@@ -1315,6 +1373,17 @@ def cmd_powerquery(args):
             cnt = 0
         for i in range(1, cnt + 1):
             if wb.Queries.Item(i).Name == name:
+                # クエリを消すと、それを読み込み先にしているシートのテーブルが
+                # 巻き添えになる（消える／更新配線が切れた死んだテーブルになる）。
+                # connection delete には同じガードがあるのに、こちらは素通りだった
+                used_by = (_connection_used_by_table(wb, f"Query - {name}")
+                           or _connection_used_by_table(wb, name))
+                if used_by and not getattr(args, 'force', False):
+                    print(f"エラー: クエリ '{name}' はシートのテーブル {used_by} が読み込み先です。")
+                    print("  削除するとそのテーブルが巻き添えになります。中止しました。")
+                    print("  先に table delete / connection delete でシート側を外すか、")
+                    print("  承知のうえなら --force を付けてください。")
+                    return False
                 wb.Queries.Item(i).Delete()
                 print(f"クエリ削除: {name}")
                 print("（保存はしていません）")
@@ -1373,6 +1442,14 @@ def cmd_powerquery(args):
                 ws = wb.ActiveSheet
             at = getattr(args, 'at', None) or 'A1'
             dest = ws.Range(at)
+            # 出力先が空かを確認する。--sheet を省くとアクティブシートの A1 に
+            # 問答無用でテーブルを作って Refresh するため、そこにあった手作りの表が
+            # 潰れる。pivot create には同じ検査（_is_dest_area_empty）があるのに、
+            # こちらだけ素通りだった。新規に作ったシートなら当然空なので検査不要
+            if created_ws is None and not _is_dest_area_empty(xl, dest):
+                print(f"エラー: 出力先 {ws.Name}!{dest.Address} は空ではありません。中止しました。")
+                print("  既存の表を上書きしないよう、--sheet / --at で空き場所を指定してください。")
+                return False
             # 0 = xlSrcExternal。Source に Mashup の OLEDB 文字列を渡す
             lo = ws.ListObjects.Add(0, conn_str, None, True, dest)
             qt = lo.QueryTable
@@ -1385,7 +1462,12 @@ def cmd_powerquery(args):
             qt.BackgroundQuery = False
             qt.AdjustColumnWidth = True
             try:
-                qt.Refresh(False)              # BackgroundQuery:=False
+                # QueryTable.Refresh は Boolean を返す。失敗しても例外を投げず
+                # False を返す経路があり、捨てると「シートに読み込みました」と
+                # 成功報告したまま空／エラー列だけのテーブルが残る
+                if qt.Refresh(False) is False:  # BackgroundQuery:=False
+                    raise RuntimeError("QueryTable.Refresh が False を返しました"
+                                       "（M式の実行時エラーの可能性）")
             except Exception as ex:
                 # M式の実行時エラー等で失敗すると、追加済みの ListObject と
                 # 自動生成の接続が孤児として残り、再実行のたび「テーブル1/2…」と
@@ -1455,6 +1537,22 @@ def cmd_powerquery(args):
                         print("  削除するとテーブルの更新ができなくなるため中止しました。")
                         print("  モデルにも読み込みたい場合は、シート読み込みを解除してから実行してください。")
                         return False
+                    # _connection_used_by_table はシートのテーブルしか見ない。
+                    # 既にモデルに載っている接続（InModel）は「未使用」と判定されて
+                    # そのまま Delete され、そのテーブルに紐づくメジャー・
+                    # リレーションシップが道連れになる。しかも Add2 で作り直すので
+                    # 「データモデルに読み込みました」と成功報告してしまう。
+                    in_model = False
+                    try:
+                        in_model = bool(cn.InModel)
+                    except Exception:
+                        in_model = False
+                    if in_model and not getattr(args, 'force', False):
+                        print(f"エラー: '{cn_name}' は既にデータモデルに読み込まれています。")
+                        print("  作り直すと、このテーブルに紐づくメジャーとリレーションシップが")
+                        print("  失われるため中止しました（更新するだけなら powerquery refresh）。")
+                        print("  承知のうえで作り直すなら --force を付けてください。")
+                        return False
                     # 消す前に中身を控える。Add2 が失敗したときに元へ戻せないと、
                     # 「接続だけ消えてモデルにも載っていない＝クエリが未配線」の
                     # 一番たちの悪い状態で終わるため。
@@ -1509,6 +1607,7 @@ _XL_CONN_TYPE = {1: 'OLEDB', 2: 'ODBC', 3: 'XMLMAP', 4: 'TEXT',
 
 
 @protect_safe
+@dialog_safe
 def cmd_connection(args):
     """ブック接続の管理: connection <list|refresh|delete> [name]
 

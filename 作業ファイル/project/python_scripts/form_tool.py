@@ -60,7 +60,14 @@ def _ctrl_type(ct):
 
 
 def backup_form(wb, comp):
-    """破壊的操作（rename/delete/copy元の改変等）の前に .frm/.frx を退避する安全網"""
+    """破壊的操作（rename/delete/scale/copy元の改変等）の前に .frm/.frx を退避する安全網。
+
+    戻り値: True=退避できた / False=失敗した
+
+    従来は失敗しても「続行」と出して先へ進んでいた。VBE に Undo は無く、
+    .frm の退避も取れていない状態で破壊すると元に戻す手段が消える。
+    呼び出し側は False のとき（--force が無い限り）中止すること。
+    """
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -68,8 +75,10 @@ def backup_form(wb, comp):
         path = os.path.join(BACKUP_DIR, f"{base}_{comp.Name}_{stamp}.frm")
         comp.Export(path)
         print(f"フォーム退避: backups/{os.path.basename(path)} (+.frx)")
+        return True
     except Exception as e:
-        print(f"⚠ フォーム退避に失敗（続行）: {e}")
+        print(f"エラー: フォーム '{comp.Name}' の退避に失敗しました: {e}")
+        return False
 
 
 # ================================================================
@@ -154,6 +163,12 @@ def cmd_scale(args):
     if args.factor <= 0:
         sys.exit("倍率は正の数で指定してください。")
     xl, wb, comp = connect_form(args.form)
+    # 全座標・全サイズ・全フォントを書き換える＝最も広範囲を壊すコマンドなのに、
+    # rename/delete にはある退避がここには無かった。しかも Font.Size は下で round
+    # されるため 0.5倍→2倍でも元には戻らない（11pt→6pt→12pt）。不可逆な操作は
+    # 必ず退避を取ってから行う
+    if not backup_form(wb, comp) and not getattr(args, 'force', False):
+        sys.exit("退避できないため中止しました（--force で強行可）。")
     k = args.factor
     # フォームの Width/Height は枠・タイトルバー（クローム）込み。クロームまで
     # 倍率を掛けると、縮小時に内寸が「コントロール座標×k」より狭くなって
@@ -558,6 +573,8 @@ def main():
     p.add_argument("form", help="フォーム名")
     p.add_argument("factor", type=float, help="倍率 (例: 1.5)")
     p.add_argument("--save", action="store_true", help="実行後にブックを保存")
+    p.add_argument("--force", action="store_true",
+                   help="退避が取れなくても強行する（元に戻せなくなる）")
     p.set_defaults(func=cmd_scale)
 
     p = sub.add_parser("set", help="コントロールの位置/サイズ/Caption/Font.Size を設定")

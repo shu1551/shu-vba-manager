@@ -44,8 +44,14 @@ def _is_initialish(v):
 
 
 def _tag_value(xml, tag):
-    """<tag>値</tag> を取り出す（<tag/> の自己完結タグは空欄扱い）"""
-    m = re.search(f'<{tag}>(.*?)</{tag}>', xml, re.S)
+    """<tag>値</tag> を取り出す（<tag/> の自己完結タグは空欄扱い）。
+
+    開始タグの属性を許容する。<dc:creator xml:space="preserve">山田太郎</dc:creator>
+    のような属性付きに当たらないと、値が空と判定されて [OK] 扱いになり、さらに
+    実名リストが空のまま vbaProject.bin の実名検索まで素通りして、実名を抱えたまま
+    「機械チェックは全項目クリア」＋終了コード0 を返す（PII ゲートとして致命的）。
+    """
+    m = re.search(rf'<{tag}(?:\s[^>]*)?>(.*?)</{tag}>', xml, re.S)
     return m.group(1) if m else ''
 
 
@@ -171,12 +177,16 @@ def _blank_tag(text, tag):
     自己完結タグ <dc:creator/> に当たらない正規表現だと「何もしていないのに
     空欄化しました」と報告してしまうため、両方の形を見る。
     """
-    m = re.search(f'<{tag}>(.*?)</{tag}>', text, re.S)
+    # 開始タグの属性を許容する（_tag_value と同じ理由）。
+    # <dc:creator xml:space="preserve">山田太郎</dc:creator> のような属性付きに
+    # 当たらないと、実名が残っているのに「空欄化する項目はありませんでした」と
+    # 報告して何もしないまま公開GOになる。
+    m = re.search(rf'<{tag}(?:\s[^>]*)?>(.*?)</{tag}>', text, re.S)
     if m:
         if not m.group(1):
             return text, None                      # 既に空欄
         return text.replace(m.group(0), f'<{tag}></{tag}>', 1), m.group(1)
-    if re.search(f'<{tag}\\s*/>', text):
+    if re.search(rf'<{tag}(?:\s[^>]*)?/>', text):
         return text, None                          # 自己完結タグ＝既に空欄
     return text, None
 

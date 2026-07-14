@@ -887,3 +887,267 @@ def test_copy_form_rejects_leading_underscore():
     import form_tool
     with pytest.raises(SystemExit):
         form_tool.cmd_copy_form(argparse.Namespace(form="F_X", new="_F_X2"))
+
+
+# ================================================================
+# 2026-07-15 点検: 「1行完結 Sub」の残存経路（delete-procedure / call-graph）
+# ================================================================
+
+class _FakeCodeModule:
+    """ProcStartLine/ProcCountLines の領域に次の宣言行が食い込む状況を再現する。"""
+    def __init__(self, lines):
+        self._lines = lines
+
+    def Lines(self, start, count):
+        return '\r\n'.join(self._lines[start - 1:start - 1 + count])
+
+
+def test_narrow_proc_range_excludes_next_declaration():
+    # 1行完結 Sub の直後のプロシージャ。ProcCountLines が次の宣言行まで含んでしまう
+    # （count=3 が「Sub 次の処理()」まで食い込んだ状態）
+    cm = _FakeCodeModule([
+        'Sub 一行版(): Call Main: End Sub',   # 1行目
+        '',                                    # 2行目
+        'Sub 次の処理()',                      # 3行目 ← 食い込み
+        '    MsgBox 1',
+        'End Sub',
+    ])
+    start, count = vm._narrow_proc_range(cm, 1, 3)
+    assert (start, count) == (1, 1), "次の宣言行を削除範囲に含めてはいけない"
+    # 絞った範囲は1行完結 Sub 自身のみ
+    assert cm.Lines(start, count) == 'Sub 一行版(): Call Main: End Sub'
+
+
+def test_narrow_proc_range_keeps_normal_proc_intact():
+    cm = _FakeCodeModule([
+        'Sub 普通()',
+        '    MsgBox 1',
+        'End Sub',
+        '',
+    ])
+    start, count = vm._narrow_proc_range(cm, 1, 4)
+    assert (start, count) == (1, 3)
+
+
+def test_inline_body_after_decl():
+    f = vm._inline_body_after_decl
+    # 1行完結 Sub → 本体を返す
+    raw = 'Sub X(): Call Main: End Sub'
+    assert f(raw, raw.index('X') + 1).strip() == 'Call Main: End Sub'
+    # 普通の宣言行 → 空
+    raw2 = 'Sub Y(a As String)'
+    assert f(raw2, raw2.index('Y') + 1) == ''
+    # 引数の既定値の文字列に ':' や ')' があっても誤らない
+    raw3 = 'Sub Z(Optional s As String = "a:b)"): Call Main: End Sub'
+    assert f(raw3, raw3.index('Z') + 1).strip() == 'Call Main: End Sub'
+    # 戻り型指定つき Function の1行完結
+    raw4 = 'Function F() As String: F = "x": End Function'
+    assert 'F = ' in f(raw4, raw4.index('F') + 1)
+
+
+def _inv(code, procs):
+    return {'modules': [{'name': 'Mod1', 'type': 1, 'code': code,
+                         'procs': [{'name': p} for p in procs]}],
+            'onaction': []}
+
+
+def test_analyze_calls_sees_body_of_one_line_sub():
+    # 「Sub ボタン18_Click(): Call 印刷実行: End Sub」の Call を見落とすと、
+    # 印刷実行が「どこからも呼ばれていない」に誤って載る
+    code = '\r\n'.join([
+        'Sub ボタン18_Click(): Call 印刷実行: End Sub',
+        '',
+        'Sub 印刷実行()',
+        '    MsgBox 1',
+        'End Sub',
+    ])
+    res = vm._analyze_calls(_inv(code, ['ボタン18_Click', '印刷実行']))
+    assert ('Mod1', 'ボタン18_Click') in res['edges'], "1行完結Subの Call が計上されていない"
+    assert '印刷実行' in res['edges'][('Mod1', 'ボタン18_Click')]
+    assert '印刷実行' not in res['orphans'], "呼ばれているのに孤立扱いになっている"
+
+
+def test_analyze_calls_detects_typo_in_one_line_sub():
+    # 1行完結 Sub の中の誤記（印刷実効）が未解決Callとして検出されること
+    code = '\r\n'.join([
+        'Sub ボタン18_Click(): Call 印刷実効: End Sub',
+        '',
+        'Sub 印刷実行()',
+        'End Sub',
+    ])
+    res = vm._analyze_calls(_inv(code, ['ボタン18_Click', '印刷実行']))
+    names = [u[2] for u in res['unresolved']]
+    assert '印刷実効' in names, "1行完結Subの中の誤記が検出されていない"
+
+
+def test_analyze_calls_one_line_sub_does_not_capture_following_lines():
+    # 1行完結 Sub は宣言行で閉じている。後続行の呼び出しをその Sub の名で
+    # 計上し続けてはいけない（cur が閉じられているか）
+    code = '\r\n'.join([
+        'Sub 一行版(): Call A: End Sub',
+        '',
+        'Sub 別の処理()',
+        '    Call B',
+        'End Sub',
+    ])
+    res = vm._analyze_calls(_inv(code, ['一行版', '別の処理', 'A', 'B']))
+    assert 'B' not in res['edges'].get(('Mod1', '一行版'), set()), \
+        "1行完結Subの後続行が、その Sub の呼び出しとして計上されている"
+    assert 'B' in res['edges'][('Mod1', '別の処理')]
+
+
+# ================================================================
+# 2026-07-15 点検: snapshot-diff が「読めなかった」を「消えた」と誤報する件
+# （ヘルパーは既存の _write_snap(path, sheets) / _diff_args(old, new) を使う）
+# ================================================================
+
+def test_snapshot_diff_does_not_report_unreadable_shapes_as_deleted(tmp_path, capsys):
+    # 旧: 図形3つを正常に読めた / 新: 図形の列挙に失敗（shapes_error だけ）
+    # → 図形は1つも消えていない。「図形削除: 3件」と言ってはいけない
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    _write_snap(p1, {"S": {"dims": "10行 x 3列", "cells": [],
+                           "shapes": [{"name": "ボタン1"}, {"name": "ボタン2"},
+                                      {"name": "ボタン3"}]}})
+    _write_snap(p2, {"S": {"dims": "10行 x 3列", "cells": [],
+                           "shapes_error": "COM エラー: 図形を列挙できません"}})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "図形削除" not in out, "読めなかっただけの図形を「削除」と誤報している"
+    assert "比較していません" in out or "比較できていません" in out
+
+
+def test_snapshot_diff_never_claims_match_when_unreadable(tmp_path, capsys):
+    # 両側とも図形が読めない → 差分ゼロに見えるが「一致」と断言してはいけない
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    info = {"dims": "10行 x 3列", "cells": [], "shapes_error": "COM エラー"}
+    _write_snap(p1, {"S": dict(info)})
+    _write_snap(p2, {"S": dict(info)})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "一致" not in out, "読めていないのに「一致」と断言している"
+    assert "比較できていません" in out
+
+
+def test_snapshot_diff_does_not_report_unreadable_cells_as_deleted(tmp_path, capsys):
+    # 旧: セルを読めた / 新: セルの読み取りに失敗 → 「セル削除」と言ってはいけない
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    _write_snap(p1, {"S": {"dims": "2行 x 1列",
+                           "cells": [{"r": 1, "c": {"A": "あ"}},
+                                     {"r": 2, "c": {"A": "い"}}]}})
+    _write_snap(p2, {"S": {"dims": "2行 x 1列", "cells": [],
+                           "cells_error": "COM エラー: 値を読めません"}})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "セル削除" not in out, "読めなかっただけのセルを「削除」と誤報している"
+
+
+def test_snapshot_diff_detects_shape_resize(tmp_path, capsys):
+    # ボタンを 1x1pt に潰す変更を「差分なし」と言ってはいけない（図形のサイズの目）
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    _write_snap(p1, {"S": {"dims": "10行 x 3列", "cells": [],
+                           "shapes": [{"name": "実行ボタン", "l": 10, "t": 10,
+                                       "w": 96, "h": 24}]}})
+    _write_snap(p2, {"S": {"dims": "10行 x 3列", "cells": [],
+                           "shapes": [{"name": "実行ボタン", "l": 10, "t": 10,
+                                       "w": 1, "h": 1}]}})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "図形変更" in out, "図形のサイズ変更を見落としている"
+    assert "大きさ" in out
+
+
+def test_snapshot_diff_match_message_does_not_overclaim(tmp_path, capsys):
+    # 本当に一致しているときも、見ていない書式まで一致したかのように言わない
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    info = {"dims": "1行 x 1列", "cells": [{"r": 1, "c": {"A": "x"}}]}
+    _write_snap(p1, {"S": dict(info)})
+    _write_snap(p2, {"S": dict(info)})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "差分なし" in out
+    assert "書式" in out, "書式が比較対象外であることを明示していない"
+
+
+# ================================================================
+# 2026-07-15: 書式の目（四つ目の目）。クリーン化で書式が飛んでも
+# 「差分なし（一致）」と言っていたのを塞いだ回帰テスト
+# ================================================================
+
+def _fmt_sheet(sheet=None, cols=None, rows=None):
+    """format ブロックつきのシート情報を作る"""
+    return {"dims": "11行 x 4列", "cells": [{"r": 1, "c": {"A": "商品"}}],
+            "format": {"sheet": sheet or {}, "cols": cols or {}, "rows": rows or {}}}
+
+
+def test_snapshot_diff_detects_wiped_formatting(tmp_path, capsys):
+    # クリーン化マクロが書式だけを吹き飛ばした（値・結合・図形は無傷）。
+    # 従来はこれを「差分なし（一致）」と報告していた＝ポスター.xlsm 破壊の再演
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    _write_snap(p1, {"売上表": _fmt_sheet(
+        sheet={"bold": None, "border": 1, "fill": 0, "numfmt": None},
+        cols={"A": {"bold": None, "border": 1, "w": 18.0}},
+        rows={"1": {"bold": True, "border": 1, "h": 24.0}})})
+    _write_snap(p2, {"売上表": _fmt_sheet(
+        sheet={"bold": False, "border": -4142, "fill": 16777215, "numfmt": "G/標準"},
+        cols={"A": {"bold": False, "border": -4142, "w": 8.42}},
+        rows={"1": {"bold": False, "border": -4142, "h": 18.0}})})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "書式変更" in out, "書式が吹き飛んだのに検出していない"
+    assert "罫線" in out, "罫線の消失を検出していない"
+    assert "一致" not in out
+    # シート全体の一撃を列・行ぶん繰り返して騒がしくしない（読めない検分は役に立たない）
+    assert "列幅" in out, "局所的な変化（列幅）は出すこと"
+
+
+def test_snapshot_diff_format_noise_is_suppressed(tmp_path, capsys):
+    # シート全体で起きた変化を、各列でも繰り返さない
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    cols_old = {c: {"border": 1, "w": 8.38} for c in "ABCD"}
+    cols_new = {c: {"border": -4142, "w": 8.38} for c in "ABCD"}
+    _write_snap(p1, {"S": _fmt_sheet(sheet={"border": 1}, cols=cols_old)})
+    _write_snap(p2, {"S": _fmt_sheet(sheet={"border": -4142}, cols=cols_new)})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "シート全体: 罫線" in out
+    # A列〜D列で同じ内容を繰り返さない
+    assert "A列: 罫線" not in out, "シート全体の変化を列ぶん繰り返している（騒がしい）"
+
+
+def test_snapshot_diff_format_local_change_survives(tmp_path, capsys):
+    # 局所的な変化（その列だけ違う）は、抑制に巻き込まれず出ること
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    _write_snap(p1, {"S": _fmt_sheet(sheet={"border": 1},
+                                     cols={"A": {"border": 1}, "B": {"border": 1}})})
+    _write_snap(p2, {"S": _fmt_sheet(sheet={"border": -4142},
+                                     cols={"A": {"border": -4142}, "B": {"border": 9}})})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "B列: 罫線" in out, "列だけの局所的な変化が消えている"
+    assert "A列: 罫線" not in out
+
+
+def test_snapshot_diff_does_not_report_unreadable_format(tmp_path, capsys):
+    # 書式を読めなかっただけの snapshot を「書式が変わった」と誤報しない
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    _write_snap(p1, {"S": _fmt_sheet(sheet={"bold": True})})
+    s2 = {"dims": "11行 x 4列", "cells": [{"r": 1, "c": {"A": "商品"}}],
+          "format_error": "COM エラー: 書式を読めません"}
+    _write_snap(p2, {"S": s2})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "書式変更" not in out, "読めなかっただけの書式を「変更」と誤報している"
+    assert ("比較していません" in out or "比較できていません" in out)
+    assert "一致" not in out, "書式を読めていないのに「一致」と言っている"
+
+
+def test_snapshot_diff_format_missing_on_one_side(tmp_path, capsys):
+    # 片方が --no-format で採られている → 書式は比較できないと明示する
+    p1, p2 = tmp_path / "old.json", tmp_path / "new.json"
+    _write_snap(p1, {"S": _fmt_sheet(sheet={"bold": True})})
+    _write_snap(p2, {"S": {"dims": "11行 x 4列",
+                           "cells": [{"r": 1, "c": {"A": "商品"}}]}})
+    vm.cmd_snapshot_diff(_diff_args(p1, p2))
+    out = capsys.readouterr().out
+    assert "書式変更" not in out
+    assert ("比較していません" in out or "比較できていません" in out)

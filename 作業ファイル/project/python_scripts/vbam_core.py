@@ -194,8 +194,17 @@ def release_created_instances(only_saved=True):
                     if not wbs.Item(i).Saved:
                         dirty = True
                         break
-                except Exception:
-                    pass
+                except Exception as ex2:
+                    # Saved の取得が COM のビジー拒否で弾かれることがある
+                    # （セル編集中・モーダル表示中に普通に起きる）。ここで握って
+                    # 素通りさせると「未保存なし」と誤断し、下で Close(SaveChanges=False)
+                    # → Quit → kill まで進んで、未保存の変更を無言で捨てる。
+                    # 判定できないときは安全side（温存）に倒す。
+                    if _com_is_busy(ex2):
+                        busy = True
+                    else:
+                        dirty = True
+                    break
         except Exception as ex:
             if _com_is_busy(ex):
                 # マクロ実行中・モーダル表示中。生きているし、未保存かどうかも
@@ -495,7 +504,7 @@ def get_workbook(target_file_arg=None, load_addins=False, readonly=False):
                     print(f"エラー: 読み取り専用で開いたブックを閉じられませんでした: {ex}")
                     print("  Excel がビジー（マクロ実行中・ダイアログ表示中）の可能性があります。")
                     print("  少し待ってから再実行してください。")
-                    raise
+                    raise ReopenFailed(str(ex))
                 try:
                     xl.EnableEvents = True   # 健診モードで切っていたイベントを戻す
                 except Exception as ex:
@@ -508,7 +517,7 @@ def get_workbook(target_file_arg=None, load_addins=False, readonly=False):
                 # 読み取り専用のまま、を防ぐ）
                 try:
                     if bool(wb.ReadOnly):
-                        raise Exception(
+                        raise ReopenFailed(
                             "開き直しましたが、まだ読み取り専用です"
                             "（ファイルが読み取り専用属性、または他で開かれています）")
                 except pywintypes.com_error:
@@ -518,6 +527,13 @@ def get_workbook(target_file_arg=None, load_addins=False, readonly=False):
             if load_addins:
                 load_excel_addins_and_personal(xl)
             return xl, wb
+        except ReopenFailed:
+            # 「読み取り専用のまま書き込みに進む」のを防ぐために上げた例外。
+            # ここで握ると下の _get_workbook_uncached が既に開いている（＝閉じ損ねた／
+            # 読み取り専用のままの）ブックを見つけて返してしまい、防ごうとした事故が
+            # そのまま起きる。キャッシュだけ捨てて、失敗は呼び出し元へ伝える。
+            _wb_cache.pop(key, None)
+            raise
         except Exception:
             del _wb_cache[key]
     xl, wb = _get_workbook_uncached(target_file_arg, load_addins, readonly)
@@ -1261,7 +1277,14 @@ def _unprotect_all_sheets(wb):
         except Exception:
             pass
         try:
-            ws.Unprotect()
+            # Password を省略すると、パスワード保護シートに対して Excel は例外ではなく
+            # 「パスワード入力ダイアログ」を出し、COM 呼び出しがそこでブロックする
+            # （DisplayAlerts=False でも抑止されない）。この解除は dialog_safe の
+            # ウォッチャーが起動する前（protect_safe が外側）に走るため、誰も解除できず
+            # 人が手で閉じるまで戻らない＝無言ハングになる。
+            # ダミーを渡せば「パスワード相違」で確実に例外化し、下の警告経路に落ちる。
+            # （パスワード無しの保護シートに対しては、渡しても普通に解除できる）
+            ws.Unprotect(Password=_UNPROTECT_PROBE_PW)
             saved.append((ws, drawing, contents, scenarios, ui_only, allow_kwargs))
         except Exception as ex:
             # 解除できなかった＝そのシートは保護されたまま。以後の操作はそこで失敗するが、
@@ -1271,6 +1294,21 @@ def _unprotect_all_sheets(wb):
             print("  このシートを触る操作は失敗します。Excel 側で先に保護を解除してください。",
                   file=sys.stderr)
     return saved
+
+
+class ReopenFailed(Exception):
+    """読み取り専用で開いたブックの「開き直し」に失敗した。
+
+    get_workbook のキャッシュ生存確認は例外を握って再接続に落ちる作りだが、
+    この失敗だけは握りつぶしてはいけない（握ると読み取り専用のままのブックを
+    返し、呼び出し元の replace-procedure 等がそのまま書き込みに進む）。
+    生存確認の失敗と区別するための専用型。
+    """
+
+
+# Unprotect に渡すダミーパスワード。Password 省略時のパスワード入力ダイアログ
+# （＝無言ハング）を避け、確実に例外へ倒すためだけに使う。解錠が目的ではない。
+_UNPROTECT_PROBE_PW = "__vbam_probe__"
 
 
 def _ws_name(ws):
@@ -1356,10 +1394,14 @@ class protected_sheets_guard:
             structure = windows = False
         if structure or windows:
             try:
-                self.wb.Unprotect()
+                # 引数なしの Unprotect はパスワード保護時にダイアログを出して固まる
+                # （_unprotect_all_sheets と同じ理由。ダミーで確実に例外化させる）
+                self.wb.Unprotect(Password=_UNPROTECT_PROBE_PW)
                 self._wb_saved = (structure, windows)
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"⚠ ブックの構造保護を一時解除できませんでした"
+                      f"（パスワード保護の可能性）: {ex}", file=sys.stderr)
+                print("  シートの追加・削除・改名を伴う操作は失敗します。", file=sys.stderr)
         self._saved = _unprotect_all_sheets(self.wb)
         _active_guards.append(self)
         return self
@@ -1374,8 +1416,13 @@ class protected_sheets_guard:
             try:
                 self.wb.Protect(Structure=self._wb_saved[0],
                                 Windows=self._wb_saved[1])
-            except Exception:
-                pass
+            except Exception as ex:
+                # 従来は完全に無言だった。復元できないと「保護してあるはずのブックの
+                # 構造保護が、いつの間にか外れている」状態でコマンドが成功終了する。
+                # シート保護の再保護（_reprotect_sheets）は必ず報告するので、対称に揃える
+                print(f"⚠ ブックの構造保護を復元できませんでした: {ex}", file=sys.stderr)
+                print("  このブックは構造保護が外れたままです。Excel 側で保護し直してください。",
+                      file=sys.stderr)
         return False
 
 
@@ -1406,6 +1453,7 @@ __all__ = [
     'BACKUP_DIR',
     'LAST_PROC_FILE',
     'ModuleNameCollisionError',
+    'ReopenFailed',
     'SCRIPT_DIR',
     'XL_EXTS',
     '_LAST_SNAPSHOT_FILE',

@@ -54,6 +54,105 @@ _jobs = queue.Queue()
 _worker_lock = threading.Lock()
 
 
+class _ThreadRouted(io.TextIOBase):
+    """スレッドごとに出力先を振り分ける stdout/stderr/stdin の代理。
+
+    従来はワーカーがジョブ毎に sys.stdout 自体を差し替えていた。しかし sys.stdout は
+    プロセス全体のグローバルであってスレッドローカルではないため、次の穴が残る:
+
+      1. W1 が MsgBox に捕まり 600 秒でタイムアウト → 世代交代で見捨てられる
+      2. W2 がジョブを終え、finally で sys.stdout を REAL_STDOUT に戻す
+      3. そこで人がダイアログを閉じ、W1 が復帰して print する
+      4. その print は REAL_STDOUT ＝ JSON-RPC の通信線へ流れ、セッションが壊れる
+
+    従来のガード（自分が据えたものが残っているときだけ戻す）が守っていたのは
+    「復元時」だけで、「実行中の書き込み」は無防備だった。
+
+    この代理を起動時に1回だけ据え、ワーカーは sys.stdout に二度と触らず
+    「自分のスレッドのバッファ」を登録するだけにする。見捨てられた旧ワーカーは
+    自分の（誰も読まない）バッファに書き続け、通信線には絶対に届かない。
+    """
+    _local = threading.local()
+
+    def __init__(self, real, stream='out'):
+        self._real = real
+        self._stream = stream          # 'out' | 'err' | 'in'
+
+    @classmethod
+    def bind(cls, out_buf, err_buf, in_buf, json_mode=False):
+        """このスレッドの出力先を登録する（ワーカーが自分のジョブ開始時に呼ぶ）"""
+        cls._local.out = out_buf
+        cls._local.err = err_buf
+        cls._local.inp = in_buf
+        cls._local.json_mode = json_mode
+
+    @classmethod
+    def unbind(cls):
+        cls._local.out = None
+        cls._local.err = None
+        cls._local.inp = None
+        cls._local.json_mode = False
+
+    @classmethod
+    def json_mode(cls):
+        return getattr(cls._local, 'json_mode', False)
+
+    def _target(self):
+        if self._stream == 'out':
+            return getattr(_ThreadRouted._local, 'out', None) or self._real
+        if self._stream == 'err':
+            return getattr(_ThreadRouted._local, 'err', None) or self._real
+        return getattr(_ThreadRouted._local, 'inp', None) or self._real
+
+    def write(self, s):
+        return self._target().write(s)
+
+    def flush(self):
+        try:
+            self._target().flush()
+        except Exception:
+            pass
+
+    def readline(self, *a):
+        return self._target().readline(*a)
+
+    def read(self, *a):
+        return self._target().read(*a)
+
+    def isatty(self):
+        return False
+
+
+# 起動時に1回だけ据える。以後 sys.stdout/stderr/stdin は誰も差し替えない
+sys.stdout = _ThreadRouted(REAL_STDOUT, 'out')
+sys.stderr = _ThreadRouted(REAL_STDERR, 'err')
+sys.stdin = _ThreadRouted(REAL_STDIN, 'in')
+
+
+def _install_json_aware_print():
+    """--json のジョブでは、素の print()（情報行）を stderr 側へ退避する。
+
+    JSON 本体は print(..., file=sys.stdout) と明示して出力される一方、
+    情報行（「対象ブック: ...」等）は素の print() で出る。CLI では
+    setup_encoding が builtins.print にパッチを当ててこれを分離しているが、
+    MCP は setup_encoding を呼ばないため、両者が同じ stdout に混ざり
+    機械処理側が json.loads できなかった。同じ分離をここで行う。
+    スレッドローカル判定にしてあるので、他スレッドの print は巻き込まない。
+    """
+    import builtins
+    _orig_print = builtins.print
+
+    def _print(*args, **kwargs):
+        if 'file' not in kwargs and _ThreadRouted.json_mode():
+            kwargs['file'] = sys.stderr
+        _orig_print(*args, **kwargs)
+
+    builtins.print = _print
+
+
+_install_json_aware_print()
+
+
 def _release_com_refs():
     """接続キャッシュの Excel COM 参照を手放す（COM を作ったワーカースレッド上で呼ぶ）。
 
@@ -83,6 +182,14 @@ def _tokenize(line):
     lex.escape = ''  # Windows パスの \ をエスケープ扱いしない（shell と同じ）
     lex.commenters = ''  # 行中の # をコメント扱いしない（#FF0000 等が消える。shell/batch と同じ）
     return list(lex)
+
+
+def _wants_json(line):
+    """その行が --json を求めているか（CLI は sys.argv を見るが MCP には無いので行を見る）"""
+    try:
+        return "--json" in _tokenize(line)
+    except Exception:
+        return "--json" in line
 
 
 def _run_line(parser, table, line, buf):
@@ -121,45 +228,35 @@ def _worker(jobs):
                 # 後から副作用だけ走る、を防ぐためここで捨てる
                 continue
             box["started"] = True
-        buf = io.StringIO()
-        fake_stdin = io.StringIO("")
+        # stdout（JSON本体）と stderr（情報行・警告）を分ける。混ぜると --json の
+        # 出力に情報行が紛れ込み、機械処理側が json.loads できない
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
         ok = False
         try:
-            # stdout/stderr は redirect_stdout（with 文）ではなく自前で差し替える。
-            # with 文の __exit__ は「自分が入った時点の値」を無条件に復元するため、
-            # 世代交代（_restart_worker）後に旧ワーカーが復帰すると、新ワーカーが
-            # 据えたリダイレクトを剥がして本物の stdout ＝ JSON-RPC の通信線を
-            # 露出させてしまう。「自分が据えたものが残っているときだけ戻す」に加え、
-            # 戻し先は入った時点の値ではなく REAL_*（本物の通信線）にする。
-            # 入った時点の値だと、前世代の捨てられたバッファを掴んで復元し続け、
-            # ジョブ外の print が誰も読まないバッファに溜まる
-            sys.stdin = fake_stdin
-            sys.stdout = buf
-            sys.stderr = buf
+            # sys.stdout をグローバルに差し替えるのではなく、自分のスレッドの
+            # 出力先を登録するだけ（_ThreadRouted 参照）。こうすると世代交代で
+            # 見捨てられた旧ワーカーが後から復帰して print しても、その出力は
+            # 自分のバッファに行き、JSON-RPC の通信線には絶対に漏れない。
+            _ThreadRouted.bind(out_buf, err_buf, io.StringIO(""),
+                               json_mode=_wants_json(line))
             if line == "__cleanup__":
                 vba_manager.cleanup_excel()
                 ok = True
             else:
-                ok = _run_line(parser, table, line, buf) is not False
+                ok = _run_line(parser, table, line, err_buf) is not False
         except SystemExit as e:
             ok = e.code in (0, None)
         except EOFError:
-            buf.write("\nエラー: 確認プロンプト待ちになりました（MCP では応答できません）。"
-                      "確認付きコマンドは -y を付けて再実行してください")
+            err_buf.write("\nエラー: 確認プロンプト待ちになりました（MCP では応答できません）。"
+                          "確認付きコマンドは -y を付けて再実行してください")
         except Exception as e:
-            buf.write(f"\nエラー: {e}")
+            err_buf.write(f"\nエラー: {e}")
         finally:
-            # 世代交代後に旧ワーカーが復帰した場合、新世代が据えたものを剥がして
-            # 本物（JSON-RPC の通信線）を露出させないよう、自分が据えたものが
-            # 残っているときだけ復元する。戻し先は必ず REAL_*（起動時に控えた実体）
-            if sys.stdin is fake_stdin:
-                sys.stdin = REAL_STDIN
-            if sys.stdout is buf:
-                sys.stdout = REAL_STDOUT
-            if sys.stderr is buf:
-                sys.stderr = REAL_STDERR
+            _ThreadRouted.unbind()
             box["ok"] = ok
-            box["out"] = buf.getvalue()
+            box["out"] = out_buf.getvalue()
+            box["err"] = err_buf.getvalue()
             done.set()
 
 
@@ -206,14 +303,25 @@ def _run(line, timeout=600):
                        "ワーカーを再起動しました。次の呼び出しから復旧します"
                        "（実行中だったコマンドは Excel 側で続いている可能性があります。"
                        "モーダルダイアログが開いていないか確認してください）")
-    return box.get("ok", False), (box.get("out") or "").strip()
+    return (box.get("ok", False),
+            (box.get("out") or "").strip(),
+            (box.get("err") or "").strip())
 
 
 def _submit(line, timeout=600):
-    ok, out = _run(line, timeout)
+    ok, out, err = _run(line, timeout)
+    # --json 指定時は JSON 本体（stdout）だけを返す。情報行（stderr）を混ぜると
+    # 機械処理側が json.loads できない（CLI では setup_encoding が情報行を stderr へ
+    # 退避して分離しているが、MCP は setup_encoding を呼ばないので自前で分ける）
+    if _wants_json(line):
+        if ok and out:
+            return out
+        # 失敗時だけは理由が要る（黙って空を返さない）
+        return ((out + "\n" + err).strip() + "\n（コマンドは失敗しました）").strip()
+    body = "\n".join(p for p in (err, out) if p).strip()
     if not ok:
-        out = (out + "\n（コマンドは失敗しました）").strip()
-    return out or "（出力なし）"
+        body = (body + "\n（コマンドは失敗しました）").strip()
+    return body or "（出力なし）"
 
 
 mcp = FastMCP("vba-manager")
@@ -249,12 +357,14 @@ def get_procedure(name: str, module: str = "") -> str:
     修正の流れ: get_procedure → set_procedure_code → replace_procedure
     """
     cmd = f'get "{module}" "{name}"' if module else f'get "{name}"'
-    ok, out = _run(cmd)
+    ok, out, err = _run(cmd)
+    # get のコード本文は stdout、情報行・警告は stderr。人が読むので両方返す
+    body = "\n".join(p for p in (err, out) if p).strip()
     if not ok:
-        return (out + "\n（取得に失敗しました）").strip()
+        return (body + "\n（取得に失敗しました）").strip()
     # get の出力に保存先とコード全文が含まれる（_last_proc.vba と同一内容）ので
     # ファイルを読み直して二重に返さない
-    return out
+    return body
 
 
 @mcp.tool()

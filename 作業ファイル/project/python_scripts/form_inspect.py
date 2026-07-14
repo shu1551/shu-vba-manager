@@ -492,6 +492,29 @@ def _tab_arg(c, tab_map):
     return ""
 
 
+# form_layout の STYLE['font'] と同じ既定。これと違うサイズだけ font= を出す
+_DEFAULT_FONT_PT = 12
+
+
+def _font_arg(c):
+    """既定と違うフォントサイズなら font= を出す。
+
+    出さないと、往復（--to-layout → build_form）で全コントロールが 12pt に
+    揃えられてしまう（9pt で作られた既存フォームは見た目が別物になる）。
+    form_layout の _place_control は e.get('font') を読む実装になっているので、
+    要素式に font= を書けばそのまま効く。
+    """
+    fs = c.get("font_size")
+    if not fs:
+        return ""
+    try:
+        if abs(float(fs) - _DEFAULT_FONT_PT) < 0.5:
+            return ""
+    except Exception:
+        return ""
+    return f", font={float(fs):g}"
+
+
 def _emit_elem(c, max_right, tab_map=None):
     """1コントロールを form_layout の要素式に変換する。未対応種別は None"""
     t = c.get("type") or ""
@@ -500,32 +523,41 @@ def _emit_elem(c, max_right, tab_map=None):
     stretch = abs((c["left"] + c["width"]) - max_right) <= 1 if max_right else False
     w_arg = "" if stretch else f", width={c['width']:g}"
     ti = _tab_arg(c, tab_map)
+    fo = _font_arg(c)
 
     if t.startswith("Label"):
         b = ", bold=True" if c.get("bold") else ""
         # ラベルも実名を出す。名前を捨てると受け側が lbl1, lbl2... と機械採番し、
         # VBA が lblStatus.Caption = ... と名指ししていた参照が黙って切れる
-        return f'lbl("{cap}", name="{name}"{b}{ti})'
+        return f'lbl("{cap}", name="{name}"{b}{fo}{ti})'
     if t.startswith("TextBox"):
         h = f", height={c['height']:g}" if abs(c["height"] - 22) > 1 else ""
         ml = ", multiline=True" if c.get("multiline") else ""
-        return f'txt("{name}"{w_arg}{h}{ml}{ti})'
+        return f'txt("{name}"{w_arg}{h}{ml}{fo}{ti})'
     if t.startswith("ComboBox"):
-        return f'combo("{name}"{w_arg}{ti})'
+        return f'combo("{name}"{w_arg}{fo}{ti})'
     if t.startswith("ListBox"):
-        return f'lst("{name}"{w_arg}, height={c["height"]:g}{ti})'
+        return f'lst("{name}"{w_arg}, height={c["height"]:g}{fo}{ti})'
     if t.startswith("CheckBox"):
-        return f'chk("{name}", "{cap}"{ti})'
+        return f'chk("{name}", "{cap}"{fo}{ti})'
     if t.startswith("OptionButton"):
         g = f', group="{c["group"]}"' if c.get("group") else ""
-        return f'opt("{name}", "{cap}"{g}{ti})'
+        return f'opt("{name}", "{cap}"{g}{fo}{ti})'
     if t.startswith("CommandButton"):
         acc = f', accel="{c["accelerator"]}"' if c.get("accelerator") else ""
+        b = ", bold=True" if c.get("bold") else ""
         if c.get("cancel"):
-            return f'cancel("{name}", "{cap}"{acc}{ti})'
+            return f'cancel("{name}", "{cap}"{acc}{b}{fo}{ti})'
         if c.get("default"):
-            return f'ok("{name}", "{cap}"{acc}{ti})'
-        return f'btn("{name}", "{cap}"{acc}{ti})'
+            return f'ok("{name}", "{cap}"{acc}{b}{fo}{ti})'
+        return f'btn("{name}", "{cap}"{acc}{b}{fo}{ti})'
+    # form_layout が作れる型は逆変換もできなければ「片肺」になる
+    # （作れるのに戻せない＝往復でそのコントロールが消える）
+    if t.startswith("Image"):
+        return f'img("{name}", {c["width"]:g}, {c["height"]:g})'
+    # SpinButton は単体の要素関数が form_layout に無い（spin_txt が TextBox と
+    # SpinButton をひと組で作る複合部品）。単純な逆変換にはならないので出力せず、
+    # 呼び出し側で「未対応」として目に見える形に残す（黙って消さない）
     return None
 
 
@@ -536,8 +568,11 @@ def _emit_cluster(r, max_right, indent, tab_map=None):
     if len(r) == 1 and types[0].startswith("Label") and r[0].get("bold"):
         cap = (r[0].get("caption") or "").replace('"', '\\"')
         return f'{indent}heading("{cap}", name="{r[0]["name"]}"),'
-    # ボタンバー: ボタンだけの行（通常は最終行・右寄せ）
-    if all(t.startswith("CommandButton") for t in types):
+    # ボタンバー: ボタンだけの行。ただし button_bar は「右端寄せ＋全ボタンを
+    # 最大幅に統一」する部品なので、無条件に当てるとカレンダーの日ボタン格子の
+    # ような並びが右寄せ＋幅72ptに膨らんで崩壊する。少数（〜3個）のときだけ
+    # ボタンバーと見なし、それ以外は幅を明示した row として出す
+    if all(t.startswith("CommandButton") for t in types) and len(r) <= 3:
         parts = [_emit_elem(c, 0, tab_map) for c in r]
         return f"{indent}button_bar({', '.join(p for p in parts if p)}),"
     parts = []
@@ -548,9 +583,14 @@ def _emit_cluster(r, max_right, indent, tab_map=None):
             parts.append(p)
         else:
             skipped.append(f"{c['name']}({c.get('type')})")
+    if not parts:
+        # 未対応型だけの行。row() は空だと ValueError で落ちるので、行ごと
+        # コメントにして「消えた」ことを目に見える形で残す
+        return (f"{indent}# ★未対応のため出力できませんでした（手動で追加してください）: "
+                f"{', '.join(skipped)}")
     line = f"{indent}row({', '.join(parts)}),"
     if skipped:
-        line += f"  # 未対応のため手動で: {', '.join(skipped)}"
+        line += f"  # ★未対応のため手動で: {', '.join(skipped)}"
     return line
 
 

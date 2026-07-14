@@ -443,6 +443,10 @@ def _collect_shapes(shapes, out, in_group=None):
         try:
             s["l"] = round(float(shp.Left))
             s["t"] = round(float(shp.Top))
+            # サイズも採る。位置だけ見ていると、ボタンを 1×1pt に潰す／2倍に伸ばす
+            # といった変更を snapshot-diff が「差分なし」と見逃す
+            s["w"] = round(float(shp.Width))
+            s["h"] = round(float(shp.Height))
         except Exception:
             pass
         try:
@@ -467,6 +471,229 @@ def _collect_shapes(shapes, out, in_group=None):
                 pass
 
 
+# 書式の目が見る項目。COM のプロパティ1つ＝1往復（約1.1ms）なので、
+# 数を絞りつつ「クリーン化で消えるもの」を確実に押さえる。
+# 罫線は Borders.LineStyle が「全辺・全セルで同じなら値／不揃いなら None」を返す
+# ため1往復で足りる（罫線が丸ごと消えたかは、これで確実に分かる）。
+_FMT_PROPS = (
+    ('bold',   lambda r: r.Font.Bold),
+    ('size',   lambda r: r.Font.Size),
+    ('font',   lambda r: r.Font.Name),
+    ('italic', lambda r: r.Font.Italic),
+    ('color',  lambda r: r.Font.Color),
+    ('fill',   lambda r: r.Interior.Color),
+    ('numfmt', lambda r: r.NumberFormat),
+    ('border', lambda r: r.Borders.LineStyle),
+    ('halign', lambda r: r.HorizontalAlignment),
+)
+
+
+def _fmt_read(rng, keys):
+    """範囲の書式をまとめ読み。範囲内で不揃いな項目は None（Excel の性質）。
+
+    値は JSON に載るように素の型へ均す（COM の float/bool/str がそのまま来る）。
+    読めなかった項目は "?" にして「揃っている」と誤解させない。
+    """
+    out = {}
+    for key, getter in _FMT_PROPS:
+        if keys is not None and key not in keys:
+            continue
+        try:
+            v = getter(rng)
+        except Exception:
+            out[key] = "?"          # 読めなかった（＝揃っているとは言えない）
+            continue
+        if v is None:
+            out[key] = None         # 範囲内で不揃い
+        elif isinstance(v, float) and v == int(v):
+            out[key] = int(v)
+        elif isinstance(v, (int, str, bool)):
+            out[key] = v
+        else:
+            out[key] = str(v)
+    return out
+
+
+def _collect_format(sh, ur, nr, nc):
+    """シートの書式を採る（値・結合・図形に続く「四つ目の目」）。
+
+    Excel の COM には書式の一括読みが無い。セル単位で読むと 1万セルで33秒（実測）。
+    一方 Excel は「範囲の書式が揃っていれば値／不揃いなら None」を返す性質を持つ。
+    これを使って、揃っている範囲は1往復で確定させる:
+
+      1. シート全体を1回読む。揃っている項目はここで確定（列・行を見る必要なし）
+      2. 不揃い（None）だった項目だけ、列ごとに読む
+      3. 行は二分割で降りる。揃っていればその塊で確定、不揃いなら半分に割る
+         （見出し1行だけ太字のシートなら、1万行でも約30往復で終わる）
+
+    行を1行ずつ読む素朴なやり方だと、見出し行が太字なだけで本文1万行を1万回
+    読みに行き 38.9秒かかった。行上限で打ち切れば速いが、上限より下の書式を
+    一切見ない盲点ができる（数万行のシートではそこが本体）。二分割ならどちらも要らない。
+
+    戻り値:
+      sheet / cols … 揃っていればその値、不揃いなら None（欠測ではない）
+      row_blocks   … 同じ書式が続く行の塊のリスト [{r0, r1, 各項目}, ...]
+      読めなかった項目は "?"。
+    """
+    info = {}
+    sheet_fmt = _fmt_read(ur, None)
+    info["sheet"] = sheet_fmt
+
+    # 不揃いだった項目だけ下へ降りる（揃っている項目は列・行を見る必要がない）
+    mixed = [k for k, v in sheet_fmt.items() if v is None]
+
+    # 揃っている項目は、各行・各列も必ずその値になる（範囲の部分集合だから）。
+    # ここで埋めておかないと、行・列の dict に「その項目のキーが無い」状態になり、
+    # 前後で揃い方が変われば snapshot-diff が「不在」を「None（不揃い）への変化」
+    # として誤報する（例: クリーン化で太字が揃った途端に「太字 False → None」）。
+    # 「測っていない」を「不揃い」と言うのは、検分器がついてはいけない類の嘘。
+    # COM 往復は増えない（シート全体の1回で確定している値を写すだけ）。
+    inherited = {k: v for k, v in sheet_fmt.items() if k not in mixed}
+
+    # 列幅・行高も同じ理屈で先にまとめて見る。ほとんどのシートは全列同じ幅・
+    # 全行同じ高さなので、その場合は1回の読みで確定し、列ぶん・行ぶんの COM 往復
+    # （1本あたり約1.1ms）を丸ごと省ける。不揃い（None）のときだけ下へ降りる。
+    def _uniform(getter):
+        try:
+            v = getter()
+            return round(float(v), 2) if v is not None else None
+        except Exception:
+            return None
+
+    uni_w = _uniform(lambda: ur.EntireColumn.ColumnWidth)
+    uni_h = _uniform(lambda: ur.EntireRow.RowHeight)
+    # 非表示行の有無も先にまとめて見る。Hidden が False で揃っていれば
+    # 「非表示行は1行も無い」と確定するので、行ごとの問い合わせを省ける
+    try:
+        rows_all_visible = (ur.EntireRow.Hidden is False)
+    except Exception:
+        rows_all_visible = False
+
+    cols = {}
+    for ci in range(1, nc + 1):
+        cno = ur.Column + ci - 1
+        col_rng = sh.Range(sh.Cells(ur.Row, cno), sh.Cells(ur.Row + nr - 1, cno))
+        d = dict(inherited)
+        if mixed:
+            d.update(_fmt_read(col_rng, mixed))
+        if uni_w is not None:
+            d["w"] = uni_w                     # 全列同じ幅と確定済み（追加の往復なし）
+        else:
+            try:
+                d["w"] = round(float(sh.Columns(cno).ColumnWidth), 2)
+            except Exception:
+                d["w"] = "?"
+        try:
+            d["hidden"] = bool(sh.Columns(cno).Hidden)
+        except Exception:
+            pass
+        cols[_col_letter(cno)] = d
+    info["cols"] = cols
+
+    # --- 行は「1行ずつ」ではなく「同じ書式が続く塊」で採る ---
+    #
+    # 1行ずつ読むと、見出し行が1行太字なだけでシート全体が「不揃い」になり、
+    # 本文が全部同じ書式でも1万行を1万回読みに行く（実測: 10,004行で38.9秒）。
+    # 行上限で打ち切れば速くはなるが、上限より下の書式を一切見ない盲点ができる
+    # （ファイル一覧.xlsm のような数万行のシートでは、そこが本体）。
+    # 速度と盲点のどちらかを選ばされる時点で、やり方が間違っている。
+    #
+    # そこで二分割で降りる: 範囲を読んで揃っていればその塊で確定（1往復）、
+    # 不揃いなら半分に割って繰り返す。見出し1行だけ違うシートなら、1万行でも
+    # 約30往復で終わる。上限も要らなくなり、盲点も消える。
+    #
+    # ただし「列ごとの違い」で不揃いになっている項目（例: 金額列だけ表示形式が
+    # #,##0）は、どの行を読んでも必ず不揃い（None）になる。それを二分割で追うと
+    # 最後の1行まで割り続け、途中の読みが全部無駄になる（実測で倍近く遅くなった）。
+    # そういう項目は「各列では揃っている」＝列の目で既に捉えているので、行へは
+    # 降りない。降りるのは「どこかの列の中で不揃い」＝行方向の変化がある項目だけ。
+    row_keys = [k for k in mixed
+                if any((cols[cl].get(k) is None) for cl in cols)]
+    # 降りない項目は、各行の中では必ず不揃い（列同士で値が違うから）＝ None が事実。
+    # ここを空欄にすると「測っていない」と「不揃い」が混ざり、diff が誤報する
+    col_only = {k: None for k in mixed if k not in row_keys}
+
+    # 二分割には「読む回数の上限」を付ける。
+    # 均一なシート（本文1万行が同じ書式＝ファイル一覧型）は数十往復で全行を覆えるが、
+    # 「金額列だけカンマ書式」のように "どの行の中でも不揃い" な項目があると、
+    # 二分割は最後の1行まで割り続け、途中の読みが全部無駄になる（実測で倍近く遅い）。
+    # 上限を置けば、均一なシートは今までどおり全行カバー、割り続けても終わらない
+    # シートは途中で止まる。止めた場合は「そこまでの粒度でしか見ていない」と必ず残す
+    # （黙って粗く見て「差分なし」と言うのが、検分器として最悪の嘘）。
+    budget = {"left": 600}          # 行方向の読み取り回数の上限（約1〜2秒ぶん）
+    coarse = []                     # 上限に当たって細かく見られなかった範囲
+
+    row_blocks = []
+
+    def _row_range(r0, r1):
+        return sh.Range(sh.Cells(r0, ur.Column), sh.Cells(r1, ur.Column + nc - 1))
+
+    def _descend(r0, r1, keys):
+        """[r0, r1] の書式を採る。揃っていれば1塊、不揃いなら二分割して降りる。"""
+        d = dict(inherited)
+        d.update(col_only)          # 列方向だけの違い＝どの行でも不揃い（None が事実）
+        if keys:
+            budget["left"] -= 1
+            d.update(_fmt_read(_row_range(r0, r1), keys))
+        # 高さ・非表示も同じ塊の単位で見る（全体で揃っていれば追加の往復ゼロ）
+        if uni_h is not None:
+            d["h"] = uni_h
+        else:
+            try:
+                v = sh.Range(sh.Rows(r0), sh.Rows(r1)).RowHeight
+                d["h"] = round(float(v), 2) if v is not None else None
+            except Exception:
+                d["h"] = "?"
+        if rows_all_visible:
+            hid = False
+        else:
+            try:
+                hv = sh.Range(sh.Rows(r0), sh.Rows(r1)).Hidden
+                hid = None if hv is None else bool(hv)
+            except Exception:
+                hid = None
+        if hid:
+            d["hidden"] = True
+
+        # この塊の中で不揃いな項目（None）があるか。無ければ塊として確定。
+        # col_only の項目（列方向だけの違い）は、行を割っても永遠に None のままなので
+        # 「まだ不揃い」の判定から外す（外さないと最後の1行まで割り続ける）
+        still_mixed = [k for k, v in d.items()
+                       if v is None and k not in col_only]
+        if not still_mixed or r0 >= r1:
+            # 1行まで降りてなお None のものは「その行の中で不揃い」＝事実として残す
+            row_blocks.append({"r0": r0, "r1": r1, **d})
+            return
+        if budget["left"] <= 0:
+            # 上限に到達。ここから下は細かく見ない。粗い塊のまま残し、
+            # 「この範囲はこの粒度でしか見ていない」を必ず報告する
+            coarse.append([r0, r1])
+            row_blocks.append({"r0": r0, "r1": r1, **d})
+            return
+        mid = (r0 + r1) // 2
+        _descend(r0, mid, still_mixed)
+        _descend(mid + 1, r1, still_mixed)
+
+    r_top, r_bot = ur.Row, ur.Row + nr - 1
+    _descend(r_top, r_bot, mixed)
+    if coarse:
+        info["rows_coarse"] = coarse
+
+    # 隣り合う塊で中身が同じなら畳む（二分割の切れ目が残るのを均す）
+    merged_blocks = []
+    for b in sorted(row_blocks, key=lambda x: x["r0"]):
+        if merged_blocks:
+            prev = merged_blocks[-1]
+            same = all(prev.get(k) == b.get(k)
+                       for k in set(prev) | set(b) if k not in ("r0", "r1"))
+            if same and prev["r1"] + 1 == b["r0"]:
+                prev["r1"] = b["r1"]
+                continue
+        merged_blocks.append(dict(b))
+    info["row_blocks"] = merged_blocks
+    return info
+
+
 def cmd_snapshot(args):
     """アクティブブック(または1シート)を意味構造JSONに畳む＝開いたままブックLMの下ごしらえ。
 
@@ -483,6 +710,10 @@ def cmd_snapshot(args):
     except (TypeError, ValueError):
         print("エラー: --max-rows は数値で指定してください")
         return False
+    # 書式に行上限は要らない。行は二分割で降りて「同じ書式が続く塊」で採るため、
+    # 行数が増えても往復は log 的にしか増えない（10,004行でも約30往復）。
+    # 上限で打ち切ると「上限より下の書式を見ていない」盲点ができ、数万行のシートでは
+    # そこが本体になる。速度と盲点のどちらかを選ばせない、が今の設計。
 
     xl, wb = get_workbook(target_file)
     active = wb.ActiveSheet.Name
@@ -516,7 +747,11 @@ def cmd_snapshot(args):
             try:
                 sub = sh.Range(ur.Cells(1, 1), ur.Cells(read_rows, nc))
                 raw = sub.Value
-            except Exception:
+            except Exception as e:
+                # 黙って None にすると「空のシート」と見分けがつかず、snapshot-diff が
+                # 数千件のセル追加/削除を誤報する（図形の shapes_error と同じ理由で
+                # 「読めなかった事実」を残す）
+                info["cells_error"] = str(e)
                 raw = None
             if raw is None:
                 grid = []
@@ -563,13 +798,25 @@ def cmd_snapshot(args):
         if shapes:
             info["shapes"] = shapes
 
+        # --- 書式（四つ目の目。値・結合・図形だけ見ていたのが従来）---
+        if not getattr(args, 'no_format', False):
+            if ur is not None and nr > 0:
+                try:
+                    info["format"] = _collect_format(sh, ur, nr, nc)
+                except Exception as e:
+                    # 読めなかったことを残す（黙って落とすと diff が
+                    # 「書式が消えた」と誤報する／「一致」と嘘をつく）
+                    info["format_error"] = str(e)
+
         # --- テーブル（正式な ListObject だけ・推定はしない）---
         tables = []
         try:
             for lo in sh.ListObjects:
                 tables.append({"name": lo.Name, "address": lo.Range.Address})
-        except Exception:
-            pass
+        except Exception as e:
+            # 握りつぶすと「テーブルなし」と区別がつかず、diff がテーブルの
+            # 追加/削除を誤報する
+            info["tables_error"] = str(e)
         if tables:
             info["tables"] = tables
 
@@ -744,6 +991,8 @@ def cmd_snapshot_diff(args):
     diff_sheets = 0
     merged_note_hidden = []   # 結合未走査で比較できず、かつ他に差分がなく非表示のシート
     trunc_note_hidden = []    # セル打ち切りで一部しか比較できず、かつ他に差分がなく非表示のシート
+    unread_note_hidden = []   # 読み取り失敗で比較を降り、かつ他に差分がなく非表示のシート
+    unread_any = []           # 読み取り失敗が1件でもあったシート（最後の総括に出す）
 
     for name in [n for n in old_sheets if n not in new_sheets]:
         diff_sheets += 1
@@ -756,6 +1005,24 @@ def cmd_snapshot_diff(args):
     for name in [n for n in old_sheets if n in new_sheets]:
         oi, ni = old_sheets[name], new_sheets[name]
 
+        # 片側でも「読めなかった」snapshot は、空 vs 実データの疑似差分になる。
+        # 結合（merged_skipped_cells）で比較を降りるのと同じ扱いにする。
+        # 見ていないものを「消えた」と report するのが検分器として最悪の嘘
+        cells_unreadable = bool(oi.get('cells_error') or ni.get('cells_error'))
+        shapes_unreadable = bool(oi.get('shapes_error') or ni.get('shapes_error'))
+        tables_unreadable = bool(oi.get('tables_error') or ni.get('tables_error'))
+        # 書式も同じ扱いに合流させる。ここに入れないと「書式を読めていないのに、
+        # 他に差分が無いから『差分なし（一致）』」という一番たちの悪い嘘になる
+        # （読めなかった／片側だけ --no-format、のどちらも「比較していない」）
+        _fmt_err = bool(oi.get('format_error') or ni.get('format_error'))
+        _fmt_missing = bool(oi.get('format')) != bool(ni.get('format'))
+        unreadable_parts = (['セル'] if cells_unreadable else []) \
+            + (['図形'] if shapes_unreadable else []) \
+            + (['テーブル'] if tables_unreadable else []) \
+            + (['書式'] if (_fmt_err or _fmt_missing) else [])
+        if unreadable_parts:
+            unread_any.append(f"{name}（{'・'.join(unreadable_parts)}）")
+
         oc, nc_ = cell_map(oi), cell_map(ni)
         # 片側だけ --max-rows で打ち切った snapshot をそのまま比べると、打ち切り行より
         # 下は「片側だけ空」＝実際は無変更なのに丸ごとセル追加/削除に化ける。
@@ -765,10 +1032,13 @@ def cmd_snapshot_diff(args):
         if cell_limit is not None:
             oc = {k: v for k, v in oc.items() if k[0] <= cell_limit}
             nc_ = {k: v for k, v in nc_.items() if k[0] <= cell_limit}
-        added = sorted([k for k in nc_ if k not in oc], key=cell_order)
-        removed = sorted([k for k in oc if k not in nc_], key=cell_order)
-        changed = sorted([k for k in oc if k in nc_ and oc[k] != nc_[k]],
-                         key=cell_order)
+        if cells_unreadable:
+            added, removed, changed = [], [], []
+        else:
+            added = sorted([k for k in nc_ if k not in oc], key=cell_order)
+            removed = sorted([k for k in oc if k not in nc_], key=cell_order)
+            changed = sorted([k for k in oc if k in nc_ and oc[k] != nc_[k]],
+                             key=cell_order)
 
         merged_unscanned = bool(oi.get('merged_skipped_cells')
                                 or ni.get('merged_skipped_cells'))
@@ -791,33 +1061,124 @@ def cmd_snapshot_diff(args):
         os_, odup = shape_map(oi)
         ns_, ndup = shape_map(ni)
         shape_dup = odup | ndup
-        s_add = sorted([n2 for n2 in ns_ if n2 not in os_])
-        s_del = sorted([n2 for n2 in os_ if n2 not in ns_])
-        s_chg = []
-        for n2 in sorted(set(os_) & set(ns_)):
-            a, b = os_[n2], ns_[n2]
-            fields = []
-            if a.get('text') != b.get('text'):
-                fields.append(f"文字 '{clip(a.get('text'))}'→'{clip(b.get('text'))}'")
-            if a.get('onaction') != b.get('onaction'):
-                fields.append(f"OnAction {a.get('onaction')}→{b.get('onaction')}")
-            if (a.get('l'), a.get('t')) != (b.get('l'), b.get('t')):
-                fields.append(f"位置 ({a.get('l')},{a.get('t')})→({b.get('l')},{b.get('t')})")
-            if fields:
-                s_chg.append((n2, fields))
+        s_add, s_del, s_chg = [], [], []
+        if not shapes_unreadable:
+            s_add = sorted([n2 for n2 in ns_ if n2 not in os_])
+            s_del = sorted([n2 for n2 in os_ if n2 not in ns_])
+            for n2 in sorted(set(os_) & set(ns_)):
+                a, b = os_[n2], ns_[n2]
+                fields = []
+                if a.get('text') != b.get('text'):
+                    fields.append(f"文字 '{clip(a.get('text'))}'→'{clip(b.get('text'))}'")
+                if a.get('onaction') != b.get('onaction'):
+                    fields.append(f"OnAction {a.get('onaction')}→{b.get('onaction')}")
+                if (a.get('l'), a.get('t')) != (b.get('l'), b.get('t')):
+                    fields.append(f"位置 ({a.get('l')},{a.get('t')})→({b.get('l')},{b.get('t')})")
+                if (a.get('w'), a.get('h')) != (b.get('w'), b.get('h')):
+                    fields.append(f"大きさ ({a.get('w')}x{a.get('h')})→({b.get('w')}x{b.get('h')})")
+                if fields:
+                    s_chg.append((n2, fields))
+
+        # --- 書式の差分（四つ目の目）---
+        # None は「その範囲の中で不揃い」を意味する（欠測ではない）。
+        # 片側でも書式を読めていなければ比較を降りる（疑似差分を出さない）。
+        # 判定は上の unreadable_parts と同じものを使う（二重に持つと食い違う）
+        fmt_unreadable = _fmt_err
+        fmt_missing = _fmt_missing            # 片方だけ --no-format で採った
+        of_, nf_ = oi.get('format') or {}, ni.get('format') or {}
+        f_chg = []
+        if not fmt_unreadable and of_ and nf_:
+            def _fmt_label(k):
+                return {'bold': '太字', 'size': '文字サイズ', 'font': 'フォント',
+                        'italic': '斜体', 'color': '文字色', 'fill': '塗り',
+                        'numfmt': '表示形式', 'border': '罫線', 'halign': '横位置',
+                        'w': '列幅', 'h': '行高', 'hidden': '非表示'}.get(k, k)
+
+            # シート全体で起きた変化（例: 全体の罫線が消えた）は、各列・各行でも
+            # 同じ内容で観測される。それを列ぶん・行ぶん繰り返すと、シート全体の
+            # 一撃が数十件に膨れて読めなくなる（＝検分結果として役に立たない）。
+            # 「シート全体の変化と同じ(旧値→新値)」の項目は、列・行では繰り返さない。
+            # 局所的な変化（その列だけ幅が変わった等）はそのまま出る。
+            sheet_chg = {}
+
+            def _diff_fmt(a, b, where, skip_same_as_sheet=False):
+                for k in sorted(set(a) | set(b)):
+                    va, vb = a.get(k), b.get(k)
+                    if va == vb:
+                        continue
+                    if skip_same_as_sheet and sheet_chg.get(k) == (va, vb):
+                        continue          # シート全体の変化で説明がつく＝繰り返さない
+                    f_chg.append(f"{where}{_fmt_label(k)} {va} → {vb}")
+
+            os_f, ns_f = of_.get('sheet') or {}, nf_.get('sheet') or {}
+            for k in sorted(set(os_f) | set(ns_f)):
+                if os_f.get(k) != ns_f.get(k):
+                    sheet_chg[k] = (os_f.get(k), ns_f.get(k))
+            _diff_fmt(os_f, ns_f, 'シート全体: ')
+            oc_f, nc_f = of_.get('cols') or {}, nf_.get('cols') or {}
+            for k in sorted(set(oc_f) | set(nc_f), key=lambda s: (len(s), s)):
+                _diff_fmt(oc_f.get(k) or {}, nc_f.get(k) or {}, f'{k}列: ',
+                          skip_same_as_sheet=True)
+            # --- 行の書式（同じ書式が続く塊で持っている）---
+            # 前後で塊の切れ目は一致しない（見出しが太字でなくなれば塊は繋がる）。
+            # そこで両者の境目を突き合わせ、重なる区間ごとに比べる。
+            def _blocks(x):
+                bs = x.get('row_blocks')
+                if bs:
+                    return [(int(b['r0']), int(b['r1']),
+                             {k: v for k, v in b.items() if k not in ('r0', 'r1')})
+                            for b in bs]
+                # 旧形式（行ごとの dict）の snapshot とも比べられるようにする
+                rows_old = x.get('rows') or {}
+                return [(int(k), int(k), v) for k, v in rows_old.items() if k.isdigit()]
+
+            ob, nb = _blocks(of_), _blocks(nf_)
+            if ob and nb:
+                # 両者の境目を集めて区間に割る（重なる範囲だけを比べる＝
+                # 片側にしか無い行を「変わった」と誤報しない）
+                lo = max(min(b[0] for b in ob), min(b[0] for b in nb))
+                hi = min(max(b[1] for b in ob), max(b[1] for b in nb))
+                cuts = {lo, hi + 1}
+                for r0, r1, _ in ob + nb:
+                    if lo <= r0 <= hi:
+                        cuts.add(r0)
+                    if lo <= r1 + 1 <= hi + 1:
+                        cuts.add(r1 + 1)
+                edges = sorted(c for c in cuts if lo <= c <= hi + 1)
+
+                def _at(bs, r):
+                    for r0, r1, d in bs:
+                        if r0 <= r <= r1:
+                            return d
+                    return None
+
+                for i in range(len(edges) - 1):
+                    a0, a1 = edges[i], edges[i + 1] - 1
+                    if a0 > a1:
+                        continue
+                    da, db = _at(ob, a0), _at(nb, a0)
+                    if da is None or db is None:
+                        continue
+                    where = f'{a0}行: ' if a0 == a1 else f'{a0}〜{a1}行: '
+                    _diff_fmt(da, db, where, skip_same_as_sheet=True)
 
         def table_map(info):
             return {t['name']: t.get('address') for t in info.get('tables', ())}
         ot, nt = table_map(oi), table_map(ni)
-        t_add = sorted([n2 for n2 in nt if n2 not in ot])
-        t_del = sorted([n2 for n2 in ot if n2 not in nt])
-        t_chg = sorted([n2 for n2 in ot if n2 in nt and ot[n2] != nt[n2]])
+        if tables_unreadable:
+            t_add, t_del, t_chg = [], [], []
+        else:
+            t_add = sorted([n2 for n2 in nt if n2 not in ot])
+            t_del = sorted([n2 for n2 in ot if n2 not in nt])
+            t_chg = sorted([n2 for n2 in ot if n2 in nt and ot[n2] != nt[n2]])
 
         has_diff = any((added, removed, changed, m_add, m_del,
-                        s_add, s_del, s_chg, t_add, t_del, t_chg,
+                        s_add, s_del, s_chg, t_add, t_del, t_chg, f_chg,
                         oi.get('dims') != ni.get('dims')))
         if not has_diff:
             # シート自体を表示しない場合も、比較できなかった事実は落とさない
+            if unreadable_parts:
+                unread_note_hidden.append(f"{name}（{'・'.join(unreadable_parts)}）")
             if merged_unscanned:
                 merged_note_hidden.append(name)
             if cell_limit is not None:
@@ -836,6 +1197,9 @@ def cmd_snapshot_diff(args):
             tail = f"（全{total}行）" if total else ""
             print(f"  ※ 打ち切られた snapshot のため、セルは {cell_limit}行までしか比較していません"
                   f"{tail}＝それ以降の行の変更は検出できません")
+        if unreadable_parts:
+            print(f"  ※ {'・'.join(unreadable_parts)}を読めなかった snapshot です"
+                  "＝その差分は比較していません（「消えた」ではありません）")
         if merged_unscanned:
             print("  ※ 結合セル未走査の snapshot（範囲が大）＝結合の差分は比較していない")
         if shape_dup:
@@ -866,7 +1230,17 @@ def cmd_snapshot_diff(args):
             show("テーブル削除", t_del, lambda n2: f"{n2} ({ot[n2]})")
         if t_chg:
             show("テーブル範囲変更", t_chg, lambda n2: f"{n2}: {ot[n2]} → {nt[n2]}")
+        if f_chg:
+            show("書式変更", f_chg, lambda s: s)
+        if fmt_unreadable:
+            print("  ※ 書式を読めなかった snapshot です＝書式の差分は比較していません")
+        elif fmt_missing:
+            print("  ※ 片方の snapshot が --no-format で採られています"
+                  "＝書式の差分は比較していません")
 
+    if unread_note_hidden:
+        print(f"\n※ 読み取りに失敗した snapshot のため、次のシートは比較できていません: "
+              f"{', '.join(unread_note_hidden)}")
     if merged_note_hidden:
         print(f"\n※ 結合セル未走査の snapshot のため、次のシートは結合の差分を比較できていません: "
               f"{', '.join(merged_note_hidden)}")
@@ -876,8 +1250,17 @@ def cmd_snapshot_diff(args):
     print("\n" + "-" * 60)
     if diff_sheets:
         print(f"差分あり: シート{diff_sheets}枚に変更")
+    elif unread_any:
+        # 読めなかったシートがある状態で「一致」と言ってはいけない
+        print("差分なし（ただし読み取りに失敗した箇所があり、そこは比較できていません）")
     else:
-        print("差分なし（2つのスナップショットは一致）")
+        # snapshot が見ているのは 値・結合・書式・図形・テーブル。
+        # 書式は「シート全体／列／行」の粒度で見ており、セル1つ単位ではない
+        # （セル単位は1万セルで33秒かかり実用にならない＝実測）。
+        # 見ている範囲を正確に言い、それ以上を保証したように読ませない。
+        print("差分なし（値・結合・書式・図形・テーブルの範囲で一致）")
+        print("  ※ 書式はシート全体／列／行の単位で比較しています"
+              "（同じ行・列の中だけで打ち消し合う変更は検出できません）")
     return True
 
 
