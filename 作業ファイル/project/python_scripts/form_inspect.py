@@ -75,7 +75,10 @@ def _normalize_type(t):
         return t
     if t in _TYPE_NORMALIZE:
         return _TYPE_NORMALIZE[t]
-    # 既に一般名（Label/TextBox…）ならそのまま。未知のI〜名は接頭Iを外して返す
+    # 既に一般名（Label/TextBox…）ならそのまま。辞書に無い I〜名は、辞書のキーと
+    # 部分一致すればその一般名に寄せ、どれとも一致しなければ受け取った名前を
+    # そのまま返す（接頭 I は外さない。判定側は startswith で見るので、
+    # 素性の分からない型を勝手に一般名らしく見せない方が安全）
     if t.startswith("I") and len(t) > 1 and t[1].isupper():
         for key, val in _TYPE_NORMALIZE.items():
             if key.lower() in t.lower():
@@ -351,8 +354,13 @@ def lint_form(form_name, info, controls, code=None):
 
     # 5. TabIndex が視線順（上→下、左→右）と食い違う
     #    行内の上下中央合わせでラベルと入力の top はずれるため、比較は「上下中央」で行う
+    #    ListBox は比較から外す。一覧系フォームは ListBox が TabIndex 0（開いた瞬間の
+    #    フォーカスが一覧＝PageDown が効く）のが正で、画面上は下にあっても正しい。
+    #    ここで「不一致」と報告すると、それを見た者が tab-order で視線順に「直し」て
+    #    フォーカスを壊す（2026-07-11 実害）。
     tabbed = [c for c in ok_items if c["tab_index"] is not None
-              and c["parent"] in (None, form_name)]
+              and c["parent"] in (None, form_name)
+              and not (c.get("type") or "").startswith("ListBox")]
     visual = sorted(tabbed, key=lambda c: (round((c["top"] + c["height"] / 2) / 14), c["left"]))
     actual = sorted(tabbed, key=lambda c: c["tab_index"])
     mism = [(v["name"]) for v, a in zip(visual, actual) if v["name"] != a["name"]]
@@ -477,55 +485,65 @@ def _cluster_rows(items):
     return rows
 
 
-def _emit_elem(c, max_right):
+def _tab_arg(c, tab_map):
+    """tab_map に載っているコントロールだけ tab_index=N を明示する引数文字列"""
+    if tab_map and c["name"] in tab_map:
+        return f", tab_index={tab_map[c['name']]}"
+    return ""
+
+
+def _emit_elem(c, max_right, tab_map=None):
     """1コントロールを form_layout の要素式に変換する。未対応種別は None"""
     t = c.get("type") or ""
     name = c["name"]
     cap = (c.get("caption") or "").replace('"', '\\"')
     stretch = abs((c["left"] + c["width"]) - max_right) <= 1 if max_right else False
     w_arg = "" if stretch else f", width={c['width']:g}"
+    ti = _tab_arg(c, tab_map)
 
     if t.startswith("Label"):
         b = ", bold=True" if c.get("bold") else ""
-        return f'lbl("{cap}"{b})'
+        # ラベルも実名を出す。名前を捨てると受け側が lbl1, lbl2... と機械採番し、
+        # VBA が lblStatus.Caption = ... と名指ししていた参照が黙って切れる
+        return f'lbl("{cap}", name="{name}"{b}{ti})'
     if t.startswith("TextBox"):
         h = f", height={c['height']:g}" if abs(c["height"] - 22) > 1 else ""
         ml = ", multiline=True" if c.get("multiline") else ""
-        return f'txt("{name}"{w_arg}{h}{ml})'
+        return f'txt("{name}"{w_arg}{h}{ml}{ti})'
     if t.startswith("ComboBox"):
-        return f'combo("{name}"{w_arg})'
+        return f'combo("{name}"{w_arg}{ti})'
     if t.startswith("ListBox"):
-        return f'lst("{name}"{w_arg}, height={c["height"]:g})'
+        return f'lst("{name}"{w_arg}, height={c["height"]:g}{ti})'
     if t.startswith("CheckBox"):
-        return f'chk("{name}", "{cap}")'
+        return f'chk("{name}", "{cap}"{ti})'
     if t.startswith("OptionButton"):
         g = f', group="{c["group"]}"' if c.get("group") else ""
-        return f'opt("{name}", "{cap}"{g})'
+        return f'opt("{name}", "{cap}"{g}{ti})'
     if t.startswith("CommandButton"):
         acc = f', accel="{c["accelerator"]}"' if c.get("accelerator") else ""
         if c.get("cancel"):
-            return f'cancel("{name}", "{cap}"{acc})'
+            return f'cancel("{name}", "{cap}"{acc}{ti})'
         if c.get("default"):
-            return f'ok("{name}", "{cap}"{acc})'
-        return f'btn("{name}", "{cap}"{acc})'
+            return f'ok("{name}", "{cap}"{acc}{ti})'
+        return f'btn("{name}", "{cap}"{acc}{ti})'
     return None
 
 
-def _emit_cluster(r, max_right, indent):
+def _emit_cluster(r, max_right, indent, tab_map=None):
     """1行クラスタ→宣言コード行（spacer は呼び出し側でブロック間ギャップから出す）"""
     types = [(c.get("type") or "") for c in r]
     # 見出し: 太字ラベル単独の行
     if len(r) == 1 and types[0].startswith("Label") and r[0].get("bold"):
         cap = (r[0].get("caption") or "").replace('"', '\\"')
-        return f'{indent}heading("{cap}"),'
+        return f'{indent}heading("{cap}", name="{r[0]["name"]}"),'
     # ボタンバー: ボタンだけの行（通常は最終行・右寄せ）
     if all(t.startswith("CommandButton") for t in types):
-        parts = [_emit_elem(c, 0) for c in r]
+        parts = [_emit_elem(c, 0, tab_map) for c in r]
         return f"{indent}button_bar({', '.join(p for p in parts if p)}),"
     parts = []
     skipped = []
     for c in r:
-        p = _emit_elem(c, max_right)
+        p = _emit_elem(c, max_right, tab_map)
         if p:
             parts.append(p)
         else:
@@ -536,17 +554,17 @@ def _emit_cluster(r, max_right, indent):
     return line
 
 
-def _blocks_of(items, max_right, indent):
+def _blocks_of(items, max_right, indent, tab_map=None):
     """行クラスタを (top, bottom, [コード行]) のブロック列にする"""
     blocks = []
     for r in _cluster_rows(items):
         top = min(c["top"] for c in r)
         bottom = max(c["top"] + c["height"] for c in r)
-        blocks.append((top, bottom, [_emit_cluster(r, max_right, indent)]))
+        blocks.append((top, bottom, [_emit_cluster(r, max_right, indent, tab_map)]))
     return blocks
 
 
-def _frame_block(fr, ok_items, indent):
+def _frame_block(fr, ok_items, indent, tab_map=None):
     """Frame コントロールを frame(...) 宣言ブロックに展開する。
 
     トップレベルの frame と page 内の frame の両方から使う共通経路。
@@ -559,10 +577,44 @@ def _frame_block(fr, ok_items, indent):
     c_inputs = [c for c in children
                 if (c.get("type") or "").startswith(("TextBox", "ComboBox", "ListBox"))]
     c_right = max((c["left"] + c["width"] for c in c_inputs), default=0)
-    for _, _, lines_ in _blocks_of(children, c_right, indent + "    "):
+    for _, _, lines_ in _blocks_of(children, c_right, indent + "    ", tab_map):
         fl.extend(lines_)
-    fl.append(f"{indent}),")
+    fl.append(f'{indent}    name="{fr["name"]}"{_tab_arg(fr, tab_map)}),')
     return (fr["top"], fr["top"] + fr["height"], fl)
+
+
+def _decl_order(plain_items, container_items):
+    """宣言（＝build_form の配置）順のコントロール名を返す。
+
+    build_form の TabIndex 自動採番はこの順に 0,1,2... と振る。to_layout_code の
+    ブロック並び（top 順・行内は left 順、frame/multipage はそれ自体で1ブロック）
+    と一致させてある。
+    """
+    entries = []
+    for r in _cluster_rows(plain_items):
+        top = min(c["top"] for c in r)
+        for i, c in enumerate(r):      # _cluster_rows は行内を left 昇順に並べる
+            entries.append((top, i, c["name"]))
+    for c in container_items:
+        entries.append((c["top"], 0, c["name"]))
+    entries.sort(key=lambda e: (e[0], e[1]))
+    return [n for _, _, n in entries]
+
+
+def _tab_overrides(order, by_name):
+    """自動採番（宣言順）と実際の TabIndex が食い違う分だけ、明示指定の dict を返す。
+
+    TabIndex はどこにも出力されていなかったため、往復すると受け側が配置順で
+    振り直していた。一覧系フォームの「ListBox が TabIndex 0」のような、
+    配置順では表せない意図がここで消える。食い違うときだけ明示する
+    （一致していれば自動採番に任せて生成コードを汚さない）。
+    """
+    have = [n for n in order if by_name.get(n, {}).get("tab_index") is not None]
+    if len(have) < 2:
+        return {}
+    if sorted(have, key=lambda n: by_name[n]["tab_index"]) == have:
+        return {}
+    return {n: by_name[n]["tab_index"] for n in have}
 
 
 def to_layout_code(form_name, info, controls):
@@ -583,11 +635,31 @@ def to_layout_code(form_name, info, controls):
               if (c.get("type") or "").startswith(("TextBox", "ComboBox", "ListBox"))]
     max_right = max((c["left"] + c["width"] for c in inputs), default=0)
 
+    # TabIndex はコンテナ（フォーム / Frame / Page）ごとの番号なので、
+    # 「宣言順の自動採番と食い違うか」もコンテナ単位で判定する
+    by_name = {c["name"]: c for c in ok_items}
+    tab_map = dict(_tab_overrides(_decl_order(top_items, frames + mpages), by_name))
+
+    def _add_frame_tabs(fr):
+        kids = [c for c in ok_items if c["parent"] == fr["name"]]
+        tab_map.update(_tab_overrides(_decl_order(kids, []), by_name))
+
+    for fr in frames:
+        _add_frame_tabs(fr)
+    for mp in mpages:
+        for pg in mp.get("pages", []):
+            kids = [c for c in ok_items if c["parent"] == pg["name"]]
+            pg_frames = [c for c in kids if (c.get("type") or "").startswith("Frame")]
+            plain = [c for c in kids if not (c.get("type") or "").startswith("Frame")]
+            tab_map.update(_tab_overrides(_decl_order(plain, pg_frames), by_name))
+            for fr in pg_frames:
+                _add_frame_tabs(fr)
+
     # 通常行とフレームを (top, bottom, 行リスト) のブロックに統一して top 順に並べ、
     # ブロック間の縦ギャップから spacer を推定する（フレームの高さも正しく反映される）
-    blocks = _blocks_of(top_items, max_right, "    ") if top_items else []
+    blocks = _blocks_of(top_items, max_right, "    ", tab_map) if top_items else []
     for fr in frames:
-        blocks.append(_frame_block(fr, ok_items, "    "))
+        blocks.append(_frame_block(fr, ok_items, "    ", tab_map))
     for mp in mpages:
         ml = [f'    multipage("{mp["name"]}",']
         for pg in mp.get("pages", []):
@@ -603,13 +675,15 @@ def to_layout_code(form_name, info, controls):
             c_inputs = [c for c in plain
                         if (c.get("type") or "").startswith(("TextBox", "ComboBox", "ListBox"))]
             c_right = max((c["left"] + c["width"] for c in c_inputs), default=0)
-            pblocks = _blocks_of(plain, c_right, "            ") if plain else []
+            pblocks = _blocks_of(plain, c_right, "            ", tab_map) if plain else []
             for fr in pg_frames:
-                pblocks.append(_frame_block(fr, ok_items, "            "))
+                pblocks.append(_frame_block(fr, ok_items, "            ", tab_map))
             pblocks.sort(key=lambda b: b[0])
             for _, _, lines_ in pblocks:
                 ml.extend(lines_)
             ml.append("        ),")
+        if mp["name"] in tab_map:
+            ml.append(f'        tab_index={tab_map[mp["name"]]},')
         ml.append("    ),")
         blocks.append((mp["top"], mp["top"] + mp["height"], ml))
     blocks.sort(key=lambda b: b[0])
@@ -714,6 +788,13 @@ def render_form_png(xl, wb, form_name, out_path, echo=print, overlay=None,
       "ThunderDFrame" ウィンドウを TOPMOST 化して BitBlt で撮る
       （PrintWindow は黒帯が出るので使わない）。
       finally で Unload と一時モジュール削除。保存したパスを返す（失敗時 None）。
+
+      後始末の原則:
+      - 一時モジュールの出し入れでブックが「未保存」に落ちないよう、撮影前の
+        wb.Saved を控えて後で戻す（「目」であるはずの --png がブックを汚さない）。
+      - Unload に失敗するとフォームはモードレス表示のまま残る。そこで一時
+        モジュールまで消すと閉じる手段が無くなるので、失敗時はモジュールを
+        残して閉じ方を案内する（黙って握りつぶさない）。
     """
     import time
     import ctypes
@@ -727,6 +808,13 @@ def render_form_png(xl, wb, form_name, out_path, echo=print, overlay=None,
         pass
 
     vbp = wb.VBProject
+    # 一時モジュールの Add/Remove でブックは「未保存」に落ちる。撮影前の状態を
+    # 控えておき、後始末まで済んだら戻す（--png は見るだけの操作＝ブックを汚さない）
+    was_saved = None
+    try:
+        was_saved = bool(wb.Saved)
+    except Exception as e:
+        echo(f"  wb.Saved の取得に失敗（保存状態の復元はスキップ）: {e}")
     # 撮影対象の特定用に Caption を控える。クラス名だけの FindWindow だと、
     # ユーザーが別フォームをモードレス表示中に「別の窓」を撮ってしまう
     form_caption = None
@@ -845,15 +933,30 @@ def render_form_png(xl, wb, form_name, out_path, echo=print, overlay=None,
                         pass
         return saved
     finally:
+        unload_failed = False
         if shown:
             try:
                 xl.Run(pre + "tmpFormInspectUnload")
-            except Exception:
-                pass
-        try:
-            vbp.VBComponents.Remove(mod)
-        except Exception:
-            pass
+            except Exception as e:
+                unload_failed = True
+                echo(f"⚠ フォーム {form_name} の Unload に失敗しました: {e}")
+                echo("  フォームがモードレス表示のまま残っている可能性があります。"
+                     "閉じる手段として一時モジュールを残します"
+                     f"（Excel で {pre}tmpFormInspectUnload を実行、"
+                     f"またはフォームの × で閉じてから {mod.Name} を削除してください）。")
+        if not unload_failed:
+            try:
+                vbp.VBComponents.Remove(mod)
+            except Exception as e:
+                unload_failed = True   # 掃除しきれていない＝保存状態は戻さない
+                echo(f"⚠ 一時モジュール {mod.Name} の削除に失敗しました: {e}")
+        # 後始末が完了したときだけ保存状態を戻す。残置物があるのに Saved=True に
+        # すると「変更なし」の顔で本当の変更を隠してしまう
+        if was_saved and not unload_failed:
+            try:
+                wb.Saved = True
+            except Exception as e:
+                echo(f"⚠ wb.Saved の復元に失敗（ブックが未保存状態のままです）: {e}")
 
 
 def main():

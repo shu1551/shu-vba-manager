@@ -248,9 +248,14 @@ def cmd_read_range(args):
     specs = rest if rest else [None]
     use_formula = getattr(args, 'formula', False)
     try:
-        width = int(getattr(args, 'width', None) or 40)
+        # `or 40` だと --width 0 が偽値で既定値に化ける（指定が無言で消える）ため is None 判定
+        w_opt = getattr(args, 'width', None)
+        width = 40 if w_opt is None else int(w_opt)
     except (TypeError, ValueError):
         print("エラー: --width は数値で指定してください")
+        return False
+    if width < 1:
+        print("エラー: --width は 1 以上で指定してください")
         return False
     tsv_out = getattr(args, 'tsv_out', None)
     if tsv_out is not None and len(specs) > 1:
@@ -543,8 +548,10 @@ def cmd_snapshot(args):
         shapes = []
         try:
             _collect_shapes(sh.Shapes, shapes)
-        except Exception:
-            pass
+        except Exception as e:
+            # 黙って落とすと「図形なし」と見分けがつかず、後の snapshot-diff で
+            # 図形の消失/追加を取り違える。読めなかった事実を JSON とサマリに残す
+            info["shapes_error"] = str(e)
         if shapes:
             info["shapes"] = shapes
 
@@ -578,13 +585,43 @@ def cmd_snapshot(args):
             parts.append("結合未走査(大)")
         if "shapes" in info:
             parts.append(f"図形{len(info['shapes'])}")
+        if "shapes_error" in info:
+            parts.append("図形読取不可")
         if "tables" in info:
             parts.append(f"表{len(info['tables'])}")
         mark = '*' if name == active else ' '
         print(f"{mark} {name}: " + "  ".join(p for p in parts if p))
     print("-" * 60)
+    # 図形を列挙できなかったシートは警告として明示する（「図形0」に見せない）
+    shape_err = [(n, i["shapes_error"]) for n, i in sheets.items() if "shapes_error" in i]
+    if shape_err:
+        print("⚠ 次のシートは図形を読み取れませんでした（このJSONでは図形なしと区別できません）:")
+        for n, e in shape_err:
+            print(f"   {n}: {e}")
+        print("-" * 60)
     print("このJSONを read して質問すれば、開いたままブックLMになる。")
     return True
+
+
+def _cell_compare_limit(old_info, new_info):
+    """snapshot 2つのシート情報から「セルを比較してよい行の上限」を返す（無ければ None）。
+
+    snapshot は --max-rows で読み込む行を打ち切る（cells_truncated に記録）。
+    打ち切りは「そこから下は読んでいない」だけで「空だった」ではないため、
+    打ち切り行より下を比較すると片側だけ空＝疑似差分になる。両側の read_rows の
+    小さい方（打ち切りが片側だけなら、その値）を上限として返す。
+    """
+    limits = []
+    for info in (old_info, new_info):
+        t = info.get('cells_truncated') or {}
+        r = t.get('read_rows')
+        try:
+            r = int(r)
+        except (TypeError, ValueError):
+            continue
+        if r > 0:
+            limits.append(r)
+    return min(limits) if limits else None
 
 
 def cmd_snapshot_diff(args):
@@ -604,9 +641,14 @@ def cmd_snapshot_diff(args):
     new_path = (os.path.abspath(args.posargs[1]) if len(args.posargs) >= 2
                 else _LAST_SNAPSHOT_FILE)
     try:
-        max_show = int(getattr(args, 'max_opt', None) or 20)
+        # `or 20` だと --max 0（件数だけ見たい）が偽値で既定に化けるため is None 判定
+        m_opt = getattr(args, 'max_opt', None)
+        max_show = 20 if m_opt is None else int(m_opt)
     except (TypeError, ValueError):
         print("エラー: --max は数値で指定してください")
+        return False
+    if max_show < 0:
+        print("エラー: --max は 0 以上で指定してください（0 は件数のみ表示）")
         return False
 
     docs = []
@@ -660,6 +702,7 @@ def cmd_snapshot_diff(args):
     old_sheets, new_sheets = old['sheets'], new['sheets']
     diff_sheets = 0
     merged_note_hidden = []   # 結合未走査で比較できず、かつ他に差分がなく非表示のシート
+    trunc_note_hidden = []    # セル打ち切りで一部しか比較できず、かつ他に差分がなく非表示のシート
 
     for name in [n for n in old_sheets if n not in new_sheets]:
         diff_sheets += 1
@@ -673,6 +716,14 @@ def cmd_snapshot_diff(args):
         oi, ni = old_sheets[name], new_sheets[name]
 
         oc, nc_ = cell_map(oi), cell_map(ni)
+        # 片側だけ --max-rows で打ち切った snapshot をそのまま比べると、打ち切り行より
+        # 下は「片側だけ空」＝実際は無変更なのに丸ごとセル追加/削除に化ける。
+        # 結合（merged_skipped_cells）で比較を降りるのと同じ扱いで、比較する行を
+        # 両者の read_rows の小さい方までに切り詰める（切り詰めた事実は必ず表示する）。
+        cell_limit = _cell_compare_limit(oi, ni)
+        if cell_limit is not None:
+            oc = {k: v for k, v in oc.items() if k[0] <= cell_limit}
+            nc_ = {k: v for k, v in nc_.items() if k[0] <= cell_limit}
         added = sorted([k for k in nc_ if k not in oc], key=cell_order)
         removed = sorted([k for k in oc if k not in nc_], key=cell_order)
         changed = sorted([k for k in oc if k in nc_ and oc[k] != nc_[k]],
@@ -725,17 +776,25 @@ def cmd_snapshot_diff(args):
                         s_add, s_del, s_chg, t_add, t_del, t_chg,
                         oi.get('dims') != ni.get('dims')))
         if not has_diff:
+            # シート自体を表示しない場合も、比較できなかった事実は落とさない
             if merged_unscanned:
-                # シート自体を表示しない場合も、比較できなかった事実は落とさない
                 merged_note_hidden.append(name)
+            if cell_limit is not None:
+                trunc_note_hidden.append(f"{name}（{cell_limit}行まで）")
             continue
         diff_sheets += 1
         print(f"\n* シート: {name}")
         if oi.get('dims') != ni.get('dims'):
             print(f"  使用範囲: {oi.get('dims')} → {ni.get('dims')}")
-        trunc = oi.get('cells_truncated') or ni.get('cells_truncated')
-        if trunc:
-            print(f"  ※ セルは {trunc['read_rows']}行で打ち切られた snapshot ＝比較もその範囲まで")
+        if cell_limit is not None:
+            total = None
+            for _i in (oi, ni):
+                t = _i.get('cells_truncated') or {}
+                if t.get('total_rows'):
+                    total = max(total or 0, int(t['total_rows']))
+            tail = f"（全{total}行）" if total else ""
+            print(f"  ※ 打ち切られた snapshot のため、セルは {cell_limit}行までしか比較していません"
+                  f"{tail}＝それ以降の行の変更は検出できません")
         if merged_unscanned:
             print("  ※ 結合セル未走査の snapshot（範囲が大）＝結合の差分は比較していない")
         if shape_dup:
@@ -770,6 +829,9 @@ def cmd_snapshot_diff(args):
     if merged_note_hidden:
         print(f"\n※ 結合セル未走査の snapshot のため、次のシートは結合の差分を比較できていません: "
               f"{', '.join(merged_note_hidden)}")
+    if trunc_note_hidden:
+        print(f"\n※ 打ち切られた snapshot のため、次のシートはセルを途中までしか比較できていません: "
+              f"{', '.join(trunc_note_hidden)}")
     print("\n" + "-" * 60)
     if diff_sheets:
         print(f"差分あり: シート{diff_sheets}枚に変更")
@@ -813,11 +875,15 @@ def cmd_wiring(args):
         vba_error = e
 
     rows = []
+    unread_sheets = []          # 図形を列挙できず、配線図から丸ごと落ちたシート
     for sh in wb.Worksheets:
         shapes = []
         try:
             _collect_shapes(sh.Shapes, shapes)
-        except Exception:
+        except Exception as e:
+            # 黙って continue すると、そのシートのボタンが1本も出ないまま
+            # 「行き先なし 0本」＝健全という誤った安心につながる
+            unread_sheets.append((sh.Name, str(e)))
             continue
         for s in shapes:
             macro = s.get('onaction')
@@ -847,7 +913,9 @@ def cmd_wiring(args):
         print(json.dumps({"success": True, "book": wb.Name,
                           "vba_readable": vba_error is None,
                           "wires": rows, "broken": len(broken),
-                          "external": len(external)},
+                          "external": len(external),
+                          "unread_sheets": [{"sheet": n, "error": e}
+                                            for n, e in unread_sheets]},
                          ensure_ascii=False))
         # JSON では broken フィールドが判定を運ぶ。ここで exit 1 にすると
         # success:true の JSON に MCP が「失敗しました」を付けて食い違う
@@ -862,8 +930,13 @@ def cmd_wiring(args):
     if vba_error is not None:
         print("※ VBA プロジェクトに触れないため実在確認は未実施（配線の一覧のみ）")
         print(f"   詳細: {vba_error}")
+    if unread_sheets:
+        print("⚠ 次のシートは図形を読み取れず、配線図に含まれていません（未検査）:")
+        for n, e in unread_sheets:
+            print(f"   {n}: {e}")
     if not rows:
-        print("OnAction が登録された図形/ボタンはありません")
+        print("OnAction が登録された図形/ボタンはありません"
+              + ("（ただし上記シートは未検査）" if unread_sheets else ""))
         return True
 
     cur = None
@@ -898,6 +971,10 @@ def cmd_wiring(args):
                 print(f"  {r['sheet']} / {label(r)} → {r['macro']}")
     else:
         print(f"配線 {len(rows)}本（実在確認なし）")
+    if unread_sheets:
+        # 未検査シートがある以上「行き先なし 0本」は健全の証明にならない
+        print(f"※ 図形を読み取れなかったシートが {len(unread_sheets)}枚あります"
+              f"（{', '.join(n for n, _ in unread_sheets)}）＝この配線図は全数ではありません")
     print("参考: マクロ側から見た地図は call-graph（孤立検出）/ docs（マクロ→ボタン逆引き）")
     return not broken
 
@@ -989,6 +1066,7 @@ def _screenshot_cleanup(xl, ws):
 
 __all__ = [
     'LAST_VIEW_FILE',
+    '_cell_compare_limit',
     '_collect_shapes',
     '_disp_pad',
     '_disp_truncate',

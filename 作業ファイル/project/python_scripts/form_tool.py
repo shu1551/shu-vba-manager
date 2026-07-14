@@ -39,10 +39,24 @@ import re
 import sys
 import time
 
-from form_inspect import get_active_excel
+from form_inspect import get_active_excel, _normalize_type
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKUP_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..', 'backups'))
+
+
+def _ctrl_type(ct):
+    """コントロールの型名を一般名で返す（取れなければ空文字）。
+
+    生の型名は IMdcList / IMdcTextBox のような内部名なので、form_inspect と
+    同じ辞書で ListBox / TextBox 等に正規化する（生名のまま 'listbox' を
+    探しても IMdcList には当たらない）。
+    """
+    try:
+        raw = ct._oleobj_.GetTypeInfo().GetDocumentation(-1)[0] or ""
+    except Exception:
+        return ""
+    return _normalize_type(raw) or ""
 
 
 def backup_form(wb, comp):
@@ -231,6 +245,14 @@ def cmd_align(args):
 
 
 def cmd_rename(args):
+    # 新しい名前はイベントプロシージャ宣言行（Sub <新名>_Click）にそのまま入る。
+    # 先頭 _ 等の無効な名前を通すと CodeModule に `Sub _新名_Click` が注入され、
+    # ツールは成功報告のままコンパイルで死ぬ。copy-form と同じガードを先に通す
+    # （COM に触る前＝フォームを改変する前に止める）
+    import vba_manager
+    reason = vba_manager.check_vba_identifier(args.new)
+    if reason:
+        sys.exit(f"'{args.new}' はコントロール名に使えません: {reason}")
     xl, wb, comp = connect_form(args.form)
     backup_form(wb, comp)
     names = []
@@ -282,6 +304,11 @@ def cmd_move(args):
 
 def cmd_size_match(args):
     """同サイズ化: size-match <form> <controls,> [--ref 基準名] [--width-only|--height-only]"""
+    # 両方指定すると下の分岐が両方とも偽になり、何もせず「成功」で終わる
+    # （サイレント no-op）。意図が矛盾しているので受け付けない
+    if args.width_only and args.height_only:
+        sys.exit("--width-only と --height-only は同時に指定できません"
+                 "（両方指定すると幅も高さも変えない no-op になります）。")
     xl, wb, comp = connect_form(args.form)
     ctrls = pick_controls(comp, args.controls)
     if args.ref:
@@ -361,6 +388,22 @@ def cmd_tab_order(args):
         order = " → ".join(ct.Name for ct in ctrls[:10]) + ("…" if len(ctrls) > 10 else "")
         print(f"TabIndex を指定順に整列: {order}")
     else:
+        # 一覧系フォームは ListBox が TabIndex 0（開いた瞬間のフォーカスが一覧にあり、
+        # PageDown で送れる）のが正。視線順の自動整列は上部の検索欄・検索ボタンを
+        # 先頭に持ってきて ListBox を後ろへ落とすため、この配置を壊す（2026-07-11 実害）。
+        # 機械的な視線順では正解を決められないので、ListBox のあるフォームでは
+        # 自動整列を拒否し、--controls で明示させる。
+        listboxes = [ct.Name for ct in comp.Designer.Controls
+                     if _ctrl_type(ct).startswith('ListBox')]
+        if listboxes:
+            print(f"エラー: このフォームには ListBox があります: {', '.join(listboxes)}")
+            print("  一覧系フォームは ListBox が TabIndex 0（開いた瞬間のフォーカスが一覧）"
+                  "であることが多く、")
+            print("  視線順の自動整列はその配置を壊します（PageDown が効かなくなる）。")
+            print("  --controls で順序を明示してください。")
+            print(f"  例: py form_tool.py tab-order {args.form} "
+                  f"--controls {listboxes[0]},txt検索,btn検索")
+            return
         groups = {}
         for ct in comp.Designer.Controls:
             try:

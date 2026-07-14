@@ -482,7 +482,9 @@ def cmd_list_open(args):
         return True
     if not excel_running:
         print('Excelは起動していません')
-        return
+        # 「起動していません」は正常な状態報告であって異常ではない。
+        # ここだけ None を返すと終了コードが 1 になり他の分岐と不揃いになる
+        return True
     if not books:
         print('（開いているブックはありません）')
         return True
@@ -535,7 +537,10 @@ def cmd_list(args):
     """マクロ(プロシージャ)一覧"""
     load_addins = getattr(args, 'personal', False) or getattr(args, 'addin', False) or getattr(args, 'all', False)
     target_file, _ = parse_target_and_rest(args.posargs)
-    xl, default_wb = get_workbook(target_file, load_addins=load_addins)
+    # 参照するだけのコマンド。閉じたブックを自動で開く場合に Workbook_Open /
+    # Auto_Open を発火させないよう読み取り専用＋イベント無効で開く
+    # （既に開いているブックには影響しない）
+    xl, default_wb = get_workbook(target_file, load_addins=load_addins, readonly=True)
 
     # 全プロジェクトをリスト化 (ビジーエラー対策としてリトライ)
     import time
@@ -710,7 +715,8 @@ def cmd_list_modules(args):
     """モジュール一覧"""
     load_addins = getattr(args, 'personal', False) or getattr(args, 'addin', False) or getattr(args, 'all', False)
     target_file, _ = parse_target_and_rest(args.posargs)
-    xl, default_wb = get_workbook(target_file, load_addins=load_addins)
+    # 参照するだけのコマンド → 読み取り専用で開く（Workbook_Open を起こさない）
+    xl, default_wb = get_workbook(target_file, load_addins=load_addins, readonly=True)
 
     # 全プロジェクトをリスト化 (ビジーエラー対策としてリトライ)
     import time
@@ -955,7 +961,8 @@ def cmd_get(args):
     else:
         requests.append((None, rest[0]))
 
-    xl, wb = get_workbook(target_file)
+    # コードを読むだけ → 読み取り専用で開く（Workbook_Open を起こさない）
+    xl, wb = get_workbook(target_file, readonly=True)
 
     results = []
     for module_name, macro_name in requests:
@@ -1045,6 +1052,28 @@ def cmd_replace_procedure(args):
             break
     new_code = '\n'.join(code_lines) + '\n'
 
+    # コードファイルに2本以上のプロシージャが入っていたら弾く。
+    # get は複数のプロシージャを1ファイルに連結して書ける（cmd_get）が、
+    # replace-procedure は先頭1本の「領域」に全文を流し込むため、2本目以降は
+    # モジュール内の重複定義になりコンパイルエラーになる。MCP 経由は常に -y で
+    # 確認プロンプトも挟まらないので、文言の注意ではなく機械的に止める。
+    decl_names = []
+    for ln in code_lines:
+        s = ln.strip()
+        if not s or s.startswith("'") or re.match(r'^Rem\b', s, re.IGNORECASE):
+            continue
+        md = pattern.match(s)
+        if md:
+            decl_names.append(md.group(1))
+    if len(decl_names) > 1:
+        print(f"エラー: コードファイルに {len(decl_names)} 本のプロシージャが入っています:")
+        for dn in decl_names:
+            print(f"  - {dn}")
+        print("  replace-procedure は1本ずつ書き戻してください")
+        print("  （先頭の1本しか対象にならず、2本目以降は重複定義になります）。")
+        print("  まとめて差し替えるなら replace-module を使ってください。")
+        return False
+
     xl, wb = get_workbook(target_file)
 
     # --module 未指定時：同名プロシージャが複数モジュールにある場合はエラー
@@ -1100,14 +1129,26 @@ def cmd_replace_procedure(args):
     lead = 0
     while lead < len(old_all) and old_all[lead].strip() == '':
         lead += 1
-    trail = 0
-    while trail < len(old_all) - lead and old_all[len(old_all) - 1 - trail].strip() == '':
-        trail += 1
+    # 末尾は空行だけでなく「次プロシージャの宣言行」も削除範囲から外す。
+    # ProcCountLines の領域には次の宣言行が食い込むことがあり（1行完結 Sub の直後など）、
+    # get(_extract_proc) と new_code のサニタイザは同じ条件でその行を落とす。
+    # ここだけ削除範囲に含めると、消した宣言行が new_code から復元されず
+    # 次のプロシージャが宣言を失って壊れる（両者を対称に保つ）。
+    end = len(old_all)
+    while end - lead > 1:
+        last = old_all[end - 1].strip()
+        if last == '':
+            end -= 1
+        elif (pattern.match(last)
+              and not re.search(r'\bEnd\s+(?:Sub|Function)\b', last, re.IGNORECASE)):
+            end -= 1
+        else:
+            break
     eff_start = proc_start + lead
-    eff_count = proc_count - lead - trail
+    eff_count = end - lead
 
     import difflib
-    old_lines = old_all[lead:len(old_all) - trail]
+    old_lines = old_all[lead:end]
     new_lines = new_code.replace('\r\n', '\n').split('\n')
     if new_lines and new_lines[-1] == '': new_lines.pop()
 
@@ -1232,15 +1273,34 @@ def cmd_replace_procedure(args):
         if decl_idx > 0:
             print("  (宣言より上のコメント行は、Attribute方式では .bas 側の既存行を維持します)")
             new_lines = new_lines[decl_idx:]
+        # Attribute行の挿入位置は「宣言の実体が終わった直後」。
+        # 宣言が行継続 " _" で折り返している場合（Sub X(ByVal a As Long, _ ）に
+        # 1行目の直後へ入れると Attribute が継続行の前に割り込んで構文破壊になる。
+        # 読み取り側（上の attr_block 収集）と対称に、継続行を読み飛ばしてから入れる
+        insert_at = 1
+        while insert_at < len(new_lines) and re.search(r'\s_\s*$', new_lines[insert_at - 1]):
+            insert_at += 1
         for ai, al in enumerate(attr_block):
-            new_lines.insert(1 + ai, al)
+            new_lines.insert(insert_at + ai, al)
 
         # .bas 内の対象プロシージャを置換（Sub宣言行から End Sub まで）
         bas_lines[sub_line_idx:proc_end_idx + 1] = new_lines
         new_bas = '\r\n'.join(bas_lines)
 
+        # --force で CP932 に無い文字（絵文字・機種依存文字等）が混ざると
+        # ここで UnicodeEncodeError になる。生の例外で落とすと一時 .bas が残るので
+        # 握りつぶさず・分かる形で報告して片付ける
+        try:
+            encoded_bas = new_bas.encode('cp932')
+        except UnicodeEncodeError as ex:
+            bad = new_bas[ex.start:ex.end]
+            _remove_export_artifacts(tmp_bas)
+            print(f"エラー: 置換コードに CP932（Shift-JIS）で扱えない文字があります: {bad!r}")
+            print("  VBA モジュールは CP932 で保存されます。該当文字を通常の文字に置き換えてください。")
+            return False
+
         with open(tmp_bas, 'wb') as f:
-            f.write(new_bas.encode('cp932'))
+            f.write(encoded_bas)
 
         # Remove + Import（例外時も DisplayAlerts を戻し、一時ファイルを残さない）
         xl.DisplayAlerts = False
@@ -1954,7 +2014,8 @@ def cmd_export_module(args):
         return False
     module_name = rest[0]
 
-    xl, wb = get_workbook(target_file)
+    # 書き出すだけ（ブックは変更しない） → 読み取り専用で開く
+    xl, wb = get_workbook(target_file, readonly=True)
 
     # export-all と同じ Type 別拡張子を使う。フォームを .bas で書き出すと、
     # replace-module の「.frm なのに .frx が無い」ガードをすり抜けてしまう
@@ -1990,7 +2051,8 @@ def cmd_export_all(args):
 
     ext_map = {1: '.bas', 2: '.cls', 3: '.frm', 100: '.cls'}
 
-    xl, wb = get_workbook(target_file)
+    # 書き出すだけ（ブックは変更しない） → 読み取り専用で開く
+    xl, wb = get_workbook(target_file, readonly=True)
     exported = []
     skipped = 0
     for comp in wb.VBProject.VBComponents:
@@ -2116,9 +2178,11 @@ def cmd_restore(args):
 def cmd_list_shortcuts(args):
     """ショートカットキーが設定されているマクロの一覧表示"""
     target_file, _ = parse_target_and_rest(args.posargs)
-    xl, wb = get_workbook(target_file)
+    # Export して読むだけ（ブックは変更しない） → 読み取り専用で開く
+    xl, wb = get_workbook(target_file, readonly=True)
 
     shortcuts = []
+    unread = []      # Export に失敗して中身を見られなかったモジュール
 
     for comp in wb.VBProject.VBComponents:
         if comp.Type not in (1, 2, 3, 100):
@@ -2129,7 +2193,10 @@ def cmd_list_shortcuts(args):
             comp.Export(tmp_file)
             with open(tmp_file, 'rb') as f:
                 content = f.read().decode('cp932', errors='replace')
-        except Exception:
+        except Exception as ex:
+            # 黙って飛ばすと最後に「ショートカットなし」と言い切ってしまう。
+            # 読めなかったモジュールは必ず報告する
+            unread.append((comp.Name, _com_error_text(ex)))
             continue
         finally:
             _remove_export_artifacts(tmp_file)
@@ -2164,11 +2231,22 @@ def cmd_list_shortcuts(args):
 
     if getattr(args, 'json', False):
         import json
-        print(json.dumps({"success": True, "file": wb.Name, "shortcuts": shortcuts}, ensure_ascii=False), file=sys.stdout)
+        out = {"success": True, "file": wb.Name, "shortcuts": shortcuts}
+        if unread:
+            out["unread_modules"] = [{"module": m, "error": e} for m, e in unread]
+        print(json.dumps(out, ensure_ascii=False), file=sys.stdout)
         return True
 
+    if unread:
+        print(f"⚠ 次のモジュールは読めませんでした（一覧に反映されていません・{len(unread)}件）:")
+        for m, e in unread:
+            print(f"  - {m}: {e}")
+
     if not shortcuts:
-        print("ショートカットキーが設定されているマクロはありません。")
+        if unread:
+            print("読めたモジュールの範囲では、ショートカットキーの設定は見つかりませんでした。")
+        else:
+            print("ショートカットキーが設定されているマクロはありません。")
         return True
 
     print(f"設定されているショートカットキー一覧 (数: {len(shortcuts)})")
@@ -2374,6 +2452,7 @@ def _collect_book_inventory(xl, wb, include_vba=True):
 
     # ショートカット（Attribute 走査。エクスポート方式は list-shortcuts と同じ）
     shortcuts = {}
+    sc_unread = []      # Export に失敗して読めなかったモジュール（黙って落とさない）
     attr_pat = re.compile(
         r'Attribute\s+([^.\s]+)\.VB_ProcData\.VB_Invoke_Func\s*=\s*"([^"]+)"',
         re.IGNORECASE | re.DOTALL)
@@ -2394,11 +2473,16 @@ def _collect_book_inventory(xl, wb, include_vba=True):
                         shortcuts[m.group(1)] = f"Ctrl+Shift+{key}"
                     else:
                         shortcuts[m.group(1)] = f"Ctrl+{key}"
-        except Exception:
-            pass
+        except Exception as ex:
+            # 握りつぶすと「ショートカットなし」と誤って断言することになる
+            sc_unread.append((comp.Name, _com_error_text(ex)))
         finally:
             _remove_export_artifacts(tmp)
     inv['shortcuts'] = shortcuts
+    inv['shortcuts_unread'] = sc_unread
+    if sc_unread:
+        print(f"⚠ ショートカット走査で読めなかったモジュール（{len(sc_unread)}件）: "
+              + '、'.join(f"{m}({e})" for m, e in sc_unread), file=sys.stderr)
 
     # 図形・フォームコントロールに登録されたマクロ（OnAction）＝ボタンからの実行入口。
     # VBA ロック中でも読める（Shapes はシート側の情報）
@@ -3950,7 +4034,8 @@ def cmd_grep(args):
     mod_filter = getattr(args, 'module_opt', None)
     max_hits = getattr(args, 'max_hits', None) or 200
 
-    xl, wb = get_workbook(target_file)
+    # コードを読むだけ → 読み取り専用で開く（Workbook_Open を起こさない）
+    xl, wb = get_workbook(target_file, readonly=True)
     hits = []
     total = 0
     for comp in wb.VBProject.VBComponents:
@@ -4326,6 +4411,123 @@ def _dialog_watcher_note(watcher, mode):
             f"マクロがメッセージを出しています → 内容: {body}")
 
 
+def dialog_safe(cmd_func):
+    """cmd_* を「実行中のダイアログを安全側で自動解除する」に変える decorator。
+
+    セルの書き換え・クリア・行列削除・並べ替え・置換は Worksheet_Change 等の
+    イベントマクロを同期発火させる。そのマクロが MsgBox を出すと COM 呼び出しが
+    そこでブロックし、人が手で閉じるまでコマンドが無言でハングする（2026-07-11 実害。
+    write-range と run-macro では常設済みだったが、他の書き込み系には無かった）。
+    検出したダイアログは終了後に必ず報告する（黙って握りつぶさない）。
+    """
+    import functools
+
+    @functools.wraps(cmd_func)
+    def wrapper(args):
+        try:
+            target_file, _rest = parse_target_and_rest(getattr(args, 'posargs', []) or [])
+            xl, _wb = get_workbook(target_file)
+        except Exception:
+            # ブック解決に失敗した場合は元の関数に委ね、そちらのエラーを出させる
+            return cmd_func(args)
+        watcher = _start_dialog_watcher(xl)
+        try:
+            return cmd_func(args)
+        finally:
+            try:
+                watcher.stop()
+            except Exception:
+                pass
+            note = _dialog_watcher_note(watcher, None)
+            if note:
+                print(note, file=sys.stderr)
+    return wrapper
+
+
+def _project_book_name(xl, p):
+    """VBProject から Application.Run 修飾に使うブック名を得る。
+
+    p.Filename は未保存ブックだと例外／空になる。その場合は開いているブックを
+    走査して同じプロジェクトのブック名（Book1 等）を拾う。Run はブック名で修飾
+    できるので、未保存ブックでも取り違えずに名指しできる。見つからなければ None。
+    """
+    try:
+        fn = p.Filename
+    except Exception:
+        fn = None
+    if fn:
+        return os.path.basename(fn)
+    try:
+        pname = p.Name
+    except Exception:
+        return None
+    try:
+        for w in xl.Workbooks:
+            try:
+                if not w.Path and w.VBProject.Name == pname:
+                    return w.Name
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _find_macro_owner_books(xl, wb, macro_name):
+    """macro_name を宣言しているプロジェクトを全部探す。
+
+    戻り値: (対象ブック名 or None, 他候補[(ブック名 or None, プロジェクト名)])
+
+    VBProjects の列挙順で先勝ちすると、アドインや PERSONAL.XLSB に同名 Sub が
+    あるとき作業ブックではなくそちら側を実行してしまう。対象ブック（get_workbook が
+    返した wb）に有ればそれを最優先し、他にも同名があれば警告できるよう全部返す。
+    """
+    pattern = re.compile(
+        r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
+        r'(?:Sub|Function)\s+' + re.escape(macro_name) + r'\b',
+        re.IGNORECASE | re.MULTILINE
+    )
+    try:
+        target_name = wb.Name
+    except Exception:
+        target_name = None
+
+    target_hit = None
+    others = []
+    try:
+        projects = list(xl.VBE.VBProjects)
+    except Exception as ex:
+        print(f"[DEBUG] Failed to enumerate VBProjects: {ex}", file=sys.stderr)
+        return None, []
+
+    for p in projects:
+        hit = False
+        try:
+            for comp in p.VBComponents:
+                try:
+                    cm = comp.CodeModule
+                    if cm.CountOfLines > 0 and pattern.search(cm.Lines(1, cm.CountOfLines)):
+                        hit = True
+                        break
+                except Exception:
+                    # 読めないモジュールは飛ばすが、探索自体は止めない
+                    continue
+        except Exception:
+            continue
+        if not hit:
+            continue
+        bname = _project_book_name(xl, p)
+        try:
+            pname = p.Name
+        except Exception:
+            pname = '?'
+        if bname and target_name and bname.lower() == target_name.lower():
+            target_hit = bname
+        else:
+            others.append((bname, pname))
+    return target_hit, others
+
+
 def cmd_run_macro(args):
     """Excelマクロを実行する"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -4348,33 +4550,33 @@ def cmd_run_macro(args):
 
     # マクロ名に "!" が含まれていない場合、どのブックにあるか検索する
     if "!" not in macro_name:
-        found_wb = None
-        # VBE.VBProjectsからマクロを検索
-        try:
-            pattern = re.compile(
-                r'^\s*(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
-                r'(?:Sub|Function)\s+' + re.escape(macro_name) + r'\b',
-                re.IGNORECASE | re.MULTILINE
-            )
-            for p in xl.VBE.VBProjects:
-                for comp in p.VBComponents:
-                    cm = comp.CodeModule
-                    if cm.CountOfLines > 0:
-                        code = cm.Lines(1, cm.CountOfLines)
-                        if pattern.search(code):
-                            try:
-                                if p.Filename:
-                                    found_wb = os.path.basename(p.Filename)
-                            except Exception:
-                                # 未保存ブックは Filename が取れない。プロジェクト名
-                                # ("VBAProject") で修飾しても Run は解決しないため、
-                                # 修飾なしの直接実行に任せる
-                                pass
-                            break
-                if found_wb:
-                    break
-        except Exception as ex:
-            print(f"[DEBUG] Failed to search macro location: {ex}", file=sys.stderr)
+        # 対象ブック（アクティブブック or --target）を最優先で探す。
+        # 列挙順の先勝ちだと、アドイン/PERSONAL 側の同名マクロを実行してしまう
+        target_hit, others = _find_macro_owner_books(xl, wb, macro_name)
+        found_wb = target_hit
+        if target_hit:
+            if others:
+                dup = '、'.join(
+                    (b or f'{pn}（ブック名不明）') for b, pn in others
+                )
+                print(f"⚠ 同名マクロが他にもあります: {dup} → 対象ブック "
+                      f"'{target_hit}' 側を実行します", file=sys.stderr)
+        elif others:
+            named = [(b, pn) for b, pn in others if b]
+            if named:
+                found_wb = named[0][0]
+                if len(others) > 1:
+                    dup = '、'.join(
+                        (b or f'{pn}（ブック名不明）') for b, pn in others
+                    )
+                    print(f"⚠ 同名マクロが複数のブックにあります: {dup} → "
+                          f"'{found_wb}' 側を実行します。意図が違う場合は "
+                          f"\"ブック名!マクロ名\" で名指ししてください", file=sys.stderr)
+            else:
+                # ブック名で修飾できない（プロジェクトの帰属が取れない）ときだけ
+                # 修飾なしの直接実行に任せる。黙って別ブックを掴まない
+                print(f"[WARNING] Macro '{macro_name}' はブック名を特定できない"
+                      f"プロジェクトにあります。修飾なしで実行します。", file=sys.stderr)
 
         if found_wb:
             # ブック名に空白等があると Application.Run はクォート必須
@@ -4650,14 +4852,17 @@ __all__ = [
     '_collect_book_inventory',
     '_com_error_text',
     '_dialog_watcher_note',
+    'dialog_safe',
     '_extra_code_scans',
     '_extract_proc',
     '_find_consecutive_dup_lines',
     '_find_duplicate_procedures',
+    '_find_macro_owner_books',
     '_inventory_or_explain',
     '_load_checkup_ack',
     '_load_checkup_history',
     '_parse_module_blocks',
+    '_project_book_name',
     '_save_checkup_ack',
     '_save_checkup_history',
     '_select_addin_project',

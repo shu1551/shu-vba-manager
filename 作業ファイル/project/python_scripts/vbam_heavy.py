@@ -96,7 +96,20 @@ def cmd_chart(args):
             ch.HasTitle = True
             ch.ChartTitle.Text = args.title
         if getattr(args, 'name', None):
-            co.Name = args.name
+            # 名前の重複・禁止文字で失敗すると、自動名（グラフ 1 等）のグラフだけが
+            # 残って「名前を付けたはずのグラフが chart list に無い」状態になる。
+            # 種別不正の経路と同じく、このコマンドが作ったものは片づけてから失敗を返す。
+            try:
+                co.Name = args.name
+            except Exception as ex:
+                print(f"エラー: グラフ名 '{args.name}' を設定できません: {ex}")
+                print("  同名のグラフが既にある可能性があります（chart list で確認）。")
+                try:
+                    co.Delete()
+                    print("  作成途中のグラフは片づけました。")
+                except Exception:
+                    pass
+                return False
         print(f"グラフ作成: [{ws.Name}] {co.Name}  種別={ctype}  データ={rng.Address}")
         print("（保存はしていません）")
         return True
@@ -377,7 +390,16 @@ def cmd_chart_config(args):
         print(f"系列削除: {cname} #{idx}"); print("（保存はしていません）"); return True
 
     if action == 'series-format':
-        idx = int(rest[2]) if len(rest) >= 3 else 1
+        # 系列番号の省略は「黙って系列1が書き換わる」事故のもと。明示必須にする
+        # （remove-series / trendline delete と同じ流儀）。
+        if len(rest) < 3:
+            print("使い方: chart-config series-format <chart> <series_index> [--marker-style N ...]")
+            print("  （series_index は省略できません。省略すると系列1を書き換えてしまうため）")
+            return False
+        try:
+            idx = int(rest[2])
+        except ValueError:
+            print("series_index は数値で指定してください。"); return False
         s = ch.SeriesCollection(idx)
         ch_list = []
         if getattr(args, 'marker_style', None) is not None:
@@ -390,6 +412,11 @@ def cmd_chart_config(args):
             s.MarkerBackgroundColor = _hex_to_excel_color(args.marker_bg); ch_list.append('bg')
         if getattr(args, 'invert', False):
             s.InvertIfNegative = True; ch_list.append('invert')
+        if not ch_list:
+            # 何も指定が無いのに「系列書式: …[]」と成功表示するのは実態と食い違う
+            print("エラー: 変更する書式オプションが指定されていません。")
+            print("  --marker-style/--marker-size/--marker-fg/--marker-bg/--invert のいずれかを指定してください。")
+            return False
         print(f"系列書式: {cname} #{idx} [{', '.join(ch_list)}]"); print("（保存はしていません）"); return True
 
     print(f"未知のアクション: {action}")
@@ -402,6 +429,21 @@ def cmd_chart_config(args):
 
 _XL_PIVOT_FUNC = {'sum': -4157, 'count': -4112, 'average': -4106,
                   'max': -4136, 'min': -4139}
+
+
+def _is_dest_area_empty(xl, dest):
+    """出力先セル（とその連続領域）が空かどうか。
+
+    ピボットの出力先は「置いてみるまで何行何列になるか分からない」ので、
+    起点セルの CurrentRegion（＝隣接して詰まっているデータの塊）に値が
+    1つでもあれば「既存の表の上」と見なす。判定に失敗したときは
+    「空ではない」側に倒す（破壊より中止のほうが安全）。
+    """
+    try:
+        region = dest.CurrentRegion
+        return int(xl.WorksheetFunction.CountA(region)) == 0
+    except Exception:
+        return False
 
 
 def _unique_sheet_name(wb, base):
@@ -494,7 +536,18 @@ def cmd_pivot(args):
             created_sheet = dws
             dest = dws.Range("A3")
 
+        # 出力先が既存シート（--sheet で既存を再利用 / --at）のときは、そこが空きか
+        # 先に確かめる。既存の表の上にピボットを置くと元の値が押し潰され、しかも
+        # Excel 側は黙って上書きすることがある。空でなければ撃たずに止める。
+        if created_sheet is None:
+            if not _is_dest_area_empty(xl, dest):
+                print(f"エラー: 出力先 {dest.Parent.Name}!{dest.Address} は空ではありません。")
+                print("  既存のデータを上書きしてしまうため中止しました。")
+                print("  空いているセルを --at で指定するか、--sheet に新規シート名を指定してください。")
+                return False
+
         pt = None
+        pc = None
         funcname = (getattr(args, 'func', None) or 'sum').lower()
         values = getattr(args, 'values', None)
         try:
@@ -525,9 +578,18 @@ def cmd_pivot(args):
         except Exception as ex:
             # 存在しないフィールド名等で途中失敗すると、追加した新規シートと
             # 空ピボットが残骸として残り、再実行のたび「ピボット2/3…」と増殖する。
-            # このコマンドが作ったものだけ片づける（既存シートは消さない）
+            # このコマンドが作ったものだけ片づける（既存シートのセルは絶対に消さない）
             print(f"エラー: ピボット作成に失敗しました: {ex}")
             print("  --rows/--cols/--values のフィールド名がデータ範囲の見出しと一致しているか確認してください。")
+            leftover = None
+            if pt is not None and created_sheet is None:
+                # ユーザーの既存シート上。Clear() は「どこまでが自分の作った範囲か」を
+                # Excel の TableRange2 任せにすることになり、既存セルを巻き込む恐れがある。
+                # 消さずに場所と復旧コマンドを明示する（破壊より残骸のほうがまだ安全）。
+                try:
+                    leftover = f"[{pt.Parent.Name}] {pt.Name}"
+                except Exception:
+                    leftover = "(名前取得不可のピボット)"
             try:
                 if created_sheet is not None:
                     xl.DisplayAlerts = False
@@ -535,12 +597,21 @@ def cmd_pivot(args):
                         created_sheet.Delete()
                     finally:
                         xl.DisplayAlerts = True
-                    print(f"  作成途中のシートは片づけました。")
-                elif pt is not None:
-                    pt.TableRange2.Clear()
-                    print(f"  作成途中の空ピボットは片づけました。")
+                    print("  作成途中のシート（このコマンドが作ったもの）は片づけました。")
             except Exception:
                 pass
+            if leftover:
+                print(f"  ⚠ 作成途中のピボット {leftover} が既存シートに残っています。")
+                print("     既存セルを巻き込む恐れがあるため自動では消しません。"
+                      "不要なら pivot delete <名前> で削除してください。")
+            # PivotCache の後始末。参照が外れたキャッシュは保存時に破棄されるが、
+            # Delete を持つバージョンでは明示的に落としておく（孤児キャッシュ対策）。
+            try:
+                if pc is not None:
+                    pc.Delete()
+            except Exception:
+                pass
+            pc = None
             return False
 
         print(f"ピボット作成: [{pt.Parent.Name}] {pt.Name}  ソース={ws_s.Name}!{rng.Address}")
@@ -727,7 +798,14 @@ def cmd_pivot_field(args):
     if action == 'group-numeric':
         if len(rest) < 6:
             print("使い方: pivot-field group-numeric <pivot> <field> <start> <end> <interval>"); return False
-        start, end, step = float(rest[3]), float(rest[4]), float(rest[5])
+        try:
+            start, end, step = float(rest[3]), float(rest[4]), float(rest[5])
+        except ValueError:
+            # 非数値をそのまま渡すと ValueError のトレースバックが出るだけで、
+            # 何が悪かったのか分からない。使い方を出して止める。
+            print("使い方: pivot-field group-numeric <pivot> <field> <start> <end> <interval>")
+            print(f"  start/end/interval は数値で指定してください（指定値: {rest[3]} / {rest[4]} / {rest[5]}）")
+            return False
         p = pf(field)
         if p is None:
             print(f"エラー: フィールド '{field}' が見つかりません。"); return False
@@ -937,8 +1015,20 @@ def cmd_slicer(args):
             top, left = 10.0, 400.0
 
         sc = wb.SlicerCaches.Add2(src, field)
-        sl = sc.Slicers.Add(SlicerDestination=dws, Caption=field,
-                            Top=top, Left=left, Width=144.0, Height=180.0)
+        try:
+            sl = sc.Slicers.Add(SlicerDestination=dws, Caption=field,
+                                Top=top, Left=left, Width=144.0, Height=180.0)
+        except Exception as ex:
+            # Add2 は通ったのに Slicers.Add が失敗すると（保護シート・座標不正等）、
+            # スライサー本体のない SlicerCache だけが孤児として残り、以後
+            # slicer list にも出ないまま再実行のたびに増える。作ったものは戻す。
+            print(f"エラー: スライサーの配置に失敗しました: {ex}")
+            try:
+                sc.Delete()
+                print("  作成途中のスライサーキャッシュは片づけました。")
+            except Exception:
+                print("  ⚠ スライサーキャッシュの後始末に失敗しました（保存前ならブックを閉じ直すのが確実です）。")
+            return False
         # Slicers.Add の Name 引数は効かないことがあるので作成後に明示セット
         req_name = getattr(args, 'name', None)
         if req_name:
@@ -999,16 +1089,81 @@ def cmd_calc_mode(args):
 # 重量級コマンド (4) PowerQuery （一覧・更新・作成・M式書換・削除・読み込み配線）
 # ================================================================
 
+def _connection_used_by_table(wb, cn_name):
+    """接続 cn_name を使っているシートのテーブルがあれば "シート名!テーブル名" を返す。
+
+    この接続を消すとそのテーブルの更新配線が切れる（更新できないテーブルが
+    シートに残る）。削除する側は撃つ前に必ずここを通す。
+    """
+    try:
+        for ws_chk in wb.Worksheets:
+            for lo_chk in ws_chk.ListObjects:
+                try:
+                    if lo_chk.QueryTable.WorkbookConnection.Name == cn_name:
+                        return f"{ws_chk.Name}!{lo_chk.Name}"
+                except Exception:
+                    continue     # QueryTable を持たない普通のテーブルはここに来る
+    except Exception:
+        pass
+    return None
+
+
+def _snapshot_connection(cn):
+    """接続の再作成に要る情報を控える（削除をロールバックするため）。
+
+    取れなかった項目は None。最低限 Name と接続文字列が取れなければ復元不能なので
+    None を返し、呼び出し側は「消したまま失敗した」ことを明示する。
+    """
+    snap = {'name': None, 'desc': '', 'conn': None, 'cmd_text': None,
+            'cmd_type': 1, 'in_model': False}
+    try:
+        snap['name'] = cn.Name
+    except Exception:
+        return None
+    try:
+        snap['desc'] = cn.Description or ''
+    except Exception:
+        pass
+    try:
+        snap['in_model'] = bool(cn.InModel)
+    except Exception:
+        pass
+    try:
+        sub = cn.OLEDBConnection            # PowerQuery 接続は OLEDB
+        snap['conn'] = str(sub.Connection)
+        snap['cmd_text'] = sub.CommandText
+        snap['cmd_type'] = int(sub.CommandType)
+    except Exception:
+        pass
+    if not snap['conn']:
+        return None
+    return snap
+
+
+def _restore_connection(wb, snap):
+    """_snapshot_connection で控えた接続を作り直す。成功したら True"""
+    try:
+        wb.Connections.Add2(snap['name'], snap['desc'], snap['conn'],
+                            snap['cmd_text'], snap['cmd_type'],
+                            snap['in_model'], False)
+        return True
+    except Exception:
+        return False
+
+
 @protect_safe
 def cmd_powerquery(args):
-    """PowerQuery: powerquery <list|refresh> ...
+    """PowerQuery: powerquery <list|refresh|add|edit|delete|load> ...
 
-      powerquery list                 クエリと接続の一覧
+      powerquery list                 クエリと接続の一覧（M式の行数つき）
       powerquery refresh              全クエリ/接続を更新 (RefreshAll)
       powerquery refresh <name>       指定クエリ/接続を更新
       powerquery add <name>           M式から新規クエリ作成（接続のみ）
-                                      M式は --m-file / _last_query.m / --m "..."
+                                      M式は --m / --m-file / _last_query.m
+      powerquery edit <name>          既存クエリのM式を書き換え（M式の指定は add と同じ）
       powerquery delete <name>        クエリを削除
+      powerquery load <name> --to sheet [--sheet S] [--at A1]   シートのテーブルに読み込み
+      powerquery load <name> --to model                          データモデルに読み込み
     """
     target_file, rest = parse_target_and_rest(args.posargs)
     if not rest:
@@ -1228,7 +1383,8 @@ def cmd_powerquery(args):
                 # 自動生成の接続が孤児として残り、再実行のたび「テーブル1/2…」と
                 # 増殖する。このコマンドが作ったものだけ片づける
                 print(f"エラー: クエリの読み込みに失敗しました: {ex}")
-                print("  M式の実行時エラーの可能性があります（powerquery get で確認）。")
+                print("  M式の実行時エラーの可能性があります"
+                      "（powerquery list でクエリを確認、powerquery edit で書き換え）。")
                 try:
                     wbconn = qt.WorkbookConnection
                 except Exception:
@@ -1252,19 +1408,27 @@ def cmd_powerquery(args):
                         xl.DisplayAlerts = True
                 print("  追加途中のテーブル・接続は片づけました。")
                 return False
+            # リネームの失敗を握りつぶすと、成功メッセージだけ出て
+            # 以後 powerquery refresh <name> で引けない（名前が汎用名のまま）状態になる。
+            # 読み込み自体は成功しているので中止はせず、警告として明示する。
             try:
                 lo.Name = name
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"⚠ テーブル名を '{name}' にできませんでした（{ex}）。自動名 '{lo.Name}' のままです。")
             # 既定では「接続」等の汎用名が付く。refresh <name> で引けるよう
             # Excel 標準の "Query - <name>" に揃える。
+            conn_name = None
             try:
                 wbconn = qt.WorkbookConnection
                 if wbconn is not None:
                     wbconn.Name = f"Query - {name}"
-            except Exception:
-                pass
-            print(f"シートに読み込みました: {name} → {ws.Name}!{at}（テーブル: {lo.Name}）")
+                    conn_name = wbconn.Name
+            except Exception as ex:
+                print(f"⚠ 接続名を 'Query - {name}' にできませんでした（{ex}）。")
+                print(f"   powerquery refresh {name} では引けません。"
+                      "connection list で実際の接続名を確認し、その名前で refresh してください。")
+            print(f"シートに読み込みました: {name} → {ws.Name}!{at}（テーブル: {lo.Name}"
+                  + (f", 接続: {conn_name}" if conn_name else "") + "）")
             print("（保存はしていません）")
             return True
 
@@ -1274,29 +1438,22 @@ def cmd_powerquery(args):
             # ただしその接続がシートのテーブル（--to sheet の読み込み）に使われている
             # 場合、削除するとシート側の更新配線が壊れるため停止する。
             cn_name = f"Query - {name}"
+            deleted_snap = None       # 消した既存接続の控え（Add2 失敗時のロールバック用）
             for cn in list(wb.Connections):
                 if cn.Name == cn_name:
-                    used_by = None
-                    try:
-                        for ws_chk in wb.Worksheets:
-                            for lo_chk in ws_chk.ListObjects:
-                                try:
-                                    if lo_chk.QueryTable.WorkbookConnection.Name == cn_name:
-                                        used_by = f"{ws_chk.Name}!{lo_chk.Name}"
-                                        break
-                                except Exception:
-                                    continue
-                            if used_by:
-                                break
-                    except Exception:
-                        pass
+                    used_by = _connection_used_by_table(wb, cn_name)
                     if used_by:
                         print(f"エラー: 接続 '{cn_name}' はシートのテーブル {used_by} が使用中です。")
                         print("  削除するとテーブルの更新ができなくなるため中止しました。")
                         print("  モデルにも読み込みたい場合は、シート読み込みを解除してから実行してください。")
                         return False
+                    # 消す前に中身を控える。Add2 が失敗したときに元へ戻せないと、
+                    # 「接続だけ消えてモデルにも載っていない＝クエリが未配線」の
+                    # 一番たちの悪い状態で終わるため。
+                    old_snap = _snapshot_connection(cn)
                     try:
                         cn.Delete()
+                        deleted_snap = old_snap
                     except Exception:
                         pass
             # Connections.Add2(Name, Description, ConnectionString, CommandText,
@@ -1304,7 +1461,24 @@ def cmd_powerquery(args):
             # モデル読込は記録マクロ形式に合わせる: CommandText=クエリ名,
             # lCmdtype=6 (xlCmdTableCollection)。これでモデルテーブル名が
             # クエリ名になる（SQL/SELECT形式だと "クエリ" の汎用名になる）。
-            wb.Connections.Add2(cn_name, "", conn_str, name, 6, True, False)
+            try:
+                wb.Connections.Add2(cn_name, "", conn_str, name, 6, True, False)
+            except Exception as ex:
+                # M式の実行時エラー・モデル非対応等で失敗しうる。丸腰で呼ぶと
+                # 上で消した既存接続が戻らない。控えた内容で作り直す。
+                print(f"エラー: データモデルへの読み込みに失敗しました: {ex}")
+                print("  M式の実行時エラー、またはこのブックがデータモデル非対応の可能性があります。")
+                if deleted_snap is None:
+                    return False
+                if _restore_connection(wb, deleted_snap):
+                    print(f"  既存の接続 '{cn_name}' は元に戻しました（クエリの配線は元のままです）。")
+                else:
+                    print(f"  ⚠ 既存の接続 '{cn_name}' を消したまま復旧できませんでした。")
+                    print("     クエリ自体は残っています。配線をやり直すには:")
+                    print(f"       powerquery load {name} --to sheet   （シートに読み込む場合）")
+                    print(f"       powerquery load {name} --to model   （モデルに読み込む場合）")
+                    print("     現状は connection list / datamodel list で確認できます。")
+                return False
             print(f"データモデルに読み込みました: {name}")
             print("（保存はしていません。datamodel list で確認できます）")
             return True
@@ -1332,7 +1506,7 @@ def cmd_connection(args):
 
       connection list                クエリ/外部データ接続の一覧（種別・接続文字列）
       connection refresh [name]      接続を更新（name 省略で全件 RefreshAll）
-      connection delete <name>       接続を削除
+      connection delete <name>       接続を削除（シートのテーブルが使用中なら中止）
     """
     target_file, rest = parse_target_and_rest(args.posargs)
     if not rest:
@@ -1394,6 +1568,16 @@ def cmd_connection(args):
         for cn in wb.Connections:
             if cn.Name == name or cn.Name == f"Query - {name}":
                 actual = cn.Name           # Delete 後は参照不可になるので退避
+                # 使用中チェック。無条件に消すと、その接続でぶら下がっている
+                # シートのテーブルが「更新できないテーブル」になって黙って腐る
+                # （powerquery load --to model と同じ流儀で、撃つ前に止める）。
+                used_by = _connection_used_by_table(wb, actual)
+                if used_by:
+                    print(f"エラー: 接続 '{actual}' はシートのテーブル {used_by} が使用中です。")
+                    print("  削除するとそのテーブルを更新できなくなるため中止しました。")
+                    print(f"  それでも消す場合は、先に table delete {used_by.split('!')[-1]} で")
+                    print("  テーブル側を外してから connection delete してください。")
+                    return False
                 cn.Delete()
                 print(f"接続を削除: {actual}")
                 print("（保存はしていません）")
@@ -1659,8 +1843,12 @@ __all__ = [
     '_XL_PIVOT_FUNC',
     '_XL_PIVOT_ORIENT',
     '_XL_TRENDLINE',
+    '_connection_used_by_table',
     '_find_pivot',
     '_find_pivot_or_table',
+    '_is_dest_area_empty',
+    '_restore_connection',
+    '_snapshot_connection',
     '_unique_sheet_name',
     'cmd_calc_mode',
     'cmd_chart',

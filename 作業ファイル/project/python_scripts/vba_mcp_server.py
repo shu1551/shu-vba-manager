@@ -21,7 +21,6 @@ import os
 import queue
 import sys
 import threading
-from contextlib import redirect_stdout, redirect_stderr
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -116,16 +115,25 @@ def _worker(jobs):
             box["started"] = True
         buf = io.StringIO()
         old_stdin = sys.stdin
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
         fake_stdin = io.StringIO("")
         ok = False
         try:
+            # stdout/stderr は redirect_stdout（with 文）ではなく自前で差し替える。
+            # with 文の __exit__ は「自分が入った時点の値」を無条件に復元するため、
+            # 世代交代（_restart_worker）後に旧ワーカーが復帰すると、新ワーカーが
+            # 据えたリダイレクトを剥がして本物の stdout ＝ JSON-RPC の通信線を
+            # 露出させてしまう。stdin と同じく「自分が据えたものが残っているときだけ
+            # 戻す」に揃える
             sys.stdin = fake_stdin
-            with redirect_stdout(buf), redirect_stderr(buf):
-                if line == "__cleanup__":
-                    vba_manager.cleanup_excel()
-                    ok = True
-                else:
-                    ok = _run_line(parser, table, line, buf) is not False
+            sys.stdout = buf
+            sys.stderr = buf
+            if line == "__cleanup__":
+                vba_manager.cleanup_excel()
+                ok = True
+            else:
+                ok = _run_line(parser, table, line, buf) is not False
         except SystemExit as e:
             ok = e.code in (0, None)
         except EOFError:
@@ -134,11 +142,15 @@ def _worker(jobs):
         except Exception as e:
             buf.write(f"\nエラー: {e}")
         finally:
-            # 世代交代後に旧ワーカーが復帰した場合、新世代が据えた stdin を
-            # 本物の stdin（JSON-RPC の通信線）に戻してしまわないよう、
+            # 世代交代後に旧ワーカーが復帰した場合、新世代が据えた stdin/stdout を
+            # 本物（JSON-RPC の通信線）に戻してしまわないよう、
             # 自分が据えたものが残っているときだけ復元する
             if sys.stdin is fake_stdin:
                 sys.stdin = old_stdin
+            if sys.stdout is buf:
+                sys.stdout = old_stdout
+            if sys.stderr is buf:
+                sys.stderr = old_stderr
             box["ok"] = ok
             box["out"] = buf.getvalue()
             done.set()

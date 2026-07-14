@@ -50,6 +50,34 @@ def _hex_to_excel_color(hexstr):
 
 
 
+class _alerts_off:
+    """DisplayAlerts を一時的に切り、抜けるとき「元の値」に戻す with ブロック。
+
+    無条件に True へ戻すと、batch や MCP の 1接続セッションで呼び出し元が意図的に
+    False にしていた設定まで書き換えてしまい、後続の操作で確認ダイアログが出て
+    無言ハングする（xl.Run はダイアログが閉じるまで戻らない）。変更前の値を覚えて復元する。
+    """
+
+    def __init__(self, xl):
+        self.xl = xl
+        self.prev = True
+
+    def __enter__(self):
+        try:
+            self.prev = self.xl.DisplayAlerts
+        except Exception:
+            self.prev = True          # 読めない場合のみ Excel 既定（True）を採用
+        self.xl.DisplayAlerts = False
+        return self.xl
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.xl.DisplayAlerts = self.prev
+        except Exception:
+            pass
+        return False
+
+
 def _read_tsv_grid(path, raw=False):
     """TSV(タブ区切り)をセル値の 2次元タプルに変換（行の長さは不揃いのまま返す）。
 
@@ -82,12 +110,24 @@ def cmd_write_range(args):
         return False
 
     xl, wb = get_workbook(target_file)
+    sheet_opt = getattr(args, 'sheet_opt', None)
     append = getattr(args, 'append', False)
     if append:
         # --append: spec は「シート名!列文字」または「列文字」。使用範囲の最終行の
         # 次の行から書く（自動の最終行判定を使うため、書き込み先番地を必ず明示表示する）
+        # シート名は spec の「!」指定と --sheet のどちらでも指定できる（非append経路と
+        # 揃える。--sheet を無視するとアクティブシートに書いて別シートを汚す）
+        sheet_part = None
+        col_part = spec
         if '!' in spec:
             sheet_part, col_part = spec.split('!', 1)
+            if sheet_opt and sheet_opt != sheet_part:
+                print(f"エラー: シート指定が食い違っています（'{spec}' と --sheet {sheet_opt}）")
+                return False
+        elif sheet_opt:
+            sheet_part = sheet_opt
+        if sheet_part is not None:
+            sheet_part = sheet_part.strip("'")
             ws = None
             for sh in wb.Worksheets:
                 if sh.Name == sheet_part:
@@ -97,7 +137,7 @@ def cmd_write_range(args):
                 print(f"エラー: シート '{sheet_part}' が見つかりません")
                 return False
         else:
-            ws, col_part = wb.ActiveSheet, spec
+            ws = wb.ActiveSheet
         if not re.fullmatch(r'[A-Za-z]{1,3}', col_part or ''):
             print("エラー: --append の range は「シート名!列文字」（例: ログ!A）で指定してください")
             return False
@@ -114,7 +154,6 @@ def cmd_write_range(args):
         rng = ws.Range(f"{col_part.upper()}{next_row}")
         print(f"追記位置: {ws.Name}!{rng.Address}（使用範囲の最終行の次）")
     else:
-        sheet_opt = getattr(args, 'sheet_opt', None)
         whole = _whole_sheet_spec(wb, spec, sheet_opt)
         if whole is not None:
             print(f"エラー: '{spec}' はシート '{whole}' の使用範囲全域を指します。")
@@ -189,6 +228,7 @@ def cmd_write_range(args):
 
 
 @protect_safe
+@dialog_safe
 def cmd_clear_range(args):
     """セル範囲をクリア (既定: すべて)"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -290,11 +330,8 @@ def cmd_format_range(args):
             pass
         if n_vals > 1:
             print(f"⚠ 範囲に値が{n_vals}個あります。結合により左上以外の値は消えます。")
-        xl.DisplayAlerts = False
-        try:
+        with _alerts_off(xl):
             rng.Merge()
-        finally:
-            xl.DisplayAlerts = True
         applied.append("merge")
     if getattr(args, 'unmerge', False):
         rng.UnMerge(); applied.append("unmerge")
@@ -357,11 +394,8 @@ def cmd_sheet(args):
         sh = find_sheet(rest[1])
         if not sh:
             print(f"エラー: シート '{rest[1]}' が見つかりません"); return False
-        xl.DisplayAlerts = False
-        try:
+        with _alerts_off(xl):
             sh.Delete()
-        finally:
-            xl.DisplayAlerts = True
         print(f"シート削除: {rest[1]}")
     elif action == 'rename':
         if len(rest) < 3:
@@ -377,6 +411,10 @@ def cmd_sheet(args):
         sh = find_sheet(rest[1])
         if not sh:
             print(f"エラー: シート '{rest[1]}' が見つかりません"); return False
+        # 名前重複は Copy 後の rename で例外になり、「Sheet1 (2)」等の複製シートが
+        # 残骸として残る（add と同じく先に弾く）
+        if len(rest) >= 3 and find_sheet(rest[2]) is not None:
+            print(f"エラー: シート '{rest[2]}' は既に存在します"); return False
         sh.Copy(None, sh)
         newsh = wb.ActiveSheet
         if len(rest) >= 3:
@@ -407,6 +445,10 @@ def cmd_sheet(args):
             except Exception as e:
                 print(f"エラー: 保護解除に失敗しました（パスワード違いの可能性）: {e}")
                 return False
+            # 保護ガード（protect_safe）は入口で全保護シートを一時解除し、出口で
+            # 記録どおり再保護する。このコマンドは「保護を外すこと自体が目的」なので、
+            # 記録から落としておかないと出口で保護が戻り、成功表示のまま無言で効かない
+            forget_protection(sh)
             print(f"シート保護解除: {rest[1]}")
     elif action in ('show', 'hide', 'very-hide'):
         if len(rest) < 2:
@@ -793,6 +835,7 @@ def _sheet_or_active(wb, sheet_name):
 
 
 @protect_safe
+@dialog_safe
 def cmd_row(args):
     """行の挿入・削除: row <insert|delete> <行番号> [本数]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -823,6 +866,7 @@ def cmd_row(args):
 
 
 @protect_safe
+@dialog_safe
 def cmd_col(args):
     """列の挿入・削除: col <insert|delete> <列文字> [本数]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -831,6 +875,12 @@ def cmd_col(args):
         return False
     action = rest[0].lower()
     start = rest[1]
+    # _col_num は英字以外も黙って数値化する。str.isalpha() は '名' のような日本語も
+    # True になるため isascii() と併せて弾く（通すと巨大な列番号になり、
+    # delete では見当違いの列が消える＝取り返しがつかない）
+    if not (start.isascii() and start.isalpha()):
+        print(f"エラー: 列は列文字（A〜XFD）で指定してください: '{start}'")
+        return False
     count = int(rest[2]) if len(rest) >= 3 else 1
     end = _col_letter(_col_num(start) + count - 1)
     xl, wb = get_workbook(target_file)
@@ -854,6 +904,7 @@ def cmd_col(args):
 
 
 @protect_safe
+@dialog_safe
 def cmd_copy_range(args):
     """範囲コピー: copy-range <src> <dst> [--values]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -897,6 +948,7 @@ def cmd_copy_range(args):
 
 
 @protect_safe
+@dialog_safe
 def cmd_fill(args):
     """オートフィル: fill <range> [--right]（既定は下方向）"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -923,6 +975,7 @@ def cmd_fill(args):
 
 
 @protect_safe
+@dialog_safe
 def cmd_sort(args):
     """並べ替え: sort <range> [--key 列文字] [--desc] [--header|--no-header]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -940,8 +993,10 @@ def cmd_sort(args):
         return False
     ws, rng = _resolve_range(xl, wb, rest[0], sheet_opt)
     keycol = getattr(args, 'key', None)
-    if keycol and not keycol.isalpha():
-        # _col_num は英字以外も黙って数値化してしまい、"A1" が K列扱いになる
+    if keycol and not (keycol.isascii() and keycol.isalpha()):
+        # _col_num は英字以外も黙って数値化してしまい、"A1" が K列扱いになる。
+        # なお str.isalpha() は '名' のような日本語も True になるため isascii() が必須
+        # （'名' を通すと _col_num が巨大な列番号を返し、意図しない列でソートされる）
         print(f"エラー: --key は列文字（A〜XFD）で指定してください: '{keycol}'")
         return False
     key_idx = _col_num(keycol) if keycol else rng.Column
@@ -1016,7 +1071,16 @@ def cmd_find(args):
     look_in = -4123 if getattr(args, 'formula', False) else -4163  # xlFormulas / xlValues
     look_at = 1 if getattr(args, 'whole', False) else 2            # xlWhole / xlPart
     total = 0
-    max_hits = getattr(args, 'max_hits', None) or 200
+    # `or 200` だと --max 0（件数だけ見たい）が偽値で既定に化けるため is None 判定
+    mh = getattr(args, 'max_hits', None)
+    try:
+        max_hits = 200 if mh is None else int(mh)
+    except (TypeError, ValueError):
+        print("エラー: --max は数値で指定してください")
+        return False
+    if max_hits < 0:
+        print("エラー: --max は 0 以上で指定してください（0 は件数のみ表示）")
+        return False
     for ws in sheets:
         try:
             rng = ws.UsedRange
@@ -1050,6 +1114,7 @@ def cmd_find(args):
 
 
 @protect_safe
+@dialog_safe
 def cmd_find_replace(args):
     """一括置換: find-replace <検索> <置換> [range] [--whole] [--wildcard]"""
     target_file, rest = parse_target_and_rest(args.posargs)
@@ -1110,11 +1175,8 @@ def cmd_save(args):
     """上書き保存: save [excel_file]"""
     target_file, _ = parse_target_and_rest(args.posargs)
     xl, wb = get_workbook(target_file)
-    xl.DisplayAlerts = False
-    try:
+    with _alerts_off(xl):
         wb.Save()
-    finally:
-        xl.DisplayAlerts = True
     print(f"保存しました: {wb.FullName}")
     return True
 
@@ -1170,11 +1232,8 @@ def cmd_save_as(args):
             # これも DisplayAlerts=False で Excel 側の警告が抑止されるため明示する
             print(f"⚠ 注意: {ext} はアクティブシート1枚しか保存されません"
                   f"（このブックは {n_sheets} シート）。")
-    xl.DisplayAlerts = False
-    try:
+    with _alerts_off(xl):
         wb.SaveAs(out, FileFormat=fmt)
-    finally:
-        xl.DisplayAlerts = True
     # batch/shell/MCP の1接続セッションでは接続キャッシュが旧パスキーのまま残り、
     # 旧名を指定した後続コマンドが改名後のブックに当たる（対象取り違え）。
     # SaveAs 成功時にキャッシュのキーを新パスへ付け替える
@@ -1309,8 +1368,18 @@ def cmd_printer_list(args):
     return True
 
 
+_PRINTER_DUPLEX = {'simplex': 1, 'vertical': 2, 'horizontal': 3}
+_PRINTER_COLOR = {'mono': 1, 'color': 2}
+_PRINTER_ORIENT = {'portrait': 1, 'landscape': 2}
+
+
 def cmd_printer_setup(args):
-    """プリンターの詳細設定（両面印刷・カラー等）を変更・表示"""
+    """プリンターの詳細設定（両面印刷・カラー等）を変更・表示
+
+    ※ 他の「手」コマンドと違い、書き込み先はブックではなく **OS のプリンター設定** そのもの
+      （win32print.SetPrinter）。保存せず閉じて破棄する逃げ道が無く、即時・不可逆で
+      他のアプリの印刷にも影響する。オプション無しで呼べば現在の構成の表示だけ。
+    """
     # 対象プリンター名の決定
     printer_name = getattr(args, 'printer', None)
     if not printer_name:
@@ -1331,7 +1400,27 @@ def cmd_printer_setup(args):
         print("エラー: 対象プリンターが特定できません。--printer で指定してください。")
         return False
 
+    # 辞書に無い値（--duplex bogus 等）は、以前は無言で捨てられ applied が空のまま
+    # 「現在のプリンター構成」を表示して成功扱い＝変更依頼が消えていた。先に弾く。
+    wants = []                       # [(名前, 設定するDevMode属性, 値)]
+    for opt_name, opt_attr, table in (('--duplex', 'Duplex', _PRINTER_DUPLEX),
+                                      ('--color', 'Color', _PRINTER_COLOR),
+                                      ('--orientation', 'Orientation', _PRINTER_ORIENT)):
+        raw = getattr(args, opt_name.lstrip('-').replace('-', '_'), None)
+        if not raw:
+            continue
+        val = table.get(str(raw).lower())
+        if val is None:
+            print(f"エラー: {opt_name} に指定できない値です: '{raw}'")
+            print(f"  受け付ける値: {' | '.join(table)}")
+            return False
+        wants.append((f"{opt_name.lstrip('-')}={raw}", opt_attr, val))
+
     print(f"対象プリンター: {printer_name}")
+    if wants:
+        # 他コマンドの「（保存はしていません）」と真逆＝逃げ道が無いことを明示する
+        print("⚠ 注意: これは Windows のプリンター設定そのものを書き換えます"
+              "（即時反映・元に戻す操作なし・Excel 以外の印刷にも影響します）。")
 
     import win32print
     try:
@@ -1352,31 +1441,11 @@ def cmd_printer_setup(args):
             print("エラー: プリンターの構成情報 (DevMode) を取得できませんでした。")
             return False
 
+        # 値の妥当性は上で検査済み（未知の値はここへ来ない＝無言で捨てない）
         applied = []
-        
-        # 1. 両面印刷 (Duplex)
-        duplex_opt = getattr(args, 'duplex', None)
-        if duplex_opt:
-            val = {'simplex': 1, 'vertical': 2, 'horizontal': 3}.get(duplex_opt.lower())
-            if val:
-                devmode.Duplex = val
-                applied.append(f"duplex={duplex_opt}")
-                
-        # 2. カラー (Color)
-        color_opt = getattr(args, 'color', None)
-        if color_opt:
-            val = {'mono': 1, 'color': 2}.get(color_opt.lower())
-            if val:
-                devmode.Color = val
-                applied.append(f"color={color_opt}")
-
-        # 3. 用紙向き (Orientation)
-        orient_opt = getattr(args, 'orientation', None)
-        if orient_opt:
-            val = {'portrait': 1, 'landscape': 2}.get(orient_opt.lower())
-            if val:
-                devmode.Orientation = val
-                applied.append(f"orientation={orient_opt}")
+        for label, attr, val in wants:
+            setattr(devmode, attr, val)
+            applied.append(label)
 
         if applied:
             win32print.SetPrinter(handle, 2, info, 0)
@@ -1647,10 +1716,14 @@ def cmd_comment(args):
 __all__ = [
     '_LAST_DAX_FILE',
     '_LAST_QUERY_FILE',
+    '_PRINTER_COLOR',
+    '_PRINTER_DUPLEX',
+    '_PRINTER_ORIENT',
     '_XL_ALIGN_H',
     '_XL_ALIGN_V',
     '_XL_BORDER_WEIGHT',
     '_XL_COND_OP',
+    '_alerts_off',
     '_col_num',
     '_hex_to_excel_color',
     '_read_tsv_grid',

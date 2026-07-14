@@ -40,7 +40,7 @@ import time
 import unicodedata
 import zlib
 
-from form_builder import FormBuilder
+from form_builder import FormBuilder, check_control_name
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKUP_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..', 'backups'))
@@ -85,28 +85,42 @@ def _text_w(s, font=None):
 # 要素（宣言）。すべて dict を返すだけの純粋関数
 # ================================================================
 
-def lbl(caption, width=None, bold=False):
-    """ラベル。行の先頭に置くとラベル列として自動整列"""
+def lbl(caption, width=None, bold=False, name=None, tab_index=None):
+    """ラベル。行の先頭に置くとラベル列として自動整列。
+
+    name 省略時は build 時に lbl1, lbl2... と機械採番する。VBA から
+    `lblStatus.Caption = ...` のように名指しするラベルは name を明示すること
+    （inspect --to-layout は実名を出力するので、往復しても参照が切れない）。
+    """
+    if name is not None:
+        check_control_name(name)
     return {'kind': 'lbl', 'caption': caption, 'width': width,
-            'height': STYLE['lbl_h'], 'bold': bold}
+            'height': STYLE['lbl_h'], 'bold': bold, 'name': name,
+            'tab_index': tab_index}
 
 
-def heading(caption):
+def heading(caption, name=None):
     """セクション見出し（Bold・大きめ）。1行を占有する"""
+    if name is not None:
+        check_control_name(name)
     e = {'kind': 'lbl', 'caption': caption, 'width': _text_w(caption, STYLE['heading_pt']),
-         'height': STYLE['lbl_h'] + 2, 'bold': True, 'font': STYLE['heading_pt']}
+         'height': STYLE['lbl_h'] + 2, 'bold': True, 'font': STYLE['heading_pt'],
+         'name': name}
     return {'kind': 'row', 'elems': [e]}
 
 
-def txt(name, width=None, height=None, multiline=False, value="", required=False):
+def txt(name, width=None, height=None, multiline=False, value="", required=False,
+        tab_index=None):
     """テキストボックス。width 省略で入力列いっぱいにストレッチ。
 
     required=True で直前ラベルに「＊」を付け、vba_stub の実行ボタンに
     空チェックの雛形が入る（チェック内容の判断は書く側）。
     """
+    check_control_name(name)
     return {'kind': 'txt', 'name': name, 'width': width,
             'height': height or STYLE['ctrl_h'],
-            'multiline': multiline, 'value': value, 'required': required}
+            'multiline': multiline, 'value': value, 'required': required,
+            'tab_index': tab_index}
 
 
 def refedit(name, width=None):
@@ -118,6 +132,7 @@ def refedit(name, width=None):
     こちらはモードレス表示でも安定して動く。vba_stub がボタンの
     範囲選択ハンドラを自動生成する。
     """
+    check_control_name(name)
     t = {'kind': 'txt', 'name': name, 'width': width,
          'height': STYLE['ctrl_h'], 'multiline': False, 'value': "",
          'required': False}
@@ -131,6 +146,7 @@ def refedit(name, width=None):
 def img(name, width, height, picture=None):
     """画像。picture にファイルパスを渡すと vba_stub の Initialize で
     LoadPicture される（デザイン時埋め込みではなく実行時読込）。"""
+    check_control_name(name)
     return {'kind': 'img', 'name': name, 'width': width, 'height': height,
             'picture': picture}
 
@@ -141,6 +157,7 @@ def spin_txt(name, value="0", width=48, min_=0, max_=100):
     行内に txt と spin を並べて返し、vba_stub が連動イベント
     （Spin変更→txt反映、txt変更→Spin追随）を生成する。
     """
+    check_control_name(name)
     t = {'kind': 'txt', 'name': name, 'width': width, 'height': STYLE['ctrl_h'],
          'multiline': False, 'value': str(value), 'required': False,
          'spin': {'min': min_, 'max': max_}}
@@ -149,32 +166,42 @@ def spin_txt(name, value="0", width=48, min_=0, max_=100):
     return [t, s]
 
 
-def combo(name, width=None, items=None, rowsource=None):
+def combo(name, width=None, items=None, rowsource=None, tab_index=None):
     """コンボボックス。items は vba_stub の Initialize で AddItem、
     rowsource="シート名!A1:A10" はシート範囲への直結（デザイン時プロパティ）"""
+    check_control_name(name)
     return {'kind': 'combo', 'name': name, 'width': width,
             'height': STYLE['ctrl_h'], 'items': items or [],
-            'rowsource': rowsource}
+            'rowsource': rowsource, 'tab_index': tab_index}
 
 
-def lst(name, width=None, height=None, rows_visible=6, items=None, rowsource=None):
-    """リストボックス。height 省略時は rows_visible 行ぶん。rowsource はシート範囲直結"""
+def lst(name, width=None, height=None, rows_visible=6, items=None, rowsource=None,
+        tab_index=None):
+    """リストボックス。height 省略時は rows_visible 行ぶん。rowsource はシート範囲直結
+
+    一覧系フォームは ListBox が TabIndex 0（開いた瞬間のフォーカスが一覧＝PageDown
+    が効く）のが正。配置順の自動採番でそれが崩れる場合は tab_index=0 を明示する。
+    """
+    check_control_name(name)
     return {'kind': 'lst', 'name': name, 'width': width,
             'height': height or (rows_visible * 12 + 6), 'items': items or [],
-            'rowsource': rowsource}
+            'rowsource': rowsource, 'tab_index': tab_index}
 
 
-def chk(name, caption, width=None):
+def chk(name, caption, width=None, tab_index=None):
     """チェックボックス"""
+    check_control_name(name)
     return {'kind': 'chk', 'name': name, 'caption': caption,
-            'width': width or (_text_w(caption) + 16), 'height': STYLE['lbl_h']}
+            'width': width or (_text_w(caption) + 16), 'height': STYLE['lbl_h'],
+            'tab_index': tab_index}
 
 
-def opt(name, caption, width=None, group=None):
+def opt(name, caption, width=None, group=None, tab_index=None):
     """オプションボタン。group で排他グループを指定"""
+    check_control_name(name)
     return {'kind': 'opt', 'name': name, 'caption': caption,
             'width': width or (_text_w(caption) + 16), 'height': STYLE['lbl_h'],
-            'group': group}
+            'group': group, 'tab_index': tab_index}
 
 
 def opt_group(*pairs, group=None):
@@ -187,12 +214,14 @@ def opt_group(*pairs, group=None):
 
 
 def btn(name, caption, width=None, height=None, default=False, cancel_btn=False,
-        bold=False, accel=None):
+        bold=False, accel=None, tab_index=None):
     """ボタン。button_bar 内では全ボタンが同サイズに揃えられる。accel=アクセラレータ文字"""
+    check_control_name(name)
     return {'kind': 'btn', 'name': name, 'caption': caption,
             'width': width or max(STYLE['btn_w'], _text_w(caption) + 16),
             'height': height or STYLE['btn_h'],
-            'default': default, 'cancel': cancel_btn, 'bold': bold, 'accel': accel}
+            'default': default, 'cancel': cancel_btn, 'bold': bold, 'accel': accel,
+            'tab_index': tab_index}
 
 
 def ok(name="btnOK", caption="OK", **kw):
@@ -215,11 +244,18 @@ def row(*elems):
             flat.extend(e)
         else:
             flat.append(e)
+    # 空の行を通すと配置計算の max() が空列で ValueError になり、原因が分からない
+    # エラーとして噴き出す。宣言の受理時点で理由つきで止める（縦の空きは spacer()）
+    if not flat:
+        raise ValueError("row() には要素を1つ以上入れてください"
+                         "（縦の空きが欲しい場合は spacer() を使う）")
     return {'kind': 'row', 'elems': flat}
 
 
 def button_bar(*btns):
     """ボタンバー（右下寄せ・同サイズ揃え）。並び順は「実行系 → キャンセルが右端」"""
+    if not btns:
+        raise ValueError("button_bar() にはボタンを1つ以上入れてください")
     return {'kind': 'bar', 'elems': list(btns)}
 
 
@@ -228,7 +264,7 @@ def spacer(height=None):
     return {'kind': 'spacer', 'height': height or STYLE['gap_y'] * 2}
 
 
-def frame(caption, *rows_, name=None):
+def frame(caption, *rows_, name=None, tab_index=None):
     """枠付きグループ。中に row/spacer/bar を入れられる（frame の入れ子は不可）
 
     name 省略時は caption から決定的に採番する。hash() はプロセス毎に乱数化
@@ -241,7 +277,7 @@ def frame(caption, *rows_, name=None):
             raise ValueError("frame の中に frame / multipage は入れられません")
     auto = f"fra{zlib.crc32(str(caption).encode('utf-8')) % 10000:04d}"
     return {'kind': 'frame', 'caption': caption, 'rows': list(rows_),
-            'name': name or auto}
+            'name': check_control_name(name or auto), 'tab_index': tab_index}
 
 
 def page(caption, *rows_):
@@ -252,7 +288,7 @@ def page(caption, *rows_):
     return {'kind': 'page', 'caption': caption, 'rows': list(rows_)}
 
 
-def multipage(name, *pages_):
+def multipage(name, *pages_, tab_index=None):
     """タブ付きコンテナ。page(...) を並べる。
 
     例: multipage("mpMain",
@@ -261,21 +297,34 @@ def multipage(name, *pages_):
     """
     if not pages_ or any(p['kind'] != 'page' for p in pages_):
         raise ValueError("multipage には page(...) を1つ以上入れてください")
-    return {'kind': 'multipage', 'name': name, 'pages': list(pages_)}
+    check_control_name(name)
+    return {'kind': 'multipage', 'name': name, 'pages': list(pages_),
+            'tab_index': tab_index}
 
 
 # ================================================================
 # レイアウト計算（純粋計算・COM なし）
 # ================================================================
 
+REQUIRED_MARK = ' ＊'   # required=True の行のラベルに付く印（幅計算と描画で共有）
+
+
 def _label_col_width(rows):
-    """先頭要素が lbl の行から、ラベル列の幅を決める（frame 内は独立に計算）"""
+    """先頭要素が lbl の行から、ラベル列の幅を決める（frame 内は独立に計算）
+
+    required=True の入力を含む行のラベルには _layout_region が ＊ を付ける。
+    印を付ける前のキャプションで幅を測ると、必須項目のラベルほど末尾が欠ける
+    （＊ を含めた幅で測る）。
+    """
     w = 0
     for r in rows:
         if r['kind'] == 'row' and r['elems'] and r['elems'][0]['kind'] == 'lbl' \
            and len(r['elems']) > 1:
             e = r['elems'][0]
-            w = max(w, e['width'] or _text_w(e['caption']))
+            cap = e.get('caption') or ''
+            if any(x.get('required') for x in r['elems'][1:]):
+                cap += REQUIRED_MARK
+            w = max(w, e['width'] or _text_w(cap))
     return w
 
 
@@ -391,7 +440,7 @@ def _layout_region(rows, content_width, x0, y0):
         # 必須項目（required=True）を含む行は、ラベルに ＊ を付けて見せる
         if has_label and any(x.get('required') for x in elems[1:]):
             head = dict(elems[0])
-            head['caption'] = (head.get('caption') or '') + ' ＊'
+            head['caption'] = (head.get('caption') or '') + REQUIRED_MARK
             elems = [head] + elems[1:]
         x = x0
         fixed = _row_fixed_width(r, label_w)
@@ -572,7 +621,10 @@ def generate_vba_stub(rows, out_path=None):
     for e in elems:
         if e['kind'] in ('combo', 'lst') and e.get('items'):
             for it in e['items']:
-                init.append(f'    {e["name"]}.AddItem "{it}"')
+                # VBA の文字列リテラル中の " は "" でエスケープする
+                # （生のまま埋めると項目に " が含まれた時点で生成コードが壊れる）
+                esc = str(it).replace('"', '""')
+                init.append(f'    {e["name"]}.AddItem "{esc}"')
     for e in elems:
         if e['kind'] == 'spin':
             init.append(f'    {e["name"]}.Value = Val({e["for"]}.Value)')
@@ -666,11 +718,14 @@ def _backup_existing_form(fb, form_name):
 def _place_control(container, e, left, top, w, h, tab_state):
     """1コントロールを container（フォーム or Frame）に配置する"""
     kind = e['kind']
-    if kind == 'lbl' and 'name' not in e:
+    # ラベルは name 省略可（lbl1, lbl2... と機械採番）。名前を明示したラベルは
+    # VBA から名指しされている可能性があるので、その名前をそのまま使う
+    if kind == 'lbl' and not e.get('name'):
         tab_state['lbl_seq'] += 1
         name = f"lbl{tab_state['lbl_seq']}"
     else:
         name = e.get('name') or f"ctl{tab_state['tab']}"
+    check_control_name(name)
     ct = container.Controls.Add(_PROGID[kind], name)
     ct.Left = left; ct.Top = top; ct.Width = w; ct.Height = h
     try:
@@ -718,8 +773,12 @@ def _place_control(container, e, left, top, w, h, tab_state):
                 pass
     if kind == 'lbl' and e.get('bold'):
         ct.Font.Bold = True
+    # tab_index を明示した要素はその値を使う（省略時のみ配置順で自動採番）。
+    # ListBox 先頭フォーカスのような「配置順では表せない意図」を、
+    # inspect --to-layout → build の往復で失わないための逃げ道
+    ti = e.get('tab_index')
     try:
-        ct.TabIndex = tab_state['tab']
+        ct.TabIndex = tab_state['tab'] if ti is None else ti
     except Exception:
         pass
     tab_state['tab'] += 1
@@ -826,7 +885,10 @@ def build_form(form_name, caption, rows, width=None, vba_file=None,
                         cm.ProcStartLine(proc, 0)
                         print(f"起動マクロは既存: [{mod.Name}] {proc}（変更なし）")
                     except Exception:
-                        body = f"\nSub {proc}()\n    {form_name}.Show\nEnd Sub"
+                        # 改行は CRLF に揃える（改行二重化ガード／他の注入点と統一。
+                        # LF のまま InsertLines に渡していた唯一の穴だった）
+                        body = "\r\n".join(
+                            ["", f"Sub {proc}()", f"    {form_name}.Show", "End Sub"])
                         cm.InsertLines(cm.CountOfLines + 1, body)
                         print(f"起動マクロ追加: [{mod.Name}] Sub {proc}()")
 

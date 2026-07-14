@@ -107,6 +107,47 @@ def parse_target_and_rest(posargs):
     return None, list(posargs)
 
 
+# Excel が「今は応答できない」ときに返す HRESULT（参照が死んだわけではない）。
+# マクロ実行中・モーダルダイアログ表示中・セル編集中は普通にこれが返る。
+_COM_BUSY_HRESULTS = (
+    -2147418111,  # 0x80010001 RPC_E_CALL_REJECTED
+    -2147417846,  # 0x8001010A RPC_E_SERVERCALL_RETRYLATER
+    -2147417847,  # 0x80010109 RPC_E_SERVERCALL_REJECTED
+)
+
+
+def _com_is_busy(ex):
+    """COM 例外が「Excel がビジー（＝生きているが今は応答できない）」かどうか"""
+    for val in (getattr(ex, 'hresult', None),) + tuple(getattr(ex, 'args', ()) or ()):
+        if isinstance(val, int) and val in _COM_BUSY_HRESULTS:
+            return True
+    return False
+
+
+def _pid_is_excel(pid):
+    """その PID が今も EXCEL.EXE かを確認する（強制終了の前の身元確認）。
+
+    Windows は終了したプロセスの PID を再利用する。参照が死んだ＝プロセスは
+    もう無い、という状況で PID を撃つと、その番号を引き継いだ無関係のプロセスを
+    殺しうる。確認できないときは False（撃たない）を返す。
+    """
+    if pid is None:
+        return False
+    try:
+        import win32api
+        import win32con
+        import win32process
+        h = win32api.OpenProcess(
+            win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ, False, pid)
+        try:
+            name = win32process.GetModuleFileNameEx(h, 0)
+        finally:
+            win32api.CloseHandle(h)
+        return os.path.basename(name).lower() == 'excel.exe'
+    except Exception:
+        return False
+
+
 def release_created_instances(only_saved=True):
     """自動起動した Excel インスタンスのうち、後始末してよいものを閉じて終了する。
 
@@ -131,6 +172,7 @@ def release_created_instances(only_saved=True):
         xl = inst.get("xl")
         pid = inst.get("pid")
         alive = True
+        busy = False
         dirty = False
         try:
             wbs = xl.Workbooks
@@ -141,8 +183,17 @@ def release_created_instances(only_saved=True):
                         break
                 except Exception:
                     pass
-        except Exception:
-            alive = False  # 参照が既に死んでいる（手動で閉じられた等）→ 台帳から落とすだけ
+        except Exception as ex:
+            if _com_is_busy(ex):
+                # マクロ実行中・モーダル表示中。生きているし、未保存かどうかも
+                # 今は判定できない。ここで畳むと only_saved の約束（未保存は温存）を
+                # 破って変更を捨てるので、触らず次のアイドルに回す
+                busy = True
+            else:
+                alive = False  # 参照が本当に死んでいる（手動で閉じられた等）
+        if busy:
+            keep.append(inst)
+            continue
         if alive and only_saved and dirty:
             keep.append(inst)
             continue
@@ -157,8 +208,9 @@ def release_created_instances(only_saved=True):
                 xl.Quit()
             except Exception:
                 pass
-        if pid is not None:
-            # Quit がゾンビ化しても残さない（cleanup_excel と同じ最終手段）
+        # Quit がゾンビ化しても残さない（cleanup_excel と同じ最終手段）。ただし
+        # PID の身元を確認してから撃つ（再利用された PID の巻き添えを防ぐ）
+        if _pid_is_excel(pid):
             try:
                 os.kill(pid, signal.SIGTERM)
             except Exception:
@@ -221,14 +273,19 @@ def cleanup_excel():
             except Exception as ex:
                 print(f"[DEBUG] Error during Excel cleanup: {ex}")
 
-        # 新規起動したPIDが存在する場合は強制クリーンアップ
+        # 新規起動したPIDが存在する場合は強制クリーンアップ。
+        # 撃つ前に「その PID が今も EXCEL.EXE か」を確認する（既に終了していた場合、
+        # Windows は PID を再利用するため無関係のプロセスを殺しうる）
         if pid is not None:
-            try:
-                print(f"[DEBUG] Force-killing Excel process (PID: {pid})...")
-                os.kill(pid, signal.SIGTERM)
-                print("[DEBUG] Excel process force-killed successfully.")
-            except Exception as ex:
-                print(f"[DEBUG] Excel process force-kill failed or already exited: {ex}")
+            if not _pid_is_excel(pid):
+                print(f"[DEBUG] PID {pid} は既に EXCEL.EXE ではありません（終了済み）。強制終了はしません。")
+            else:
+                try:
+                    print(f"[DEBUG] Force-killing Excel process (PID: {pid})...")
+                    os.kill(pid, signal.SIGTERM)
+                    print("[DEBUG] Excel process force-killed successfully.")
+                except Exception as ex:
+                    print(f"[DEBUG] Excel process force-kill failed or already exited: {ex}")
 
     _created_instances = []
     _created_xl = None
@@ -409,8 +466,24 @@ def get_workbook(target_file_arg=None, load_addins=False, readonly=False):
                 except Exception:
                     pass
             if was_ro and not readonly:
-                print("⚠ このブックは診断用に読み取り専用で開いています。"
-                      "編集するには Excel で通常モードで開き直してください。")
+                # 健診モード（読み取り専用・イベント無効）で開いたブックを、同じ
+                # セッション（batch/shell/MCP は接続キャッシュを持ち越す）で書き込み系に
+                # 渡すと、編集が分かりにくい COM エラーで失敗する。
+                # 例: get <path> → replace-procedure <path>
+                # 警告だけでは直らないので、書き込みが要るときは通常モードで開き直す
+                print("（診断用に読み取り専用で開いていたブックを、書き込みのため通常モードで開き直します）")
+                try:
+                    wb.Close(SaveChanges=False)
+                except Exception:
+                    pass
+                try:
+                    xl.EnableEvents = True   # 健診モードで切っていたイベントを戻す
+                except Exception:
+                    pass
+                del _wb_cache[key]
+                xl, wb = _get_workbook_uncached(target_file_arg, load_addins, False)
+                _wb_cache[key] = (xl, wb, False)
+                return xl, wb
             if load_addins:
                 load_excel_addins_and_personal(xl)
             return xl, wb
@@ -1099,13 +1172,30 @@ def _unprotect_all_sheets(wb):
         try:
             ws.Unprotect()
             saved.append((ws, drawing, contents, scenarios, ui_only, allow_kwargs))
-        except Exception:
-            pass
+        except Exception as ex:
+            # 解除できなかった＝そのシートは保護されたまま。以後の操作はそこで失敗するが、
+            # 従来は完全に無言だったため「なぜ失敗したのか」が分からなかった
+            print(f"⚠ シート '{_ws_name(ws)}' の保護を一時解除できませんでした"
+                  f"（パスワード保護の可能性）: {ex}", file=sys.stderr)
+            print("  このシートを触る操作は失敗します。Excel 側で先に保護を解除してください。",
+                  file=sys.stderr)
     return saved
 
 
+def _ws_name(ws):
+    """シート名（取れなければ '?'）。エラーメッセージ用"""
+    try:
+        return ws.Name
+    except Exception:
+        return "?"
+
+
 def _reprotect_sheets(saved):
-    """_unprotect_all_sheets で記録した設定どおりに再保護する。"""
+    """_unprotect_all_sheets で記録した設定どおりに再保護する。
+
+    再保護に失敗したら必ず報告する。黙って諦めると「ブックの保護が外れたまま
+    コマンドは成功終了」になり、保護されているつもりのブックが無防備になる。
+    """
     for ws, drawing, contents, scenarios, ui_only, allow_kwargs in saved:
         try:
             ws.Protect(DrawingObjects=drawing, Contents=contents,
@@ -1116,8 +1206,41 @@ def _reprotect_sheets(saved):
                 # allow_kwargs の一部が今の Excel バージョンで受理されない場合の保険
                 ws.Protect(DrawingObjects=drawing, Contents=contents,
                            Scenarios=scenarios, UserInterfaceOnly=ui_only)
+                print(f"⚠ シート '{_ws_name(ws)}' を再保護しましたが、"
+                      "細かい許可設定（並べ替え許可など）は復元できませんでした。",
+                      file=sys.stderr)
+            except Exception as ex:
+                print(f"⚠ シート '{_ws_name(ws)}' の再保護に失敗しました: {ex}",
+                      file=sys.stderr)
+                print("  このシートは保護が外れたままです。Excel 側で保護し直してください。",
+                      file=sys.stderr)
+
+
+# 実行中の protected_sheets_guard（forget_protection から参照する）
+_active_guards = []
+
+
+def forget_protection(ws):
+    """このシートを「ガードの再保護対象」から外す（保護解除そのものが目的の操作用）。
+
+    ガードは入口で全保護シートを一時解除し、出口で記録どおり再保護する。
+    そのため sheet unprotect のように「保護を外すこと自体が目的」の操作は、
+    出口で保護を戻されて無言で効かなくなる。この関数で記録から落としておく。
+    """
+    try:
+        name = ws.Name
+    except Exception:
+        return
+    for g in _active_guards:
+        kept = []
+        for entry in g._saved:
+            try:
+                if entry[0].Name == name:
+                    continue
             except Exception:
                 pass
+            kept.append(entry)
+        g._saved = kept
 
 
 class protected_sheets_guard:
@@ -1147,9 +1270,14 @@ class protected_sheets_guard:
             except Exception:
                 pass
         self._saved = _unprotect_all_sheets(self.wb)
+        _active_guards.append(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            _active_guards.remove(self)
+        except ValueError:
+            pass
         _reprotect_sheets(self._saved)
         if self._wb_saved:
             try:
@@ -1211,6 +1339,11 @@ __all__ = [
     '_wb_cache',
     '_unprotect_all_sheets',
     '_reprotect_sheets',
+    '_active_guards',
+    '_com_is_busy',
+    '_pid_is_excel',
+    '_ws_name',
+    'forget_protection',
     'protected_sheets_guard',
     'protect_safe',
     'argparse',

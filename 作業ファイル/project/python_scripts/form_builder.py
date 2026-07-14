@@ -28,11 +28,32 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ================================================================
+# コントロール名のガード
+# ================================================================
+
+def check_control_name(name):
+    """コントロール名を VBA 識別子として検査する（無効なら ValueError）。
+
+    Controls.Add は名前を検査せず受け入れる。だが先頭 _ 等の無効な名前を通すと、
+    そこから機械生成されるイベント Sub 名（例: _xSpin_Change）が VBA の識別子
+    規則に反し、注入直前のガードで例外になる。その時点ではフォームを
+    clear_controls で作り直した後＝壊れたまま中断してしまう。
+    「壊す前に止める」ため、Controls.Add に渡す入口でここを通す。
+    """
+    import vba_manager
+    reason = vba_manager.check_vba_identifier(name)
+    if reason:
+        raise ValueError(f"コントロール名が不正です: {reason}")
+    return name
+
+
+# ================================================================
 # コントロール追加ヘルパー
 # ================================================================
 
 def add_btn(frm, name, caption, left, top, width, height, *, font_size=12, font_bold=False):
     """CommandButton を追加する"""
+    check_control_name(name)
     b = frm.Controls.Add("Forms.CommandButton.1", name)
     b.Caption = caption
     b.Left = left; b.Top = top; b.Width = width; b.Height = height
@@ -45,6 +66,7 @@ def add_btn(frm, name, caption, left, top, width, height, *, font_size=12, font_
 def add_lbl(frm, name, caption, left, top, width, height, *,
             align=1, fore=None, back=None, font_size=12, font_bold=False):
     """Label を追加する (align: 1=左, 2=中央, 3=右)"""
+    check_control_name(name)
     lbl = frm.Controls.Add("Forms.Label.1", name)
     lbl.Caption = caption
     lbl.Left = left; lbl.Top = top; lbl.Width = width; lbl.Height = height
@@ -62,6 +84,7 @@ def add_lbl(frm, name, caption, left, top, width, height, *,
 def add_txt(frm, name, left, top, width, height, *,
             value="", multiline=False, scrollbars=0, font_size=12):
     """TextBox を追加する"""
+    check_control_name(name)
     t = frm.Controls.Add("Forms.TextBox.1", name)
     t.Left = left; t.Top = top; t.Width = width; t.Height = height
     if value:
@@ -75,6 +98,7 @@ def add_txt(frm, name, left, top, width, height, *,
 
 def add_lst(frm, name, left, top, width, height, *, font_size=12):
     """ListBox を追加する"""
+    check_control_name(name)
     lb = frm.Controls.Add("Forms.ListBox.1", name)
     lb.Left = left; lb.Top = top; lb.Width = width; lb.Height = height
     lb.Font.Size = font_size
@@ -83,6 +107,7 @@ def add_lst(frm, name, left, top, width, height, *, font_size=12):
 
 def add_combo(frm, name, left, top, width, height, *, font_size=12):
     """ComboBox を追加する"""
+    check_control_name(name)
     cb = frm.Controls.Add("Forms.ComboBox.1", name)
     cb.Left = left; cb.Top = top; cb.Width = width; cb.Height = height
     cb.Font.Size = font_size
@@ -91,6 +116,7 @@ def add_combo(frm, name, left, top, width, height, *, font_size=12):
 
 def add_chk(frm, name, caption, left, top, width, height, *, font_size=12):
     """CheckBox を追加する"""
+    check_control_name(name)
     c = frm.Controls.Add("Forms.CheckBox.1", name)
     c.Caption = caption
     c.Left = left; c.Top = top; c.Width = width; c.Height = height
@@ -100,6 +126,7 @@ def add_chk(frm, name, caption, left, top, width, height, *, font_size=12):
 
 def add_opt(frm, name, caption, left, top, width, height, *, font_size=12):
     """OptionButton を追加する"""
+    check_control_name(name)
     o = frm.Controls.Add("Forms.OptionButton.1", name)
     o.Caption = caption
     o.Left = left; o.Top = top; o.Width = width; o.Height = height
@@ -109,6 +136,7 @@ def add_opt(frm, name, caption, left, top, width, height, *, font_size=12):
 
 def add_frame(frm, name, caption, left, top, width, height, *, font_size=12):
     """Frame を追加する"""
+    check_control_name(name)
     f2 = frm.Controls.Add("Forms.Frame.1", name)
     f2.Caption = caption
     f2.Left = left; f2.Top = top; f2.Width = width; f2.Height = height
@@ -118,6 +146,7 @@ def add_frame(frm, name, caption, left, top, width, height, *, font_size=12):
 
 def add_img(frm, name, left, top, width, height):
     """Image を追加する"""
+    check_control_name(name)
     img = frm.Controls.Add("Forms.Image.1", name)
     img.Left = left; img.Top = top; img.Width = width; img.Height = height
     return img
@@ -125,6 +154,7 @@ def add_img(frm, name, left, top, width, height):
 
 def add_spin(frm, name, left, top, width, height):
     """SpinButton を追加する"""
+    check_control_name(name)
     sp = frm.Controls.Add("Forms.SpinButton.1", name)
     sp.Left = left; sp.Top = top; sp.Width = width; sp.Height = height
     return sp
@@ -132,6 +162,7 @@ def add_spin(frm, name, left, top, width, height):
 
 def add_scroll(frm, name, left, top, width, height, *, orientation=0):
     """ScrollBar を追加する (orientation: 0=水平, 1=垂直)"""
+    check_control_name(name)
     sb = frm.Controls.Add("Forms.ScrollBar.1", name)
     sb.Left = left; sb.Top = top; sb.Width = width; sb.Height = height
     sb.Orientation = orientation
@@ -371,15 +402,26 @@ class FormBuilder:
         print(f"{form_name} は存在しません")
 
     def clear_controls(self, frm_comp):
-        """フォームの既存コントロールをすべて削除し、Designer オブジェクトを返す"""
+        """フォームの既存コントロールをすべて削除し、Designer オブジェクトを返す。
+
+        消せなかったものは必ず報告する。1個でも残ると後段の Controls.Add が
+        名前衝突で落ちるのに、失敗を握りつぶして「元の個数」を削除数として
+        出していたため、ログ上は「全部消した」に見えていた（偽の成功報告）。
+        """
         f = frm_comp.Designer
         names = [c.Name for c in f.Controls]
+        removed = 0
+        failed = []
         for n in names:
             try:
                 f.Controls.Remove(n)
-            except Exception:
-                pass
-        print(f"コントロールをクリア ({len(names)} 個削除)")
+                removed += 1
+            except Exception as e:
+                failed.append((n, e))
+        print(f"コントロールをクリア ({removed}/{len(names)} 個削除)")
+        for n, e in failed:
+            print(f"⚠ 削除できませんでした: {n} ({e}) "
+                  "— この名前で再追加すると名前衝突で失敗します")
         return f
 
     def inject_vba(self, frm_comp, vba_file=None):
