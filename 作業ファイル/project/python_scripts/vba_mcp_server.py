@@ -122,6 +122,17 @@ class _ThreadRouted(io.TextIOBase):
     def isatty(self):
         return False
 
+    @property
+    def buffer(self):
+        # MCP SDK の stdio_server は起動時に sys.stdin.buffer / sys.stdout.buffer を
+        # 掴む（TextIOWrapper で包む）。TextIOBase には buffer が無いため、これを
+        # 生やさないと mcp.run() が AttributeError でサーバー起動すらできない。
+        # JSON-RPC の線は常に本物へ直結させる（ジョブのリダイレクトとは無関係）
+        return self._real.buffer
+
+    def fileno(self):
+        return self._real.fileno()
+
 
 # 起動時に1回だけ据える。以後 sys.stdout/stderr/stdin は誰も差し替えない
 sys.stdout = _ThreadRouted(REAL_STDOUT, 'out')
