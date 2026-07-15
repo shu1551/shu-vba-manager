@@ -731,7 +731,7 @@ def to_layout_code(form_name, info, controls):
     out = ["# form_inspect --to-layout による自動生成（たたき台。items等の実行時情報は要手動）",
            "from form_layout import (build_form, row, lbl, txt, combo, lst, chk, opt,",
            "                         btn, ok, cancel, button_bar, spacer, heading, frame,",
-           "                         multipage, page)",
+           "                         multipage, page, img)",
            "",
            "rows = ["]
     prev_bottom = None

@@ -118,7 +118,7 @@ _COM_BUSY_HRESULTS = (
     -2147417846,  # 0x8001010A RPC_E_SERVERCALL_RETRYLATER
     -2147417847,  # 0x80010109 RPC_E_SERVERCALL_REJECTED
     -2147417851,  # 0x80010105 RPC_E_SERVERFAULT
-    -2146777072,  # 0x800AC472 VBA_E_IGNORE（Excel がセル編集中・モーダル表示中に返す
+    -2146777998,  # 0x800AC472 VBA_E_IGNORE（Excel がセル編集中・モーダル表示中に返す
                   #             一番ありふれた「今は無理」。これを外すと、ビジーな
                   #             Excel を「死んでいる」と誤判定して強制終了し、
                   #             未保存の変更を捨てる＝温存の約束を破る）

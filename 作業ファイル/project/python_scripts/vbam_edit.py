@@ -127,7 +127,9 @@ def cmd_write_range(args):
         col_part = spec
         if '!' in spec:
             sheet_part, col_part = spec.split('!', 1)
-            if sheet_opt and sheet_opt != sheet_part:
+            # 照合はクォートを剥がしてから（"'ログ'!A" と --sheet ログ は同じ指定。
+            # 剥がす前に比べると、同じシートなのに「食い違い」と誤エラーになる）
+            if sheet_opt and sheet_opt.strip("'") != sheet_part.strip("'"):
                 print(f"エラー: シート指定が食い違っています（'{spec}' と --sheet {sheet_opt}）")
                 return False
         elif sheet_opt:
@@ -1189,16 +1191,13 @@ def cmd_find_replace(args):
     count = 0
     first = None
     # SearchFormat / MatchByte も Sort の Orientation と同じ「省略すると前回値を
-    # 引き継ぐ」族。UI で「書式を指定して検索」した後だと Find が書式条件つきで走り、
-    # 0件になって「見つかりませんでした（置換なし）」と正常終了する＝無言失敗。
-    # MatchByte も残ると日本語シートで半角/全角の区別が勝手に付く
-    try:
-        xl.FindFormat.Clear()
-        xl.ReplaceFormat.Clear()
-    except Exception:
-        pass
+    # 引き継ぐ」族なので、引数で明示して前回値に依存しない。
+    # ・SearchFormat=False で書式条件は無視される（Application.FindFormat.Clear() まで
+    #   撃つのは、ユーザーが UI に仕込んだ「書式を指定して検索」の設定を消す越権）
+    # ・MatchByte=True＝半角/全角を区別する（厳密側）。False だと「アイウ」の置換が
+    #   "ｱｲｳ" のセルまで当たり、指示より広く書き換わる
     cell = rng.Find(What=needle, LookAt=look_at, LookIn=-4123, MatchCase=match_case,
-                    SearchFormat=False, MatchByte=False)
+                    SearchFormat=False, MatchByte=True)
     while cell is not None:
         addr = cell.Address
         if first is None:
@@ -1211,7 +1210,7 @@ def cmd_find_replace(args):
         print(f"'{needle}' は {ws.Name}!{rng.Address} に見つかりませんでした（置換なし）")
         return True
     rng.Replace(What=needle, Replacement=repl, LookAt=look_at, MatchCase=match_case,
-                SearchFormat=False, ReplaceFormat=False, MatchByte=False)
+                SearchFormat=False, ReplaceFormat=False, MatchByte=True)
     print(f"置換: {ws.Name}!{rng.Address}  '{needle}' → '{repl}'  （{count}セルにヒット）")
     print("（保存はしていません）")
     return True

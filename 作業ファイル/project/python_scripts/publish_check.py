@@ -69,18 +69,23 @@ def check(path):
         if not _is_initialish(val):
             issues.append(f'{tag} が実名の可能性: {val!r}')
             realnames.append(val.strip())
-    # タイトル・説明・キーワードは社内文書の名残（担当者名・部署名）が残りやすい
+    # タイトル・説明・キーワードは社内文書の名残（担当者名・部署名）が残りやすい。
+    # 「値があるだけ」で公開NGにはしない（タイトル『ファイル一覧』のような無害な値まで
+    # exit 1 で止めると、ゲートが常時鳴って exit 1 を無視する癖を育てる）。
+    # 表示して目視に回し、作成者由来の実名が入っている場合だけブロックする
     for tag in ('dc:title', 'dc:description', 'cp:keywords', 'cp:category'):
         val = _tag_value(core, tag).strip()
         if val:
             print(f'  {tag}: {val!r} [★要確認]')
-            issues.append(f'{tag} に値が残っています: {val!r}')
+            if any(rn and rn in val for rn in realnames):
+                issues.append(f'{tag} に実名を含む値: {val!r}')
     app = _grab(z, 'docProps/app.xml')
     for tag in ('Company', 'Manager'):
         val = _tag_value(app, tag).strip()
         if val:
             print(f'  {tag}: {val!r} [★要確認]')
-            issues.append(f'{tag}: {val!r}')
+            if any(rn and rn in val for rn in realnames):
+                issues.append(f'{tag} に実名を含む値: {val!r}')
     # カスタムプロパティ（社内テンプレ由来の作成者・部署が入っていることがある）
     custom = _grab(z, 'docProps/custom.xml')
     if custom:
@@ -95,7 +100,10 @@ def check(path):
             print(f'  カスタムプロパティ: {len(props)}件 [★要確認]')
             for n, v in props:
                 print(f'      {n} = {v!r}')
-            issues.append(f'カスタムプロパティ {len(props)}件: {[n for n, _ in props]}')
+            named = [(n, v) for n, v in props
+                     if any(rn and rn in v for rn in realnames)]
+            if named:
+                issues.append(f'カスタムプロパティに実名を含む値: {named}')
     # ハイパーリンク: file:///C:/Users/実名/… が一番実名パスの残る場所
     # （ファイル一覧.xlsm 系はハイパーリンクだらけ）。sheet だけでなく全 .rels を見る。
     linkhits = []
@@ -119,22 +127,44 @@ def check(path):
     except KeyError:
         vba = b''
     if vba:
-        vba_hits = []
-        needles = [r'C:\Users', r'C:/Users'] + [n for n in realnames if n]
-        for needle in needles:
+        # 実名（作成者タグ由来）の直書きは無条件でブロック
+        name_hits = []
+        for needle in [n for n in realnames if n]:
             for enc in ('cp932', 'utf-16-le'):
                 try:
                     b = needle.encode(enc)
                 except UnicodeEncodeError:
                     continue
                 if b and b in vba:
-                    vba_hits.append(f'{needle}（{enc}）')
-        print(f'  vbaProject.bin 内のローカルパス/実名: {len(vba_hits)}件')
-        if vba_hits:
-            for h in vba_hits:
-                print(f'      {h}')
-            issues.append(f'vbaProject.bin に実名/ローカルパス: {vba_hits}'
-                          '（VBAコード中のパス文字列を書き換えて作り直すこと）')
+                    name_hits.append(f'{needle}（{enc}）')
+        # C:\Users\… は「その直後のユーザー名」を取り出して判定する。
+        # プレフィックスのヒットだけで exit 1 にすると、MSForms.exd の参照パス等
+        # （フォームを持つブックにはほぼ必ず残る）でゲートが常時鳴り、
+        # exit 1 を無視する癖を育てる＝ゲートとして一番危険な劣化。
+        # ユーザー名がイニシャル級（例: shu）なら表示のみ、実名級ならブロック
+        path_users = set()
+        for prefix in ('C:\\Users\\', 'C:/Users/'):
+            for enc in ('cp932', 'utf-16-le'):
+                b = prefix.encode(enc)
+                pos = vba.find(b)
+                while pos >= 0:
+                    tail = vba[pos + len(b): pos + len(b) + 128].decode(enc, 'ignore')
+                    m = re.match(r'[^\\/\x00-\x1f"<>|?*]{1,64}', tail)
+                    if m:
+                        path_users.add(m.group(0))
+                    pos = vba.find(b, pos + 1)
+        bad_users = sorted(u for u in path_users if not _is_initialish(u))
+        ok_users = sorted(u for u in path_users if _is_initialish(u))
+        print(f'  vbaProject.bin 内の実名直書き: {len(name_hits)}件 / '
+              f'C:\\Users パスのユーザー名: {sorted(path_users)!r}')
+        if ok_users:
+            print(f'      [★要目視] C:\\Users\\{"、".join(ok_users)} … は'
+                  'イニシャル級のため公開は止めません（MSForms.exd 等の参照パス由来が典型）')
+        if name_hits:
+            issues.append(f'vbaProject.bin に実名の直書き: {name_hits}')
+        if bad_users:
+            issues.append(f'vbaProject.bin の C:\\Users パスに実名級のユーザー名: {bad_users}'
+                          '（実名を含まない環境でフォームを保存し直す等の対処が必要）')
     wbx = _grab(z, 'xl/workbook.xml')
     hidden = re.findall(r'<sheet [^>]*state="(?:hidden|veryHidden)"[^>]*/?>', wbx)
     print(f'  隠しシート: {len(hidden)}件')
@@ -215,7 +245,7 @@ def scrub(path):
 
     if not blanked:
         print('  空欄化する項目はありませんでした（dc:creator / cp:lastModifiedBy は既に空欄）。')
-        return
+        return False
 
     tmp = path + '.scrub.tmp'
     try:
@@ -230,6 +260,7 @@ def scrub(path):
     print(f'  空欄化しました: {path}')
     for b in blanked:
         print(f'    - {b} → 空欄')
+    return True
 
 
 def main():
@@ -255,9 +286,11 @@ def main():
         else:
             print('  ✓ 機械チェックは全項目クリア（残留値は上の表示を目視）')
         if args.scrub:
-            scrub(p)
-            print('  ※ 空欄化しました。上の検査結果は空欄化「前」の状態です。')
-            print('     空欄化後の状態を確認するには --scrub なしでもう一度実行してください。')
+            # 空欄化ゼロの直後に「空欄化しました」と続けると、同じ実行結果の中で
+            # 矛盾する2行が並ぶ（PII ツールが嘘の報告をしてはいけない）
+            if scrub(p):
+                print('  ※ 空欄化しました。上の検査結果は空欄化「前」の状態です。')
+                print('     空欄化後の状態を確認するには --scrub なしでもう一度実行してください。')
     sys.exit(1 if ng else 0)
 
 

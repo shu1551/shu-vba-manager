@@ -88,13 +88,20 @@ def update_module(vbp, mod_name):
     try:
         cm.AddFromString(new_code)
     except Exception:
-        # 空のモジュールを残さない。旧コードを書き戻してから失敗を伝える
+        # 空のモジュールを残さない。旧コードを書き戻してから失敗を伝える。
+        # 書き戻し自体が失敗することもある（COM ビジー等）。そのときに
+        # 「元に戻しました」と言うと嘘になるので、戻せなかった事実で言い分ける
         try:
-            cm.DeleteLines(1, cm.CountOfLines)
-        except Exception:
-            pass
-        cm.AddFromString(_normalize_crlf(old_code))
-        print(f"  ! {mod_name}: 書き込みに失敗したため、元のコードに戻しました")
+            try:
+                cm.DeleteLines(1, cm.CountOfLines)
+            except Exception:
+                pass
+            cm.AddFromString(_normalize_crlf(old_code))
+            print(f"  ! {mod_name}: 書き込みに失敗したため、元のコードに戻しました")
+        except Exception as rb_ex:
+            print(f"  ! {mod_name}: 書き込みに失敗し、元のコードにも戻せませんでした"
+                  f"（{rb_ex}）。開いているブック上では空のままです。"
+                  "保存せずに閉じてください（ファイル側は無傷です）。")
         raise
 
     print(f"  ✓ {mod_name}: 説明文を削除（必要ならマクロも追記）")
@@ -134,10 +141,12 @@ def update_excel_live():
                 failed.append(mod_name)
 
         if failed:
-            # 1つでもコケたら保存しない（中途半端な状態をファイルに焼き付けない）
+            # 1つでもコケたら保存しない（中途半端な状態をファイルに焼き付けない）。
+            # 「元に戻してあります」と一括で断言しない（戻し自体に失敗した場合は
+            # update_module がその旨を出している）
             print(f"エラー: {', '.join(failed)} の更新に失敗したため、保存しませんでした。")
-            print("  開いているブックは元の内容に戻してあります。"
-                  "保存せずに閉じれば確実に元通りです。")
+            print("  各モジュールの状態は上の行のとおりです。"
+                  "保存せずに閉じれば確実に元通りです（ファイル側は無傷）。")
             return 1
 
         wb.Save()

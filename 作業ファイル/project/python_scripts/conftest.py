@@ -9,6 +9,12 @@ CI や普段の確認は純ロジックだけで 1〜2 秒で終わる。
 """
 import pytest
 
+# sync_tools.py が退避した旧版コピー（_sync_backup/～/test_tools.py 等）を
+# pytest が再帰収集すると、本物の test_tools.py と import 名が衝突して
+# collection error になり、テストが1件も走らない（公開リポ側で実測）。
+# 退避フォルダは収集対象から外す
+collect_ignore_glob = ["_sync_backup*"]
+
 
 def pytest_addoption(parser):
     parser.addoption(

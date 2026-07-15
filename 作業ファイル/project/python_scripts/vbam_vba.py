@@ -983,6 +983,11 @@ def _inline_body_after_decl(raw, decl_end):
                         break
             i += 1
     rest = s[i:]
+    # ':' を探す前に行末コメントを落とす。落とさないと
+    # 「Sub X() ' 例: Run "整形" してから」のようなコメント内のコロンを
+    # 本体の区切りと誤認し、コメント文をコードとして走査してしまう
+    # （コメント内の Call/Run が偽の呼び出しとして call-graph に載る）
+    rest = _strip_vba_comment(rest)
     # 引数リストの後ろに ':' があれば、それ以降が同じ行に書かれた本体
     # （'As String' のような戻り型指定はコロンの手前にある）
     if ':' not in rest:

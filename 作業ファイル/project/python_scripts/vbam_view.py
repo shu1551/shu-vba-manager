@@ -844,6 +844,8 @@ def cmd_snapshot(args):
             parts.append("図形読取不可")
         if "tables" in info:
             parts.append(f"表{len(info['tables'])}")
+        if (info.get("format") or {}).get("rows_coarse"):
+            parts.append(f"書式粗{len(info['format']['rows_coarse'])}範囲")
         mark = '*' if name == active else ' '
         print(f"{mark} {name}: " + "  ".join(p for p in parts if p))
     print("-" * 60)
@@ -853,6 +855,19 @@ def cmd_snapshot(args):
         print("⚠ 次のシートは図形を読み取れませんでした（このJSONでは図形なしと区別できません）:")
         for n, e in shape_err:
             print(f"   {n}: {e}")
+        print("-" * 60)
+    # 書式の走査が予算打ち切りで粗い粒度のまま残ったシートも明示する
+    # （JSON には rows_coarse で残るが、端末で黙っていると「全部見た」に読める）
+    fmt_coarse = [(n, (i.get("format") or {}).get("rows_coarse"))
+                  for n, i in sheets.items()
+                  if (i.get("format") or {}).get("rows_coarse")]
+    if fmt_coarse:
+        print("⚠ 次のシートは書式の走査が粗い粒度で打ち切られています"
+              "（その範囲の行の書式は塊のままです）:")
+        for n, rngs in fmt_coarse:
+            head = '、'.join(f"{a}〜{b}行" for a, b in rngs[:5])
+            more = len(rngs) - 5
+            print(f"   {n}: {head}" + (f" 他{more}件" if more > 0 else ""))
         print("-" * 60)
     print("このJSONを read して質問すれば、開いたままブックLMになる。")
     return True
@@ -993,6 +1008,7 @@ def cmd_snapshot_diff(args):
     trunc_note_hidden = []    # セル打ち切りで一部しか比較できず、かつ他に差分がなく非表示のシート
     unread_note_hidden = []   # 読み取り失敗で比較を降り、かつ他に差分がなく非表示のシート
     unread_any = []           # 読み取り失敗が1件でもあったシート（最後の総括に出す）
+    coarse_any = []           # 書式走査が予算打ち切りで粗い粒度だったシート（総括に出す）
 
     for name in [n for n in old_sheets if n not in new_sheets]:
         diff_sheets += 1
@@ -1074,7 +1090,10 @@ def cmd_snapshot_diff(args):
                     fields.append(f"OnAction {a.get('onaction')}→{b.get('onaction')}")
                 if (a.get('l'), a.get('t')) != (b.get('l'), b.get('t')):
                     fields.append(f"位置 ({a.get('l')},{a.get('t')})→({b.get('l')},{b.get('t')})")
-                if (a.get('w'), a.get('h')) != (b.get('w'), b.get('h')):
+                # w/h を持たない旧版 snapshot と比べるときは大きさ比較を降りる。
+                # 降りないと (NonexNone)→(WxH) の疑似差分が図形の数だけ出る
+                if (('w' in a or 'h' in a) and ('w' in b or 'h' in b)
+                        and (a.get('w'), a.get('h')) != (b.get('w'), b.get('h'))):
                     fields.append(f"大きさ ({a.get('w')}x{a.get('h')})→({b.get('w')}x{b.get('h')})")
                 if fields:
                     s_chg.append((n2, fields))
@@ -1087,6 +1106,7 @@ def cmd_snapshot_diff(args):
         fmt_missing = _fmt_missing            # 片方だけ --no-format で採った
         of_, nf_ = oi.get('format') or {}, ni.get('format') or {}
         f_chg = []
+        fmt_coarse_ranges = []
         if not fmt_unreadable and of_ and nf_:
             def _fmt_label(k):
                 return {'bold': '太字', 'size': '文字サイズ', 'font': 'フォント',
@@ -1132,6 +1152,18 @@ def cmd_snapshot_diff(args):
                 rows_old = x.get('rows') or {}
                 return [(int(k), int(k), v) for k, v in rows_old.items() if k.isdigit()]
 
+            # 予算打ち切りで粗い粒度のまま残った行範囲（rows_coarse）は、
+            # still_mixed の None（=細かく見ていない）を抱えたままなので、
+            # そのまま比べると「太字 None → False」のような疑似差分を量産する。
+            # 片側でも粗い範囲に重なる区間は比較を降り、事実として報告する
+            fmt_coarse_ranges = (
+                [(int(a), int(b)) for a, b in (of_.get('rows_coarse') or ())]
+                + [(int(a), int(b)) for a, b in (nf_.get('rows_coarse') or ())])
+
+            def _overlaps_coarse(a0, a1):
+                return any(not (a1 < c0 or c1 < a0)
+                           for c0, c1 in fmt_coarse_ranges)
+
             ob, nb = _blocks(of_), _blocks(nf_)
             if ob and nb:
                 # 両者の境目を集めて区間に割る（重なる範囲だけを比べる＝
@@ -1156,6 +1188,8 @@ def cmd_snapshot_diff(args):
                     a0, a1 = edges[i], edges[i + 1] - 1
                     if a0 > a1:
                         continue
+                    if _overlaps_coarse(a0, a1):
+                        continue      # 粗くしか見ていない範囲＝比較しない（下で必ず報告）
                     da, db = _at(ob, a0), _at(nb, a0)
                     if da is None or db is None:
                         continue
@@ -1171,6 +1205,9 @@ def cmd_snapshot_diff(args):
             t_add = sorted([n2 for n2 in nt if n2 not in ot])
             t_del = sorted([n2 for n2 in ot if n2 not in nt])
             t_chg = sorted([n2 for n2 in ot if n2 in nt and ot[n2] != nt[n2]])
+
+        if fmt_coarse_ranges:
+            coarse_any.append(name)
 
         has_diff = any((added, removed, changed, m_add, m_del,
                         s_add, s_del, s_chg, t_add, t_del, t_chg, f_chg,
@@ -1237,6 +1274,13 @@ def cmd_snapshot_diff(args):
         elif fmt_missing:
             print("  ※ 片方の snapshot が --no-format で採られています"
                   "＝書式の差分は比較していません")
+        elif fmt_coarse_ranges:
+            rng = '、'.join(f"{a}〜{b}行"
+                            for a, b in sorted(set(fmt_coarse_ranges))[:5])
+            more = len(set(fmt_coarse_ranges)) - 5
+            print(f"  ※ 書式の走査が粗い粒度で打ち切られた行範囲があります（{rng}"
+                  + (f" 他{more}件" if more > 0 else "")
+                  + "）＝その範囲の行の書式差分は比較していません")
 
     if unread_note_hidden:
         print(f"\n※ 読み取りに失敗した snapshot のため、次のシートは比較できていません: "
@@ -1247,12 +1291,19 @@ def cmd_snapshot_diff(args):
     if trunc_note_hidden:
         print(f"\n※ 打ち切られた snapshot のため、次のシートはセルを途中までしか比較できていません: "
               f"{', '.join(trunc_note_hidden)}")
+    if coarse_any:
+        print(f"\n※ 書式の走査が粗い粒度で打ち切られたシートがあります"
+              f"（その範囲の行の書式差分は比較していません）: {', '.join(coarse_any)}")
     print("\n" + "-" * 60)
     if diff_sheets:
         print(f"差分あり: シート{diff_sheets}枚に変更")
     elif unread_any:
         # 読めなかったシートがある状態で「一致」と言ってはいけない
         print("差分なし（ただし読み取りに失敗した箇所があり、そこは比較できていません）")
+    elif coarse_any:
+        # 粗くしか見ていない範囲がある状態で「一致」と言い切ってはいけない
+        print("差分なし（ただし書式を粗い粒度でしか見ていない行範囲があり、"
+              "そこは比較できていません）")
     else:
         # snapshot が見ているのは 値・結合・書式・図形・テーブル。
         # 書式は「シート全体／列／行」の粒度で見ており、セル1つ単位ではない

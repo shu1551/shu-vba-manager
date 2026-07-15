@@ -306,14 +306,16 @@ def _run(line, timeout=600):
         if not started:
             # 前のジョブが長引いて未着手のままタイムアウト。ワーカー自体は健全なので
             # 世代交代せず、このジョブだけ取り下げる
-            return False, (f"タイムアウト（{timeout}秒）: {line}\n"
-                           "前のコマンドが長引いているため、このコマンドは未実行のまま"
-                           "取り下げました。しばらくしてから再実行してください")
+            # 受け側（_submit / get_procedure）は3要素で受ける。2要素で返すと
+            # ここが ValueError になり、この案内文自体が届かない
+            return False, "", (f"タイムアウト（{timeout}秒）: {line}\n"
+                               "前のコマンドが長引いているため、このコマンドは未実行のまま"
+                               "取り下げました。しばらくしてから再実行してください")
         _restart_worker()
-        return False, (f"タイムアウト（{timeout}秒）: {line}\n"
-                       "ワーカーを再起動しました。次の呼び出しから復旧します"
-                       "（実行中だったコマンドは Excel 側で続いている可能性があります。"
-                       "モーダルダイアログが開いていないか確認してください）")
+        return False, "", (f"タイムアウト（{timeout}秒）: {line}\n"
+                           "ワーカーを再起動しました。次の呼び出しから復旧します"
+                           "（実行中だったコマンドは Excel 側で続いている可能性があります。"
+                           "モーダルダイアログが開いていないか確認してください）")
     return (box.get("ok", False),
             (box.get("out") or "").strip(),
             (box.get("err") or "").strip())
@@ -325,8 +327,15 @@ def _submit(line, timeout=600):
     # 機械処理側が json.loads できない（CLI では setup_encoding が情報行を stderr へ
     # 退避して分離しているが、MCP は setup_encoding を呼ばないので自前で分ける）
     if _wants_json(line):
-        if ok and out:
-            return out
+        if ok:
+            # JSON の後ろに警告行を足すと呼び出し側の json.loads が落ちるため、
+            # 成功時は JSON 本体だけを返す（stderr の警告はここでは運ばない契約。
+            # 警告も機械で受けたいコマンドは run-macro --json の dialogs_dismissed の
+            # ように JSON 自身のフィールドで返す）
+            if out:
+                return out
+            # 成功で stdout が空＝異常ではない。「失敗しました」を付けて返すと嘘になる
+            return err or "（出力なし）"
         # 失敗時だけは理由が要る（黙って空を返さない）
         return ((out + "\n" + err).strip() + "\n（コマンドは失敗しました）").strip()
     body = "\n".join(p for p in (err, out) if p).strip()

@@ -269,7 +269,9 @@ def cmd_rename(args):
     if reason:
         sys.exit(f"'{args.new}' はコントロール名に使えません: {reason}")
     xl, wb, comp = connect_form(args.form)
-    backup_form(wb, comp)
+    if not backup_form(wb, comp):
+        # 「エラー」表示のまま黙って続行すると嘘になる。続行する事実を明示する
+        print("⚠ 退避なしで続行します（rename は名前を戻せば復元できます）。")
     names = []
     target = None
     for ct in comp.Designer.Controls:
@@ -416,7 +418,8 @@ def cmd_tab_order(args):
             print("エラー: コントロールの種類を判定できませんでした。")
             print("  ListBox があるフォームで自動整列すると、開いた瞬間のフォーカスを壊します。")
             print("  安全のため中止します。--controls で順序を明示してください。")
-            return
+            # print+return だと exit 0＝「成功」に見えて自動化を騙す（他の拒否と同じ exit 1 に）
+            sys.exit(1)
         listboxes = [ct.Name for ct, t in zip(ctrls_all, types)
                      if t.startswith('ListBox')]
         if listboxes:
@@ -427,7 +430,8 @@ def cmd_tab_order(args):
             print("  --controls で順序を明示してください。")
             print(f"  例: py form_tool.py tab-order {args.form} "
                   f"--controls {listboxes[0]},txt検索,btn検索")
-            return
+            # print+return だと exit 0＝「成功」に見えて自動化を騙す（他の拒否と同じ exit 1 に）
+            sys.exit(1)
         groups = {}
         for ct in comp.Designer.Controls:
             try:
@@ -525,7 +529,10 @@ def cmd_delete(args):
     if "," in args.control:
         sys.exit("delete-control は1個ずつ指定してください（カンマ区切り不可）。")
     xl, wb, comp = connect_form(args.form)
-    backup_form(wb, comp)
+    if not backup_form(wb, comp):
+        # 「エラー」表示のまま黙って続行すると嘘になる。続行する事実を明示する
+        # （delete は退避が無いと元に戻せない＝ブックを保存せず閉じる以外の手が消える）
+        print("⚠ 退避なしで続行します（削除後に戻すには、保存せずにブックを閉じるしかありません）。")
     ct = pick_controls(comp, args.control)[0]
     name = ct.Name
     cap = ""
