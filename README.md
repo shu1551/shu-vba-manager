@@ -54,10 +54,6 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 | **`form_tool.py`** | フォームの幾何操作 CLI。`scale / set / move / align / size-match / distribute / tab-order / rename-control / delete-control / copy-form` |
 | **`form_builder.py`** | UserForm 構築の低レベル部品。`add_btn`, `add_lbl` などのヘルパーと `Grid` 配置（カレンダー等の自由配置向け） |
 | **`test_tools.py`** | 自動テスト（pytest・92件）。レイアウト計算・エンコーディングガード・lint・名前衝突ガード等の COM 不要部分を検証 |
-| **`live_sync_vba.py`** | VBE と `.bas` ファイルをリアルタイム同期 |
-| **`menu_launcher.py`** / **`select_macro_gui.py`** | customtkinter 製のマクロ検索／実行 GUI |
-| **`bas_editor.py`** | `.bas` ファイル編集ヘルパー（プロシージャ単位の `replace_sub`, `read_bas`） |
-| **`format_bas.py`** | `.bas` 整形（空行・インデント正規化） |
 | **`optimize_vba_modules.py`** | VBA モジュール最適化 |
 | **`publish_check.py`** | ブック公開前の個人情報チェック（作成者実名・隠しシート・定義名のローカルパス・外部リンク・コメント・残留入力値）＋ `--scrub` でメタデータ空欄化。ブックを配布・公開する前に1コマンドで |
 
@@ -217,23 +213,6 @@ build_form("F_Input", "顧客登録", rows=[
 カレンダーの7×6ボタン格子のような自由配置は、従来どおり `add_btn` 等で直接置けます。
 `Grid` / `vstack` / `hstack` の座標計算ヘルパー付き。イベントコードの注入（`inject_vba`）もこちら。
 
-### `live_sync_vba.py` — ライブ同期
-
-```powershell
-py live_sync_vba.py
-```
-
-VBE 上での編集が `.bas` ファイルへ即時反映されます。
-逆方向（`.bas` の変更 → VBE 反映）にも対応。
-
-### `menu_launcher.py` — GUI ランチャー
-
-```powershell
-py menu_launcher.py
-```
-
-customtkinter 製 GUI が起動。登録された Public Sub を一覧から検索・実行できます。
-
 ### `vba_mcp_server.py` — MCP サーバー（2026-07 追加）
 
 Claude Code などの MCP クライアントに登録すると、AI がこのツールキットを直接呼び出せます。
@@ -370,18 +349,11 @@ VBAマネージャー/
 │   └── skills/
 │       └── shu-addin-manager/      ← Claude Code 用の同梱スキル
 └── 作業ファイル/
-    ├── VBAマネージャー起動.bat
-    ├── 一覧.bat
-    ├── 修正.bat
     └── project/
         └── python_scripts/         ← ★ ツールキット本体
             ├── vba_manager.py      ← 中核：VBA モジュール CRUD
+            ├── vbam_*.py（5本）     ← vba_manager の分割パート
             ├── form_builder.py     ← UserForm ビルダー
-            ├── live_sync_vba.py    ← ライブ同期
-            ├── menu_launcher.py    ← GUI ランチャー入口
-            ├── select_macro_gui.py ← customtkinter 製 GUI
-            ├── bas_editor.py       ← .bas 編集ヘルパー
-            ├── format_bas.py       ← .bas 整形
             ├── optimize_vba_modules.py
             └── *.bas / *.frm / *.frx  ← サンプル用 VBA モジュール／フォーム
 ```

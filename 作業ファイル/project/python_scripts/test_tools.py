@@ -872,7 +872,12 @@ def test_injection_route_ledger():
                 if PRIM.search(line):
                     found.add((fname, cur))
     new_routes = found - EXPECTED
-    gone = EXPECTED - found
+    # 台帳のファイルが現物に無いのは「経路が消えた」ではなく「ファイルごと無い」
+    # （例: live_sync_vba.py は 2026-07-16 にローカル専用へ退役＝公開リポに入らない。
+    #   クローン先ではファイル自体が無いのが正常）。ファイルは在るのに注入が
+    # 消えた場合だけ「台帳の掃除」として検知する
+    gone = {e for e in (EXPECTED - found)
+            if os.path.exists(os.path.join(base, e[0]))}
     assert not new_routes, (
         f"台帳に無い注入経路: {sorted(new_routes)}\n"
         "  ガード（check_vba_identifier / _find_invalid_procedure_names）を配線してから"
