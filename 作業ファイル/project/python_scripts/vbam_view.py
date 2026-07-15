@@ -694,35 +694,21 @@ def _collect_format(sh, ur, nr, nc):
     return info
 
 
-def cmd_snapshot(args):
-    """アクティブブック(または1シート)を意味構造JSONに畳む＝開いたままブックLMの下ごしらえ。
+def _snapshot_doc(wb, only_sheet=None, max_rows=5000, no_format=False):
+    """開いているブック1冊を意味構造 dict に畳む（cmd_snapshot / rehearse の共用部品）。
 
-    セル(疎)＋結合(merged)＋図形/ボタン(text・座標・OnAction)＋テーブル(ListObject)を
-    1ファイルに束ねる。晴美さんのExStruct extract を「開いてるブック相手・その場」で焼き直したもの。
-    表かどうかの"推定"はしない（機械的事実だけ吐き、意味付けは読み手のAIがやる＝この子の設計思想）。
+    wb は既に掴んでいる Workbook をそのまま受け取る（get_workbook を通さない）。
+    rehearse のように「別インスタンスで開いた非表示のコピー」を対象にするとき、
+    パス指定で get_workbook を通すと ROT 走査のタイミング次第で同じファイルを
+    二重に開きにいくため、ハンドル直渡しにしている。
+    only_sheet が見つからないときは ValueError を送出する。
     """
-    import json
-    target_file, rest = parse_target_and_rest(args.posargs)
-    only_sheet = rest[0] if rest else getattr(args, 'sheet_opt', None)
-    out_path = os.path.abspath(getattr(args, 'out_opt', None) or _LAST_SNAPSHOT_FILE)
-    try:
-        max_rows = int(getattr(args, 'max_rows', None) or 5000)
-    except (TypeError, ValueError):
-        print("エラー: --max-rows は数値で指定してください")
-        return False
-    # 書式に行上限は要らない。行は二分割で降りて「同じ書式が続く塊」で採るため、
-    # 行数が増えても往復は log 的にしか増えない（10,004行でも約30往復）。
-    # 上限で打ち切ると「上限より下の書式を見ていない」盲点ができ、数万行のシートでは
-    # そこが本体になる。速度と盲点のどちらかを選ばせない、が今の設計。
-
-    xl, wb = get_workbook(target_file)
     active = wb.ActiveSheet.Name
 
     if only_sheet:
         targets = [sh for sh in wb.Sheets if sh.Name == only_sheet]
         if not targets:
-            print(f"シート '{only_sheet}' が見つかりません")
-            return False
+            raise ValueError(f"シート '{only_sheet}' が見つかりません")
     else:
         targets = list(wb.Sheets)
 
@@ -799,7 +785,7 @@ def cmd_snapshot(args):
             info["shapes"] = shapes
 
         # --- 書式（四つ目の目。値・結合・図形だけ見ていたのが従来）---
-        if not getattr(args, 'no_format', False):
+        if not no_format:
             if ur is not None and nr > 0:
                 try:
                     info["format"] = _collect_format(sh, ur, nr, nc)
@@ -822,12 +808,44 @@ def cmd_snapshot(args):
 
         sheets[sh.Name] = info
 
-    doc = {"success": True, "book": wb.Name, "active_sheet": active, "sheets": sheets}
+    return {"success": True, "book": wb.Name, "active_sheet": active, "sheets": sheets}
+
+
+def cmd_snapshot(args):
+    """アクティブブック(または1シート)を意味構造JSONに畳む＝開いたままブックLMの下ごしらえ。
+
+    セル(疎)＋結合(merged)＋図形/ボタン(text・座標・OnAction)＋テーブル(ListObject)を
+    1ファイルに束ねる。晴美さんのExStruct extract を「開いてるブック相手・その場」で焼き直したもの。
+    表かどうかの"推定"はしない（機械的事実だけ吐き、意味付けは読み手のAIがやる＝この子の設計思想）。
+    """
+    import json
+    target_file, rest = parse_target_and_rest(args.posargs)
+    only_sheet = rest[0] if rest else getattr(args, 'sheet_opt', None)
+    out_path = os.path.abspath(getattr(args, 'out_opt', None) or _LAST_SNAPSHOT_FILE)
+    try:
+        max_rows = int(getattr(args, 'max_rows', None) or 5000)
+    except (TypeError, ValueError):
+        print("エラー: --max-rows は数値で指定してください")
+        return False
+    # 書式に行上限は要らない。行は二分割で降りて「同じ書式が続く塊」で採るため、
+    # 行数が増えても往復は log 的にしか増えない（10,004行でも約30往復）。
+    # 上限で打ち切ると「上限より下の書式を見ていない」盲点ができ、数万行のシートでは
+    # そこが本体になる。速度と盲点のどちらかを選ばせない、が今の設計。
+
+    xl, wb = get_workbook(target_file)
+    try:
+        doc = _snapshot_doc(wb, only_sheet=only_sheet, max_rows=max_rows,
+                            no_format=getattr(args, 'no_format', False))
+    except ValueError as e:
+        print(e)
+        return False
+    active = doc["active_sheet"]
+    sheets = doc["sheets"]
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(doc, f, ensure_ascii=False, indent=2)
 
     # 端末にはサマリだけ（本体JSONは大きくなり得るのでファイルへ）
-    print(f"スナップショット: {wb.Name}  → {out_path}")
+    print(f"スナップショット: {doc['book']}  → {out_path}")
     print("-" * 60)
     for name, info in sheets.items():
         parts = [info.get("dims", "")]
@@ -1566,6 +1584,7 @@ __all__ = [
     '_resolve_range',
     '_screenshot_cleanup',
     '_shape_text',
+    '_snapshot_doc',
     '_values_to_grid',
     '_whole_sheet_spec',
     'cmd_read_range',

@@ -1294,6 +1294,244 @@ def cmd_save_as(args):
     return True
 
 
+def cmd_open(args):
+    """ブックを開く: open <path>
+
+    「人が開くのと同じ場所」に開くのが原則:
+      - 既に開いていれば前面化して知らせるだけ（二重には開かない）
+      - 見えている Excel が居れば、そこに合流して開く（アドインが生きている普段の環境）
+      - Excel が完全に未起動なら通常起動（os.startfile）で開く
+        （COM 起動と違い、アドイン・PERSONAL.XLSB が普段どおり読み込まれる）
+      - 非表示の残骸 Excel しか居ないときは開かない。残骸に取り込まれると
+        「開いたのに見えない・アドインが効かない」異常環境になる（2026-06-13 実害）
+    """
+    rest = list(args.posargs)
+    if not rest:
+        print("使い方: open <path>")
+        return False
+    if len(rest) >= 2:
+        print("エラー: パスは1つだけ指定してください。使い方: open <path>")
+        return False
+    path = smart_path_resolve(rest[0])
+    if not path or not os.path.exists(path):
+        print(f"エラー: ファイルが見つかりません: {rest[0]}")
+        return False
+
+    # 既に開いていないか（全インスタンス横断）
+    for wb in _running_excel_workbooks():
+        try:
+            if wb.FullName.lower() != path.lower():
+                continue
+            app = wb.Application
+            try:
+                visible = bool(app.Visible)
+            except Exception:
+                visible = False
+            print(f"既に開いています: {wb.Name}")
+            if visible:
+                try:
+                    wb.Activate()
+                except Exception:
+                    pass
+            else:
+                print("⚠ ただし非表示の Excel インスタンスの中にいます。"
+                      "タスクマネージャで EXCEL.EXE を確認してください。")
+            return True
+        except Exception:
+            continue
+
+    # 合流先＝見えている Excel を探す。まずブック持ちインスタンス（ROT）、
+    # 次に GetActiveObject（未保存の Book1 しか無い Excel は ROT に出ないため）
+    xl = None
+    excel_somewhere = False
+    for wb in _running_excel_workbooks():
+        try:
+            app = wb.Application
+            excel_somewhere = True
+            if bool(app.Visible):
+                xl = app
+                break
+        except Exception:
+            continue
+    if xl is None:
+        try:
+            cand = _get_active_excel()
+            excel_somewhere = True
+            if bool(cand.Visible):
+                xl = cand
+        except Exception:
+            pass
+
+    if xl is not None:
+        wb = xl.Workbooks.Open(path)
+        try:
+            wb.Activate()
+        except Exception:
+            pass
+        print(f"開きました: {wb.Name}  （起動中の Excel に合流）")
+        return True
+
+    if not excel_somewhere:
+        # COM から見えなくても EXCEL.EXE のプロセスだけ残っている残骸が居る
+        # （そこへ os.startfile すると非表示側に取り込まれることがある）
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE", "/NH"],
+                capture_output=True, encoding="cp932", errors="replace", timeout=30)
+            excel_somewhere = "EXCEL.EXE" in (out.stdout or "")
+        except Exception:
+            pass
+
+    if excel_somewhere:
+        print("エラー: 非表示の EXCEL.EXE だけが残っています（残骸）。")
+        print("  ここで開くと非表示側に取り込まれて見えなくなるため、開きませんでした。")
+        print("  タスクマネージャで EXCEL.EXE を終了してから再実行してください。")
+        return False
+
+    # Excel 完全未起動 → 通常起動。アドイン・PERSONAL.XLSB が普段どおり読み込まれる
+    os.startfile(path)
+    limit = time.time() + 30.0
+    while time.time() < limit:
+        for wb in _running_excel_workbooks():
+            try:
+                if wb.FullName.lower() == path.lower():
+                    print(f"開きました: {wb.Name}  （Excel を通常起動）")
+                    return True
+            except Exception:
+                continue
+        time.sleep(0.5)
+    print("⚠ 30秒待ちましたが、開いたことを確認できませんでした。")
+    print("  保護ビュー・マクロ警告などのダイアログで止まっている可能性があります。"
+          "画面を確認してください。")
+    return False
+
+
+def cmd_close(args):
+    """ブックを閉じる: close <ブック名|path> (--save | --no-save) [-y]
+
+    鎧の三点セット: ①ブックの名指し必須 ②保存方針（--save/--no-save）の明示必須
+    ③確認プロンプト（-y でスキップ）。閉じるのはブック1冊だけで、Excel 本体は
+    終了しない。PERSONAL.XLSB とアドインブックは閉じない（保管庫を巻き込まない）。
+    """
+    rest = list(args.posargs)
+    if not rest:
+        print("使い方: close <ブック名|path> (--save | --no-save) [-y]")
+        return False
+    if len(rest) >= 2:
+        print("エラー: 対象は1つだけ指定してください。使い方: close <ブック名|path> (--save | --no-save)")
+        return False
+    save_flag = bool(getattr(args, 'save_flag', False))
+    no_save_flag = bool(getattr(args, 'no_save_flag', False))
+    if save_flag == no_save_flag:
+        print("エラー: --save（保存して閉じる）か --no-save（保存せず閉じる＝変更破棄）の"
+              "どちらか一方を必ず指定してください。")
+        return False
+
+    target = rest[0]
+    resolved = smart_path_resolve(target)
+    tgt_lower = target.lower()
+
+    # 対象を全インスタンス横断で探す。同名でも別インスタンス/別パスは別物として数える
+    matches = {}
+
+    def _consider(wb):
+        try:
+            full = wb.FullName
+            hwnd = wb.Application.Hwnd
+        except Exception:
+            return
+        name = os.path.basename(full)
+        if (name.lower() == tgt_lower or full.lower() == tgt_lower or
+                (resolved and full.lower() == resolved.lower())):
+            matches[(full.lower(), hwnd)] = wb
+
+    for wb in _running_excel_workbooks():
+        _consider(wb)
+    try:
+        # ROT に出ない未保存ブック（Book1 等）はこちらで拾う
+        for wb in _get_active_excel().Workbooks:
+            _consider(wb)
+    except Exception:
+        pass
+
+    if not matches:
+        print(f"エラー: '{target}' は開いていません。list-open で確認してください。")
+        return False
+    if len(matches) > 1:
+        print("エラー: 該当するブックが複数開いています。フルパスで名指ししてください:")
+        for wb in matches.values():
+            try:
+                print(f"  {wb.FullName}")
+            except Exception:
+                pass
+        return False
+    wb = next(iter(matches.values()))
+    name = wb.Name
+
+    # 番人: 保管庫は閉じない
+    if name.lower() == 'personal.xlsb':
+        print("エラー: PERSONAL.XLSB は閉じません（個人用マクロの保管庫。閉じると"
+              "登録マクロやショートカットが使えなくなります）。")
+        return False
+    try:
+        if bool(wb.IsAddin):
+            print(f"エラー: '{name}' はアドインブックです。close では閉じません。")
+            return False
+    except Exception:
+        pass
+
+    try:
+        full = wb.FullName
+    except Exception:
+        full = name
+    try:
+        saved = bool(wb.Saved)
+    except Exception:
+        saved = None
+
+    if save_flag:
+        try:
+            if bool(wb.ReadOnly):
+                print(f"エラー: '{name}' は読み取り専用で開かれています。--save では閉じられません。")
+                print("  変更を捨ててよければ --no-save、別名で残すなら先に save-as を。")
+                return False
+        except Exception:
+            pass
+
+    print(f"対象ブック: {name}")
+    print(f"  パス: {full}")
+    print(f"  方針: {'保存して閉じる' if save_flag else '保存せずに閉じる'}")
+    if not save_flag and saved is False:
+        print("  ⚠ 未保存の変更があります。このまま閉じると、その変更は破棄されます。")
+
+    if not getattr(args, 'yes', False):
+        try:
+            ans = input(f"ブック '{name}' を閉じますか？ (y/N): ")
+        except EOFError:
+            # パイプ/MCP 等の非対話環境。トレースバックでなく正常なキャンセルにする
+            print("非対話環境のため確認できません。-y を付けて実行してください。")
+            return False
+        if ans.strip().lower() not in ('y', 'yes'):
+            print("キャンセルされました。")
+            return False
+
+    app = wb.Application
+    with _alerts_off(app):
+        wb.Close(SaveChanges=save_flag)
+
+    # 接続キャッシュに残った死んだ参照を掃除する（batch/shell/MCP の1接続セッションで
+    # 次のコマンドが閉じたブックのキャッシュを掴まないように）
+    for key in list(_wb_cache):
+        try:
+            _ = _wb_cache[key][1].Name
+        except Exception:
+            _wb_cache.pop(key, None)
+
+    print(f"閉じました: {name}  ({'保存済み' if save_flag else '保存せず'})")
+    return True
+
+
 def cmd_export_pdf(args):
     """PDF出力: export-pdf [excel_file] <出力.pdf> [--sheet 名 | --range "シート!範囲"]
 
@@ -1779,6 +2017,7 @@ __all__ = [
     '_sheet_or_active',
     'cmd_autofilter',
     'cmd_clear_range',
+    'cmd_close',
     'cmd_col',
     'cmd_comment',
     'cmd_cond_format',
@@ -1791,6 +2030,7 @@ __all__ = [
     'cmd_freeze',
     'cmd_hyperlink',
     'cmd_name',
+    'cmd_open',
     'cmd_print_setup',
     'cmd_printer_list',
     'cmd_printer_setup',

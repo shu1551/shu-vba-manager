@@ -433,4 +433,87 @@ def test_delete_module_removes_it(book):
         xl = None
         gc.collect()
         _wait_no_excel()
+
     assert MOD_NAME not in names, "delete-module が「削除完了」と言ったのに残っている"
+
+
+# ================================================================
+# 2026-07-15 追加: rehearse（予行演習run）と open / close
+# ================================================================
+
+def test_rehearse_runs_macro_on_copy_only(book, tmp_path):
+    """rehearse がコピーだけを撃ち、本体には指一本触れないこと。
+
+    確かめる約束:
+      - 本体は無傷（C1 空のまま・Workbook_Open も起きていない）
+      - 結果コピーには A1(2)+B1(3)=5 が入っている
+      - コピーを開く瞬間も Workbook_Open を起こしていない（Z1 が空）
+      - 差分レポートに C1 の変化が事実として出る
+    """
+    copy_path = str(tmp_path / "rehearsal.xlsm")
+    rc, out = run_cli("rehearse", book, "合計を出す", "--out", copy_path)
+    assert rc == 0, out
+    assert "マクロ実行: 成功" in out, out
+    assert "C1" in out, f"差分レポートに C1 の変化が出ていない:\n{out}"
+
+    orig = peek(book)
+    assert orig["C1"] is None, "本体が書き換わっている（予行演習が本体を撃った）"
+    assert orig["Z1"] is None, "本体の Workbook_Open が走っている"
+
+    assert os.path.exists(copy_path), "結果コピーが残っていない"
+    res = peek(copy_path)
+    assert res["C1"] == 5, "結果コピーにマクロの効果が入っていない"
+    assert res["Z1"] is None, "コピーを開く瞬間に Workbook_Open が走っている"
+    assert os.path.exists(copy_path + ".before.json")
+    assert os.path.exists(copy_path + ".after.json")
+
+
+def test_open_and_close_on_running_instance(book):
+    """open の二重オープン防止と、close の鎧（-y 必須・--no-save で破棄）を実機で確かめる"""
+    import gc
+    xl = _new_excel()
+    wb = None
+    try:
+        wb = xl.Workbooks.Open(book)
+
+        # open: 既に開いているブックは二重に開かず、非表示に居ることを警告する
+        rc, out = run_cli("open", book)
+        assert rc == 0, out
+        assert "既に開いています" in out, out
+        assert "非表示" in out, out
+        assert xl.Workbooks.Count == 1
+
+        # close: -y なしの非対話は鎧③（確認プロンプト）で止まる
+        p = subprocess.run(
+            [sys.executable, VBM, "close", os.path.basename(book), "--no-save"],
+            capture_output=True, encoding="utf-8", errors="replace",
+            cwd=SCRIPT_DIR, timeout=180, stdin=subprocess.DEVNULL)
+        out = (p.stdout or "") + (p.stderr or "")
+        assert p.returncode != 0, f"確認なしで閉じてしまった:\n{out}"
+        assert "非対話" in out, out
+        assert xl.Workbooks.Count == 1, "確認で止まったはずのブックが閉じられている"
+
+        # close: 名指し＋--no-save＋-y。未保存の変更は破棄され、ディスクは無傷
+        wb.Worksheets("本体").Range("C1").Value = 123   # 未保存の変更
+        rc, out = run_cli("close", os.path.basename(book), "--no-save", "-y")
+        assert rc == 0, out
+        assert "閉じました" in out, out
+        assert "破棄" in out, "未保存の変更を破棄する警告が出ていない"
+        wb = None
+        assert xl.Workbooks.Count == 0, "ブックが閉じられていない"
+    finally:
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+            wb = None
+        try:
+            xl.Quit()
+        except Exception:
+            pass
+        xl = None
+        gc.collect()
+        _wait_no_excel()
+
+    assert peek(book)["C1"] is None, "--no-save なのに変更がディスクへ保存されている"

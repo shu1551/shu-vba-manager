@@ -1890,6 +1890,188 @@ def cmd_datamodel(args):
 
 
 
+def cmd_rehearse(args):
+    """予行演習run: rehearse [excel_file] <マクロ名> [マクロ引数...]
+
+    本体には指一本触れずにマクロの効果を検分する:
+      1. 対象ブックの「今この瞬間」のコピーを作る（SaveCopyAs＝未保存の変更込み）
+      2. 別インスタンス（DispatchEx・非表示）でコピーを開く
+         （健診モードと同じく、開く瞬間の Workbook_Open は起こさない。
+           実行中のイベント（Worksheet_Change 等）は本番同様に生かす）
+      3. 実行前 snapshot → マクロ実行（ダイアログ安全解除は run-macro と同じく常設）
+         → 実行後 snapshot
+      4. snapshot-diff で「何が変わるか」を事実で報告し、結果コピーを保存して畳む
+
+    マクロが途中で落ちても、そこまでの変化を diff で報告する（それも予行演習の収穫）。
+    本体に焼くかどうかは、この報告を見て人が決める。
+    ※ 非破壊が保証できるのはブックの中だけ。ファイル出力・メール送信など
+      「外への副作用」を持つマクロまでは止められない（そこは人が読んで判断する）。
+    """
+    import gc
+    import json
+    import tempfile
+    import vbam_core
+
+    target_file, rest = parse_target_and_rest(args.posargs)
+    if not rest:
+        print("使い方: rehearse [excel_file] <マクロ名> [マクロ引数...]")
+        print("  --auto-dialog ok|yes|no|cancel  実行中のダイアログをこのボタンで自動応答")
+        print("  --addins                        演習用Excelにアドイン・PERSONALを読み込む")
+        print("  --out <path>                    コピーの保存先（省略時は一時フォルダ）")
+        print("  --discard                       報告後に結果コピーとsnapshotを削除")
+        return False
+    macro_name = rest[0]
+    run_args = []
+    for a in rest[1:]:
+        v = _coerce_cell(a)
+        run_args.append(a if v is None else v)
+
+    # 本体は健診モード（読み取り専用・イベント無効）で掴む。閉じているブックを
+    # ここで自動オープンする場合に Workbook_Open を起こすと、その痕跡ごと
+    # SaveCopyAs されて「素の状態のコピー」でなくなるため（既に開いている
+    # ブックには影響しない＝ユーザーの Excel はそのまま）
+    xl_src, wb_src = get_workbook(target_file, readonly=True)
+    src_name = wb_src.Name
+    stem, ext = os.path.splitext(src_name)
+    if not ext:
+        ext = '.xlsx'
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_opt = getattr(args, 'out_opt', None)
+    copy_path = (os.path.abspath(out_opt) if out_opt
+                 else os.path.join(tempfile.gettempdir(), f"{stem}_予行_{stamp}{ext}"))
+    if os.path.exists(copy_path):
+        print(f"エラー: コピー先が既に存在します: {copy_path}")
+        return False
+    try:
+        wb_src.SaveCopyAs(copy_path)
+    except Exception as e:
+        print(f"エラー: コピーを作れませんでした: {e}")
+        print("  （一度も保存していない新規ブックは、先に save-as で実体を作ってください）")
+        return False
+    print(f"予行演習: {src_name} のコピーで '{macro_name}' を試し撃ちします（本体は無傷）")
+    print(f"  コピー: {copy_path}")
+
+    before_path = copy_path + ".before.json"
+    after_path = copy_path + ".after.json"
+
+    # 演習用の Excel は必ず別インスタンス（DispatchEx）。ユーザーの Excel には触れない
+    xl2 = win32com.client.DispatchEx("Excel.Application")
+    pid = None
+    try:
+        import win32process
+        _, pid = win32process.GetWindowThreadProcessId(xl2.Hwnd)
+    except Exception:
+        pass
+    inst = {"xl": xl2, "pid": pid}
+    # 後始末の安全網として登録する（本線は下の finally で自前で畳む。
+    # 万一そこへ辿り着けなくても cleanup_excel / アイドル解放が拾う）
+    vbam_core._created_instances.append(inst)
+
+    run_ok = True
+    run_err = None
+    result = None
+    dlg_note = ""
+    wb2 = None
+    try:
+        xl2.Visible = "--visible" in sys.argv or "-v" in sys.argv
+        xl2.DisplayAlerts = False
+        try:
+            xl2.EnableEvents = False       # 開く瞬間の Workbook_Open は起こさない
+        except Exception:
+            pass
+        if getattr(args, 'addins', False):
+            load_excel_addins_and_personal(xl2)
+        wb2 = xl2.Workbooks.Open(copy_path, 0)   # UpdateLinks=0
+        try:
+            xl2.EnableEvents = True        # 実行中のイベントは本番同様に生かす
+        except Exception:
+            pass
+
+        doc_before = _snapshot_doc(wb2)
+        with open(before_path, 'w', encoding='utf-8') as f:
+            json.dump(doc_before, f, ensure_ascii=False, indent=2)
+
+        # ブック名の ' は Excel 規約どおり '' に重ねる（cmd_run_macro と同じ流儀）
+        quoted = wb2.Name.replace("'", "''")
+        full_macro = f"'{quoted}'!{macro_name}"
+        _auto = getattr(args, 'auto_dialog', None)
+        _watcher = _start_dialog_watcher(xl2, _auto)
+        try:
+            result = xl2.Application.Run(full_macro, *run_args)
+        except Exception as e:
+            run_ok = False
+            run_err = _com_error_text(e)
+        finally:
+            if _watcher is not None:
+                _watcher.stop()
+                dlg_note = _dialog_watcher_note(_watcher, _auto)
+
+        doc_after = _snapshot_doc(wb2)
+        with open(after_path, 'w', encoding='utf-8') as f:
+            json.dump(doc_after, f, ensure_ascii=False, indent=2)
+
+        try:
+            wb2.Save()                     # 結果コピーは検分できる形で残す
+        except Exception as e:
+            print(f"⚠ 結果コピーを保存できませんでした: {e}")
+        wb2.Close(SaveChanges=False)
+        wb2 = None
+    except Exception as e:
+        print(f"エラー: 予行演習を続けられませんでした: {e}")
+        run_ok = False
+        if run_err is None:
+            run_err = str(e)
+    finally:
+        if wb2 is not None:
+            try:
+                wb2.Close(SaveChanges=False)
+            except Exception:
+                pass
+            wb2 = None
+        try:
+            xl2.Quit()
+        except Exception:
+            pass
+        xl2 = None
+        # 自前で畳めたので安全網から外す。外せたときだけ参照も手放す
+        # （外せなかった場合は cleanup_excel 側が参照ごと始末する）
+        try:
+            vbam_core._created_instances.remove(inst)
+            inst["xl"] = None
+        except ValueError:
+            pass
+        gc.collect()
+
+    print("-" * 60)
+    if run_ok:
+        print(f"マクロ実行: 成功  戻り値: {result}")
+    else:
+        print(f"マクロ実行: 失敗  {run_err}")
+        print("  （落ちるまでに変えたものがあれば、下の差分に出ます）")
+    if dlg_note:
+        print(dlg_note)
+
+    if os.path.exists(before_path) and os.path.exists(after_path):
+        ns = argparse.Namespace(posargs=[before_path, after_path],
+                                max_opt=getattr(args, 'max_opt', None))
+        cmd_snapshot_diff(ns)
+    else:
+        print("⚠ snapshot が揃わなかったため、差分報告はありません。")
+
+    if getattr(args, 'discard', False):
+        for p in (copy_path, before_path, after_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        print("（--discard 指定により、結果コピーと snapshot を削除しました）")
+    else:
+        print(f"結果コピー: {copy_path}")
+        print(f"  実行前/後 snapshot: {before_path} / {after_path}")
+        print("  本体に焼いてよければ run-macro で本番実行を。コピーは不要になったら削除してください。")
+    return run_ok
+
+
 __all__ = [
     '_XL_AXIS',
     '_XL_CHART_TYPE',
@@ -1914,5 +2096,6 @@ __all__ = [
     'cmd_pivot_calc',
     'cmd_pivot_field',
     'cmd_powerquery',
+    'cmd_rehearse',
     'cmd_slicer',
 ]

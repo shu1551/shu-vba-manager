@@ -1151,3 +1151,72 @@ def test_snapshot_diff_format_missing_on_one_side(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "書式変更" not in out
     assert ("比較していません" in out or "比較できていません" in out)
+
+
+# ================================================================
+# open / close / rehearse（2026-07-15 追加）: COM に触る前の門番
+# ================================================================
+
+import argparse as _ap
+
+
+def test_open_requires_path(capsys):
+    assert vm.cmd_open(_ap.Namespace(posargs=[])) is False
+    assert "使い方" in capsys.readouterr().out
+
+
+def test_open_rejects_multiple_paths(capsys):
+    assert vm.cmd_open(_ap.Namespace(posargs=["a.xlsm", "b.xlsm"])) is False
+    assert "1つだけ" in capsys.readouterr().out
+
+
+def test_open_rejects_missing_file(capsys):
+    assert vm.cmd_open(_ap.Namespace(posargs=["__vbam_unit_no_such__.xlsm"])) is False
+    assert "見つかりません" in capsys.readouterr().out
+
+
+def test_close_requires_name(capsys):
+    ns = _ap.Namespace(posargs=[], save_flag=True, no_save_flag=False, yes=True)
+    assert vm.cmd_close(ns) is False
+    assert "使い方" in capsys.readouterr().out
+
+
+def test_close_requires_save_policy(capsys):
+    # 保存方針の明示は鎧の一部。無指定も両指定も門前払いする
+    ns = _ap.Namespace(posargs=["a.xlsm"], save_flag=False, no_save_flag=False, yes=True)
+    assert vm.cmd_close(ns) is False
+    out = capsys.readouterr().out
+    assert "--save" in out and "--no-save" in out
+
+    ns = _ap.Namespace(posargs=["a.xlsm"], save_flag=True, no_save_flag=True, yes=True)
+    assert vm.cmd_close(ns) is False
+
+
+def test_close_not_open_book_fails(capsys):
+    # 開いていないブック名は「開いていません」で止まる（保存方針が正しくても）
+    ns = _ap.Namespace(posargs=["__vbam_unit_no_such__.xlsm"],
+                       save_flag=False, no_save_flag=True, yes=True)
+    assert vm.cmd_close(ns) is False
+    assert "開いていません" in capsys.readouterr().out
+
+
+def test_rehearse_requires_macro_name(capsys):
+    assert vm.cmd_rehearse(_ap.Namespace(posargs=[])) is False
+    assert "使い方" in capsys.readouterr().out
+
+
+def test_new_commands_are_wired():
+    # コマンド表と argparse の両方に配線されていること（表だけ・パーサだけの片肺を防ぐ）
+    table = vm._command_table()
+    for name in ("open", "close", "rehearse", "予行演習"):
+        assert name in table
+    parser = vm.build_parser()
+    ns, unknown = parser.parse_known_args(
+        ["close", "a.xlsm", "--no-save", "-y"])
+    assert ns.command == "close" and ns.no_save_flag and ns.yes and not unknown
+    ns, unknown = parser.parse_known_args(
+        ["rehearse", "マクロA", "--addins", "--discard", "--max", "5"])
+    assert ns.command == "rehearse" and ns.addins and ns.discard
+    assert ns.max_opt == "5" and not unknown
+    ns, unknown = parser.parse_known_args(["open", "a.xlsm"])
+    assert ns.command == "open" and not unknown

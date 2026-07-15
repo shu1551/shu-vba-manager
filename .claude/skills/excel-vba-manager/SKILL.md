@@ -149,6 +149,16 @@ py vba_manager.py delete-module <モジュール名> -y
 # マクロを引数つきで実行（数値に見える引数は数値化して渡す）
 py vba_manager.py run-macro 加算 3 4        # Function なら戻り値も表示
 
+# 予行演習run（2026-07-15）＝マクロをコピーに試し撃ちして差分報告（本体は無傷）
+py vba_manager.py rehearse <マクロ名> [引数...] [--auto-dialog ok] [--addins] [--out path] [--discard] [--max N]
+py vba_manager.py 予行演習 <マクロ名>            # 日本語別名（同じもの）
+#  流れ: SaveCopyAs（未保存の変更込みの「今この瞬間」）→ 別インスタンスでコピーを開く
+#  （Workbook_Openは起こさない）→ 前snapshot → 実行 → 後snapshot → snapshot-diff報告。
+#  マクロが途中で落ちても、そこまでの変化を差分で報告する（それも収穫）。
+#  結果コピーと前後snapshotは残す（--discard で削除）。本体に焼く判断は人がやる。
+#  ⚠ 非破壊が保証できるのはブックの中だけ。ファイル出力・メール送信など外への副作用は止められない。
+#  アドイン（秀.xlam等）の関数を呼ぶマクロは --addins を付ける（演習用Excelは素の環境のため）。
+
 # VBAテストランナー（xlflowのテスト基盤から発想だけ移植・2026-07-09）
 py vba_manager.py test [excel_file] [絞り込み] [--module 名] [--auto-dialog ok] [--json]
 py vba_manager.py テスト                     # 日本語別名（同じもの）
@@ -329,7 +339,14 @@ py vba_manager.py find 田中 --book        # 全シート横断で検索（--wh
 py vba_manager.py find-replace 旧 新 A1:Z99   # 範囲一括置換（範囲省略で使用範囲全体）
 #  ヒットセル数を事前カウントして報告、0件なら置換しない。--match-case で大小文字区別。
 
-# --- c. 保存・印刷まわり ---
+# --- c. ブックの開閉・保存・印刷まわり ---
+py vba_manager.py open "C:\path\book.xlsm"     # ブックを開く（2026-07-15）
+#  「人が開くのと同じ場所」に開く: 既に開いていれば前面化のみ／見えているExcelが居れば合流／
+#  Excel未起動なら通常起動（アドイン・PERSONALが普段どおり読み込まれる）。
+#  非表示の残骸Excelしか居ないときは取り込まれないよう開かずに止まる。
+py vba_manager.py close <ブック名> --no-save -y   # ブックを1冊閉じる（2026-07-15）
+#  鎧の三点セット: ①ブック名指し必須 ②--save/--no-save の明示必須 ③確認プロンプト（-y でスキップ）。
+#  Excel本体は終了しない。PERSONAL.XLSB とアドインブックは閉じない。同名複数はフルパス名指しを要求。
 py vba_manager.py save                    # 上書き保存（手コマンドはOK出たらこれで確定）
 py vba_manager.py save-as "C:\path\out.xlsx"   # 別名保存（拡張子で形式判定）
 #  既存ファイルへは --overwrite が無いと停止。未対応拡張子はエラー。

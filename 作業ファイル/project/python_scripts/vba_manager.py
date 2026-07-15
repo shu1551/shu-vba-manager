@@ -43,6 +43,11 @@ VBAマネージャー (アクティブブック対応版)
   -- 検索・置換 --
   find           <文字> [--book][--whole][--formula] セル検索（番地を返す）
   find-replace   <検索> <置換> [range] [--whole]     一括置換
+  -- ブックの開閉 --
+  open           <path>                             ブックを開く（見えているExcelに合流／未起動なら通常起動）
+  close          <ブック名> --save|--no-save         ブックを1冊閉じる（名指し・保存方針・確認の三点セット）
+  -- 予行演習 --
+  rehearse       [excel_file] <マクロ名> [引数...]   コピーに試し撃ちして差分を報告（本体は無傷）
   -- 保存・印刷 --
   save           [excel_file]                       上書き保存
   save-as        <path>                             別名保存
@@ -278,6 +283,21 @@ def build_parser():
     p.add_argument("--auto-dialog", dest="auto_dialog", default=None,
                    help="実行中に出るMsgBox/InputBoxを自動応答 ok|cancel|yes|no（既定は応答しない）")
 
+    # rehearse [excel_file] <macro_name> [args...]  （予行演習run＝コピーに試し撃ち）
+    p = sub.add_parser("rehearse", aliases=["予行演習"],
+                       help="マクロをコピーに試し撃ちして差分を報告（本体無傷の予行演習run）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--auto-dialog", dest="auto_dialog", default=None,
+                   help="実行中に出るMsgBox/InputBoxを自動応答 ok|cancel|yes|no（既定は安全解除のみ）")
+    p.add_argument("--addins", action="store_true",
+                   help="演習用Excelにアドイン・PERSONALを読み込む（アドインの関数を呼ぶマクロ用）")
+    p.add_argument("--out", dest="out_opt", default=None,
+                   help="コピーの保存先パス（省略時は一時フォルダに ブック名_予行_日時）")
+    p.add_argument("--discard", action="store_true",
+                   help="報告後に結果コピーとsnapshotを削除する")
+    p.add_argument("--max", dest="max_opt", default=None,
+                   help="差分の表示件数（snapshot-diff と同じ・既定20）")
+
     # test [excel_file] [絞り込み] [--module 名] [--auto-dialog ok] [--json]
     p = sub.add_parser("test", aliases=["テスト"],
                        help="テストSub（名前が「テスト」/test で始まる引数なしSub）を一括実行して成否一覧")
@@ -502,7 +522,17 @@ def build_parser():
     p.add_argument("--sheet", dest="sheet_opt", default=None,
                    help="対象シート名（rangeと分離指定）")
 
-    # c. 保存・印刷まわり
+    # c. ブックの開閉・保存・印刷まわり
+    p = sub.add_parser("open",         # open <path>
+                       help="ブックを開く（見えているExcelに合流。未起動なら通常起動＝アドインも読み込まれる）")
+    p.add_argument("posargs", nargs="*")
+    p = sub.add_parser("close",        # close <ブック名|path> (--save|--no-save) [-y]
+                       help="開いているブックを1冊閉じる（名指し・保存方針・確認の三点セット。Excel本体は終了しない）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--save", action="store_true", dest="save_flag", help="保存して閉じる")
+    p.add_argument("--no-save", action="store_true", dest="no_save_flag",
+                   help="保存せずに閉じる（未保存の変更は破棄）")
+    p.add_argument("-y", "--yes", action="store_true", dest="yes", help="確認プロンプトをスキップ")
     p = sub.add_parser("save")         # save [excel_file]
     p.add_argument("posargs", nargs="*")
     p = sub.add_parser("save-as")      # save-as [excel_file] <path> [--overwrite]
@@ -905,6 +935,8 @@ def _command_table():
         "reorder-macro":     cmd_reorder_macro,
         "list-shortcuts":    cmd_list_shortcuts,
         "run-macro":         cmd_run_macro,
+        "rehearse":          cmd_rehearse,
+        "予行演習":            cmd_rehearse,
         "read-range":        cmd_read_range,
         "read-selection":    cmd_read_selection,
         "sheet-info":        cmd_sheet_info,
@@ -927,6 +959,8 @@ def _command_table():
         "autofilter":        cmd_autofilter,
         "find":              cmd_find,
         "find-replace":      cmd_find_replace,
+        "open":              cmd_open,
+        "close":             cmd_close,
         "save":              cmd_save,
         "save-as":           cmd_save_as,
         "export-pdf":        cmd_export_pdf,
