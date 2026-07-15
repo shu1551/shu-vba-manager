@@ -1107,6 +1107,7 @@ def cmd_snapshot_diff(args):
         of_, nf_ = oi.get('format') or {}, ni.get('format') or {}
         f_chg = []
         fmt_coarse_ranges = []
+        fmt_unread_items = set()   # 片側でも "?"（項目単位の読取失敗）だった項目
         if not fmt_unreadable and of_ and nf_:
             def _fmt_label(k):
                 return {'bold': '太字', 'size': '文字サイズ', 'font': 'フォント',
@@ -1124,6 +1125,12 @@ def cmd_snapshot_diff(args):
             def _diff_fmt(a, b, where, skip_same_as_sheet=False):
                 for k in sorted(set(a) | set(b)):
                     va, vb = a.get(k), b.get(k)
+                    if va == "?" or vb == "?":
+                        # "?" は項目単位の読取失敗マーク。通常値と比較すると
+                        # 「列幅 25 → ?」のような疑似差分になる（読めなかった事実は
+                        # 差分ではない）。比較を降り、下でまとめて報告する
+                        fmt_unread_items.add(f"{where.rstrip(': ')}の{_fmt_label(k)}")
+                        continue
                     if va == vb:
                         continue
                     if skip_same_as_sheet and sheet_chg.get(k) == (va, vb):
@@ -1208,6 +1215,9 @@ def cmd_snapshot_diff(args):
 
         if fmt_coarse_ranges:
             coarse_any.append(name)
+        if fmt_unread_items:
+            # 項目単位の読取失敗も「比較できていない」の仲間（総括で嘘をつかない）
+            unread_any.append(f"{name}（書式項目の一部）")
 
         has_diff = any((added, removed, changed, m_add, m_del,
                         s_add, s_del, s_chg, t_add, t_del, t_chg, f_chg,
@@ -1281,6 +1291,11 @@ def cmd_snapshot_diff(args):
             print(f"  ※ 書式の走査が粗い粒度で打ち切られた行範囲があります（{rng}"
                   + (f" 他{more}件" if more > 0 else "")
                   + "）＝その範囲の行の書式差分は比較していません")
+        if fmt_unread_items:
+            head = '、'.join(sorted(fmt_unread_items)[:5])
+            more = len(fmt_unread_items) - 5
+            print(f"  ※ 片側で読めなかった書式項目があり、比較していません: {head}"
+                  + (f" 他{more}件" if more > 0 else ""))
 
     if unread_note_hidden:
         print(f"\n※ 読み取りに失敗した snapshot のため、次のシートは比較できていません: "

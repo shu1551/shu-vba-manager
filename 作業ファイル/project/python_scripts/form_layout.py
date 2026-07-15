@@ -99,13 +99,18 @@ def lbl(caption, width=None, bold=False, name=None, tab_index=None, font=None):
             'tab_index': tab_index, 'font': font}
 
 
-def heading(caption, name=None):
-    """セクション見出し（Bold・大きめ）。1行を占有する"""
+def heading(caption, name=None, font=None, tab_index=None):
+    """セクション見出し（Bold・大きめ）。1行を占有する。
+
+    font 省略時は STYLE['heading_pt']（13pt）。inspect --to-layout の逆変換は
+    実測フォントを明示するので、9pt/16pt の見出しが往復で 13pt に化けない。
+    """
     if name is not None:
         check_control_name(name)
-    e = {'kind': 'lbl', 'caption': caption, 'width': _text_w(caption, STYLE['heading_pt']),
-         'height': STYLE['lbl_h'] + 2, 'bold': True, 'font': STYLE['heading_pt'],
-         'name': name}
+    pt = font or STYLE['heading_pt']
+    e = {'kind': 'lbl', 'caption': caption, 'width': _text_w(caption, pt),
+         'height': STYLE['lbl_h'] + 2, 'bold': True, 'font': pt,
+         'name': name, 'tab_index': tab_index}
     return {'kind': 'row', 'elems': [e]}
 
 

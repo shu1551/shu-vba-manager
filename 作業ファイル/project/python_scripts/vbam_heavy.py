@@ -1663,8 +1663,11 @@ def cmd_datamodel(args):
     except Exception:
         print("このブックはデータモデルに対応していません。")
         # list 系は「無い」を正常報告でよいが、追加/削除の要求は実行されて
-        # いないので失敗として返す（batch やスクリプト連携で握りつぶさない）
-        return action in ('list', 'tables', 'measures', 'relations')
+        # いないので失敗として返す（batch やスクリプト連携で握りつぶさない）。
+        # 'measures add' のような複数形＋動詞も add/delete は変更要求なので失敗側
+        _sub = rest[1].lower() if len(rest) >= 2 else ''
+        return (action in ('list', 'tables', 'measures', 'relations')
+                and _sub not in ('add', 'delete'))
 
     # --- リレーションシップの作成・削除 ---
     #   datamodel relation add    <FKテーブル> <FK列> <PKテーブル> <PK列>

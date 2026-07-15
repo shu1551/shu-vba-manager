@@ -494,6 +494,8 @@ def _tab_arg(c, tab_map):
 
 # form_layout の STYLE['font'] と同じ既定。これと違うサイズだけ font= を出す
 _DEFAULT_FONT_PT = 12
+# form_layout の STYLE['heading_pt'] と同じ既定（heading() の逆変換用）
+_HEADING_FONT_PT = 13
 
 
 def _font_arg(c):
@@ -546,11 +548,15 @@ def _emit_elem(c, max_right, tab_map=None):
     if t.startswith("CommandButton"):
         acc = f', accel="{c["accelerator"]}"' if c.get("accelerator") else ""
         b = ", bold=True" if c.get("bold") else ""
+        # 幅・高さを明示する。出さないと btn() の自動採寸（最小 72×24pt）に
+        # 化け、カレンダーの日ボタン（24×20 等）が往復で膨張して格子が崩壊する
+        wa = f", width={c['width']:g}"
+        h = f", height={c['height']:g}" if abs(c["height"] - 24) > 1 else ""
         if c.get("cancel"):
-            return f'cancel("{name}", "{cap}"{acc}{b}{fo}{ti})'
+            return f'cancel("{name}", "{cap}"{wa}{h}{acc}{b}{fo}{ti})'
         if c.get("default"):
-            return f'ok("{name}", "{cap}"{acc}{b}{fo}{ti})'
-        return f'btn("{name}", "{cap}"{acc}{b}{fo}{ti})'
+            return f'ok("{name}", "{cap}"{wa}{h}{acc}{b}{fo}{ti})'
+        return f'btn("{name}", "{cap}"{wa}{h}{acc}{b}{fo}{ti})'
     # form_layout が作れる型は逆変換もできなければ「片肺」になる
     # （作れるのに戻せない＝往復でそのコントロールが消える）
     if t.startswith("Image"):
@@ -566,8 +572,19 @@ def _emit_cluster(r, max_right, indent, tab_map=None):
     types = [(c.get("type") or "") for c in r]
     # 見出し: 太字ラベル単独の行
     if len(r) == 1 and types[0].startswith("Label") and r[0].get("bold"):
-        cap = (r[0].get("caption") or "").replace('"', '\\"')
-        return f'{indent}heading("{cap}", name="{r[0]["name"]}"),'
+        c0 = r[0]
+        cap = (c0.get("caption") or "").replace('"', '\\"')
+        # heading() の既定は 13pt。それと違う実測フォントは明示しないと
+        # 往復で 13pt に化ける（lbl 系の font= と同じ理由。tab_index も同様）
+        fo = ""
+        fs = c0.get("font_size")
+        try:
+            if fs and abs(float(fs) - _HEADING_FONT_PT) >= 0.5:
+                fo = f", font={float(fs):g}"
+        except Exception:
+            fo = ""
+        ti = _tab_arg(c0, tab_map)
+        return f'{indent}heading("{cap}", name="{c0["name"]}"{fo}{ti}),'
     # ボタンバー: ボタンだけの行。ただし button_bar は「右端寄せ＋全ボタンを
     # 最大幅に統一」する部品なので、無条件に当てるとカレンダーの日ボタン格子の
     # ような並びが右寄せ＋幅72ptに膨らんで崩壊する。少数（〜3個）のときだけ
