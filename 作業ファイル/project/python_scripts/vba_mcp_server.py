@@ -355,7 +355,7 @@ def vba(command: str) -> str:
       "list"（マクロ一覧） / "list-open"（開いているブック一覧） /
       "get モジュール名 プロシージャ名" / "run-macro マクロ名" /
       "read-range A1:D10" / "write-range A1 値" / "sheet-info" /
-      "grep ActiveSheet" / "impact マクロ名"
+      "grep ActiveSheet" / "checkup" / "impact マクロ名"
     コマンド一覧・各引数は vba_help で確認できる。
     注意: 確認プロンプトを出すコマンドは必ず -y を付ける（例: "replace-procedure -y"）。
     shell / batch は使えない（このセッション自体が常駐＝接続使い回しのため不要）。

@@ -203,6 +203,34 @@ def build_parser():
                    help="各シートの先頭N行をMarkdown表で含める")
     p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
 
+    # checkup(健康診断) [excel_file] [--out f.md]
+    p = sub.add_parser("checkup", aliases=["健康診断"],
+                       help="ブックの健康診断レポート（総合判定+壊れた参照+シート検査+前回との比較）")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--out", dest="out_opt", default=None,
+                   help="出力Markdownパス（省略時は _last_checkup.md）")
+    p.add_argument("--form", action="store_true",
+                   help="フォーム検査も実施（既定は速度優先でスキップ。Designer走査が重いため）")
+    p.add_argument("--all", dest="all_books", action="store_true",
+                   help="開いている全ブックを一括診断（PERSONAL.XLSB含む）")
+    p.add_argument("--history", action="store_true",
+                   help="診断せず過去の診断履歴（経過観察）を表で表示")
+    p.add_argument("--detail", action="store_true",
+                   help="--history で各回の間に起きた所見/マクロの増減も表示")
+    p.add_argument("--note", default=None,
+                   help="今回の診断にカルテのメモを添付（例: --note \"ボタン18を一語修正\"）")
+    p.add_argument("--strict", action="store_true",
+                   help="所見が1件でもあれば終了コード1（自動化のゲート用。既定は診断完了=0）")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+    p.add_argument("--ack-all", dest="ack_all", action="store_true",
+                   help="今回のコード/フォーム所見を全て確認済み（意図的）として登録し、"
+                        "以降の所見サマリ・総合判定から除外する"
+                        "（存在しないマクロ呼び出し等の致命的所見は対象外）")
+    p.add_argument("--show-ack", dest="show_ack", action="store_true",
+                   help="診断はせず、確認済み（意図的）所見の一覧を表示")
+    p.add_argument("--unack", default=None, metavar="文字列",
+                   help="部分一致する確認済み所見を確認済みから外す（見直したくなった時）")
+
     # call-graph [excel_file] [--macro 名]
     p = sub.add_parser("call-graph", help="マクロの呼び出し関係を解析（未解決Call＝一語バグ検出つき）")
     p.add_argument("posargs", nargs="*")
@@ -894,6 +922,8 @@ def _command_table():
         "code-replace":      cmd_code_replace,
         "docs":              cmd_docs,
         "call-graph":        cmd_call_graph,
+        "checkup":           cmd_checkup,
+        "健康診断":            cmd_checkup,
         "test":              cmd_test,
         "テスト":              cmd_test,
         "impact":            cmd_impact,
