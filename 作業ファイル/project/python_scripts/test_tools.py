@@ -278,34 +278,6 @@ def test_extra_scans_auto_exec_and_option_explicit():
     assert res['no_option_explicit'] == ['Module1']
 
 
-def test_checkup_diff_line_shift_is_not_a_change():
-    prev = {'time': '2026-07-03 23:00', 'keys': ['未解決Call: [M1] 親 → 子'],
-            'procs': {'M1': ['親']}, 'total_lines': 100, 'sheets': ['S1'], 'forms': []}
-    cur = {'time': '2026-07-04 09:00', 'keys': ['未解決Call: [M1] 親 → 子'],
-           'procs': {'M1': ['親']}, 'total_lines': 100, 'sheets': ['S1'], 'forms': []}
-    assert vm._checkup_diff(prev, cur)['changed'] is False
-
-
-def test_checkup_diff_detects_new_resolved_and_growth():
-    prev = {'time': 't0', 'keys': ['重複プロシージャ: [M1] A'],
-            'procs': {'M1': ['A']}, 'total_lines': 50, 'sheets': ['S1'], 'forms': []}
-    cur = {'time': 't1', 'keys': ['未解決Call: [M2] B → 消えた子'],
-           'procs': {'M1': ['A'], 'M2': ['B']}, 'total_lines': 80,
-           'sheets': ['S1', 'S2'], 'forms': ['F_New']}
-    d = vm._checkup_diff(prev, cur)
-    assert d['changed']
-    assert d['new'] == ['未解決Call: [M2] B → 消えた子']
-    assert d['resolved'] == ['重複プロシージャ: [M1] A']
-    assert d['procs_added'] == ['[M2] B']
-    assert d['lines_delta'] == 30
-    assert d['sheets_added'] == ['S2'] and d['forms_added'] == ['F_New']
-
-
-def test_checkup_diff_first_run_returns_none():
-    assert vm._checkup_diff(None, {'keys': [], 'procs': {}, 'total_lines': 0,
-                                   'sheets': [], 'forms': []}) is None
-
-
 def test_extra_scans_destructive_and_no_restore():
     code = ('Sub 掃除()\r\n'
             '    Application.ScreenUpdating = False\r\n'
@@ -353,12 +325,6 @@ def test_extra_scans_enableevents_no_restore():
     res = vm._extra_code_scans(inv)
     assert [(m, p) for m, p, _ in res['no_restore']] == [('M1', '事故りがち')]
     assert 'EnableEvents' in res['no_restore'][0][2]
-
-
-def test_checkup_rating():
-    assert vm._checkup_rating(0, 0) == "A（異常なし）"
-    assert vm._checkup_rating(5, 0) == "B（軽度所見）"
-    assert vm._checkup_rating(5, 2) == "C（要確認）"
 
 
 def test_analyze_calls_declared_api_is_not_unresolved():
@@ -414,12 +380,6 @@ def test_analyze_calls_commented_run_is_ignored():
     res = vm._analyze_calls(inv)
     assert res['unresolved'] == []
     assert res['dynamic_runs'] == []
-
-
-def test_checkup_diff_survives_missing_fields():
-    # 履歴ファイルは外部データ＝フィールド欠損でも落ちない
-    d = vm._checkup_diff({'time': 't0'}, {'time': 't1'})
-    assert d['changed'] is False
 
 
 def test_analyze_calls_onaction_macro_is_not_orphan():

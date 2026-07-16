@@ -31,7 +31,7 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 - ✅ **バックアップからの復元（restore）**、**コマンド列の一括実行（batch・接続1回）**
 - ✅ **開いたままのブックを直接読み書き**（セル読取・書込・書式・行列操作・検索置換・PDF出力など）
 - ✅ **グラフ／ピボット／スライサー／PowerQuery／データモデル(DAX) まで CLI で操作**
-- ✅ **ブックの検分**——健康診断（checkup）・意味構造JSON化（snapshot）・前後差分（snapshot-diff）・ボタン⇔マクロ配線図と壊れた配線の検出（wiring）
+- ✅ **ブックの検分**——意味構造JSON化（snapshot）・前後差分（snapshot-diff）・ボタン⇔マクロ配線図と壊れた配線の検出（wiring）
 - ✅ **UserForm を「宣言」で構築**（行構造を書くだけで整列済みフォームが完成・イベント雛形も自動生成）
 - ✅ **フォームの検査（lint）・実表示スクリーンショット・既存フォームの宣言コード逆変換**
 - ✅ **導入セルフ診断（setup-check）**——環境が揃っているか1コマンドで○×確認
@@ -46,7 +46,7 @@ git clone https://github.com/shu1551/shu-vba-manager.git
 
 | ツール | 役割 |
 |---|---|
-| **`vba_manager.py`** | 中核ツール。VBA の `list / get / replace-module / replace-procedure / add-procedure / delete-procedure` に、コード検索 `grep`・一括置換 `code-replace`・復元 `restore`・一括実行 `batch`・導入診断 `setup-check`、シート読取（`read-range` / `sheet-info` / `screenshot`）・編集（`write-range` / `format-range` / `find-replace` / `export-pdf` 等）・グラフ／ピボット／PowerQuery／データモデル・検分（`checkup` / `snapshot` / `snapshot-diff` / `wiring`）・予行演習（`rehearse`＝コピーに試し撃ちして差分報告）・ブックの開閉（`open` / `close`）まで **75コマンド**。実装は入口＋5パート構成（`vbam_core / vbam_vba / vbam_view / vbam_edit / vbam_heavy`・2026-07-12 分割）で、使い方は従来どおり `py vba_manager.py <コマンド>` |
+| **`vba_manager.py`** | 中核ツール。VBA の `list / get / replace-module / replace-procedure / add-procedure / delete-procedure` に、コード検索 `grep`・一括置換 `code-replace`・復元 `restore`・一括実行 `batch`・導入診断 `setup-check`、シート読取（`read-range` / `sheet-info` / `screenshot`）・編集（`write-range` / `format-range` / `find-replace` / `export-pdf` 等）・グラフ／ピボット／PowerQuery／データモデル・検分（`snapshot` / `snapshot-diff` / `wiring`）・予行演習（`rehearse`＝コピーに試し撃ちして差分報告）・ブックの開閉（`open` / `close`）まで **74コマンド**。実装は入口＋5パート構成（`vbam_core / vbam_vba / vbam_view / vbam_edit / vbam_heavy`・2026-07-12 分割）で、使い方は従来どおり `py vba_manager.py <コマンド>` |
 | **`vbam_*.py`（5本）** | vba_manager の分割パート。**単体では使わない**が、`vba_manager.py` と同じフォルダに必要（clone / zip 取得なら自動で揃う） |
 | **`vba_mcp_server.py`** | vba_manager を **MCP サーバー化**する薄い窓口（2026-07 追加）。常駐 COM 接続でコマンドごとの再接続が消え、応答は実測 0.01〜0.2 秒級。`vba`（1行で全コマンド）＋ `get_procedure / set_procedure_code / replace_procedure / vba_help` の5ツール |
 | **`form_layout.py`** | UserForm を**宣言で構築**するレイアウトエンジン。行構造を書くだけでラベル整列・ボタンバー・タブ順・イベント雛形まで自動。Excel 不要の配置プレビューも（`py form_layout.py preview 宣言.py`） |
@@ -169,8 +169,7 @@ py vba_manager.py restore <バックアップ.bas>       # 置換前の状態に
 py vba_manager.py batch cmds.txt                  # コマンド列を接続1回で一括実行（実測: 6コマンド約1秒）
 py vba_manager.py export-pdf 出力.pdf --sheet 集計  # PDF出力
 
-# 検分（現地調査）：健康診断・意味構造JSON・前後差分・配線図（2026-07 追加）
-py vba_manager.py checkup                         # ブックの健康診断（総合判定A/B/C・定期健診・カルテ）
+# 検分（現地調査）：意味構造JSON・前後差分・配線図（2026-07 追加）
 py vba_manager.py snapshot                        # ブックを意味構造JSONに畳む（→ _last_snapshot.json）
 py vba_manager.py snapshot-diff before.json       # snapshot同士の差分＝マクロが実際に何を変えたか（COM不要）
 py vba_manager.py wiring                          # ボタン⇔マクロ配線図・壊れた配線の検出（別名: 配線図）

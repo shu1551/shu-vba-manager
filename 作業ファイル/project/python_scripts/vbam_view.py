@@ -948,7 +948,7 @@ def _cell_compare_limit(old_info, new_info):
 def cmd_snapshot_diff(args):
     """2つの snapshot JSON を機械的に比較: snapshot-diff <before.json> [after.json]
 
-    checkup を前後に挟む型の「シート側」版＝マクロや手作業が実際に何を変えたかを
+    変更の前後で snapshot を挟んで比較する検分＝マクロや手作業が実際に何を変えたかを
     セル・結合・図形・テーブル単位の事実で示す（COM 不要の純粋処理）。
     after 省略時は _last_snapshot.json（直近の snapshot）と比較する。
     評価はしない＝差分という事実だけ並べ、意味付けは読み手がやる（snapshot と同じ思想）。
