@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""vbam_vba.py — vba_manager 分割パート: VBA コマンド実装（list/get/replace/export/checkup/フォーム lint 等）
+"""vbam_vba.py — vba_manager 分割パート: VBA コマンド実装（list/get/replace/export/フォーム lint 等）
 
 vba_manager.py から機械分割（2026-07-12）。単体で実行せず、vba_manager.py 経由で使う。
 """
@@ -2704,7 +2704,7 @@ def _inventory_or_explain(xl, wb):
         return _collect_book_inventory(xl, wb)
     except Exception as e:
         print("エラー: VBA プロジェクトに触れません（パスワード保護または VBOM 未信頼）。")
-        print("  シート側だけの診断なら checkup（健康診断）が縮退モードで実行できます。")
+        print("  シート側だけなら sheet-info / snapshot 等の目コマンドは使えます。")
         print(f"  詳細: {e}")
         return None
 
@@ -2839,7 +2839,7 @@ def cmd_docs(args):
 
 
 def _analyze_calls(inv):
-    """呼び出し関係の解析本体（call-graph / checkup 共用・COM 不要の純粋処理）。
+    """呼び出し関係の解析本体（call-graph / impact 共用・COM 不要の純粋処理）。
 
     戻り値: {'known', 'edges', 'unresolved', 'orphans'}
     """
@@ -3005,7 +3005,7 @@ _AUTO_EXEC_PREFIXES = ('workbook_', 'worksheet_', 'chart_')
 
 
 def _extra_code_scans(inv):
-    """checkup の参考所見スキャン（COM 不要の純粋処理・事実の列挙のみ）。
+    """参考所見スキャン（COM 不要の純粋処理・事実の列挙のみ）。
 
     自動実行イベント / Option Explicit なし / On Error Resume Next /
     ハードコードされたパス / 長いプロシージャ / 破壊的な操作の所在 /
