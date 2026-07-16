@@ -45,6 +45,9 @@ VBA モジュールが破壊される。
 
 ## マクロ修正の標準フロー
 
+**1〜数行の小修正は `py vba_manager.py code-replace "旧" "新" --module 名 -y` が最短**
+（変更行だけ送る。プロシージャ全文の再送は下のフロー＝新規追加や大改造のときだけ）。
+
 1. `py vba_manager.py list` でマクロ一覧を確認
 2. `py vba_manager.py get <Sub名>` で対象コードを取得（_last_proc.vba に出力）
 3. `_last_proc.vba` を Read ツールで読み、修正内容を検討
