@@ -843,6 +843,158 @@ def cmd_list_modules(args):
     return True
 
 
+def cmd_list_forms(args):
+    """フォーム一覧（UserForm のみ抽出。キャプション・コントロール数・コード行数付き）"""
+    load_addins = getattr(args, 'personal', False) or getattr(args, 'addin', False) or getattr(args, 'all', False)
+    target_file, _ = parse_target_and_rest(args.posargs)
+    # 参照するだけのコマンド → 読み取り専用で開く（Workbook_Open を起こさない）
+    xl, default_wb = get_workbook(target_file, load_addins=load_addins, readonly=True)
+
+    # 全プロジェクトをリスト化 (ビジーエラー対策としてリトライ)
+    import time
+    all_projects = []
+    for attempt in range(5):
+        try:
+            all_projects = []
+            for p in xl.VBE.VBProjects:
+                all_projects.append(p)
+            break
+        except Exception as ex:
+            if "800ac472" in str(ex) and attempt < 4:
+                time.sleep(0.5)
+                continue
+            print(f"エラー: VBAプロジェクトモデルへのアクセスが拒否されました: {ex}", file=sys.stderr)
+            return False
+
+    # 対象のプロジェクトを選択（list-modules と同じ流儀）
+    target_projects = []
+    if getattr(args, 'all', False):
+        target_projects = all_projects
+    elif getattr(args, 'personal', False):
+        found = None
+        for p in all_projects:
+            try:
+                fname = os.path.basename(p.Filename).lower()
+                if fname in ("personal.xlsb", "personal.xls"):
+                    found = p
+                    break
+            except Exception:
+                continue
+        if not found:
+            print("エラー: 個人用マクロブック (PERSONAL.XLSB) がロードされていません。", file=sys.stderr)
+            return False
+        target_projects.append(found)
+    elif getattr(args, 'addin', False):
+        target_addin = _select_addin_project(all_projects, args.addin)
+        if target_addin is None:
+            return False
+        target_projects.append(target_addin)
+    else:
+        found = None
+        try:
+            for p in all_projects:
+                try:
+                    if p.Filename.lower() == default_wb.FullName.lower():
+                        found = p
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if not found:
+            try:
+                found = default_wb.VBProject
+            except Exception as ex:
+                print(f"エラー: VBProjectの取得に失敗しました: {ex}", file=sys.stderr)
+                return False
+        target_projects.append(found)
+
+    def get_project_display_name(p):
+        try:
+            if p.Filename:
+                return os.path.basename(p.Filename)
+        except Exception:
+            pass
+        return p.Name
+
+    def collect_forms(proj):
+        forms = []
+        for comp in proj.VBComponents:
+            if comp.Type != 3:                   # 3 = MSForm (UserForm)
+                continue
+            info = {"name": comp.Name}
+            try:
+                info["code_lines"] = comp.CodeModule.CountOfLines
+            except Exception:
+                pass
+            try:
+                d = comp.Designer
+                if d is not None:
+                    info["caption"] = d.Caption
+                    info["controls"] = d.Controls.Count
+                else:
+                    info["loaded"] = True        # 表示中/ロード中は Designer が取れない
+            except Exception:
+                info["loaded"] = True
+            forms.append(info)
+        return forms
+
+    def format_form(f):
+        parts = [f"FORM:{f['name']}"]
+        if f.get("loaded"):
+            parts.append("(ロード中: 詳細取得不可)")
+        else:
+            if "controls" in f:
+                parts.append(f"コントロール{f['controls']}個")
+            if f.get("caption") and f["caption"] != f["name"]:
+                parts.append(f"[{f['caption']}]")
+        if "code_lines" in f:
+            parts.append(f"コード{f['code_lines']}行")
+        return "  ".join(parts)
+
+    if getattr(args, 'all', False):
+        all_results = {}
+        for proj in target_projects:
+            proj_name = get_project_display_name(proj)
+            try:
+                all_results[proj_name] = collect_forms(proj)
+            except Exception as ex:
+                print(f"[DEBUG] Failed to access VBComponents of {proj_name}: {ex}", file=sys.stderr)
+                continue
+
+        if getattr(args, 'json', False):
+            import json
+            print(json.dumps({"success": True, "file": "all", "forms": all_results}, ensure_ascii=False), file=sys.stdout)
+            return True
+
+        for p_name, forms in all_results.items():
+            print(f"\n--- {p_name} ---")
+            if not forms:
+                print("（フォームなし）")
+            for f in forms:
+                print(format_form(f))
+        return True
+
+    proj = target_projects[0]
+    proj_name = get_project_display_name(proj)
+    try:
+        forms = collect_forms(proj)
+    except Exception as ex:
+        print(f"エラー: VBComponentsへのアクセスに失敗しました: {ex}", file=sys.stderr)
+        return False
+
+    if getattr(args, 'json', False):
+        import json
+        print(json.dumps({"success": True, "file": proj_name, "forms": forms}, ensure_ascii=False), file=sys.stdout)
+        return True
+
+    print(f"対象ブック: {proj_name}")
+    print(f"フォーム数: {len(forms)}")
+    for f in forms:
+        print(format_form(f))
+    return True
+
+
 def _all_procedure_names(wb):
     """ブック内の全プロシージャ名を列挙（did-you-mean 用の機械的リスト）"""
     pat = re.compile(
@@ -5144,6 +5296,7 @@ __all__ = [
     'cmd_impact',
     'cmd_list',
     'cmd_list_backups',
+    'cmd_list_forms',
     'cmd_list_modules',
     'cmd_list_open',
     'cmd_list_shortcuts',

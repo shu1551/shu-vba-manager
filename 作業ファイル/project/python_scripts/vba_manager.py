@@ -10,6 +10,7 @@ VBAマネージャー (アクティブブック対応版)
 【コマンド一覧】
   list            [excel_file]                     マクロ一覧
   list-modules    [excel_file]                     モジュール一覧
+  list-forms      [excel_file]                     フォーム一覧（コントロール数・コード行数付き）
   get             [excel_file] <macro_name>        プロシージャのコード取得
   replace-procedure [excel_file] [--code-file f]  プロシージャを置換
   replace-module  [excel_file] <module> <bas_file> モジュール全体を置換
@@ -142,6 +143,15 @@ def build_parser():
 
     # list-modules [excel_file]
     p = sub.add_parser("list-modules")
+    p.add_argument("posargs", nargs="*")
+    p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
+    p.add_argument("--personal", action="store_true", help="個人用マクロブック (PERSONAL.XLSB) を対象にする")
+    p.add_argument("--addin", nargs="?", const=True, default=False,
+                   help="アドインブック (.xlam/.xla) を対象にする。複数ロード時は名前(一部可)を指定")
+    p.add_argument("--all", action="store_true", help="開いているすべてのブック・アドインを対象にする")
+
+    # list-forms [excel_file]
+    p = sub.add_parser("list-forms")
     p.add_argument("posargs", nargs="*")
     p.add_argument("--json", action="store_true", help="結果をJSON形式で出力")
     p.add_argument("--personal", action="store_true", help="個人用マクロブック (PERSONAL.XLSB) を対象にする")
@@ -913,6 +923,7 @@ def _command_table():
         "list-open":         cmd_list_open,
         "list":              cmd_list,
         "list-modules":      cmd_list_modules,
+        "list-forms":        cmd_list_forms,
         "get":               cmd_get,
         "replace-procedure": cmd_replace_procedure,
         "add-procedure":     cmd_add_procedure,
